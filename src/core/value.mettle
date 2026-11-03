@@ -1,4 +1,4 @@
-// reach/core/value.mettle — the only representation a value has at a seam.
+// flux_orm/core/value.mettle — the only representation a value has at a seam.
 //
 // Every model field, query argument and result cell is an RcValue. This is the
 // impedance-matching layer between Mettle's static types and the database's

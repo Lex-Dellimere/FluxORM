@@ -1,4 +1,4 @@
-// reach/core/persist.mettle — the Phase-1 write path (the straw man).
+// flux_orm/core/persist.mettle — the Phase-1 write path (the straw man).
 //
 // This module exists so core + adapter can be tested as one thing. It builds
 // the three statements every ORM needs (insert/select-by-key/delete-by-key)

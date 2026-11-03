@@ -66,9 +66,9 @@ import "harness";
 // active 4, score 5, created_at 6, role 7. Post = id 0, user_id 1, title 2,
 // body 3, published_at 4.
 
-export const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_reach_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
-export const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_reach_migrations\" ORDER BY \"version\" ASC";
-export const LEDGER_INSERT: string = "INSERT INTO \"_reach_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
+export const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_flux_orm_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
+export const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_flux_orm_migrations\" ORDER BY \"version\" ASC";
+export const LEDGER_INSERT: string = "INSERT INTO \"_flux_orm_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
 
 export const USER_DDL: string = "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" INTEGER PRIMARY KEY, \"email\" TEXT NOT NULL UNIQUE, \"name\" TEXT NOT NULL, \"age\" INTEGER, \"active\" INTEGER NOT NULL, \"score\" REAL, \"created_at\" INTEGER NOT NULL, \"role\" INTEGER NOT NULL)";
 export const POST_DDL: string = "CREATE TABLE IF NOT EXISTS \"posts\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"title\" TEXT NOT NULL, \"body\" TEXT, \"published_at\" INTEGER)";
@@ -122,7 +122,7 @@ export fn has_text(hay: string, needle: string) -> bool {
 export fn new_adapter(out: RcAdapter**) -> int32 {
   var a: RcAdapter* = rc_mem_adapter();
   if (a == 0) { return RC_ERR_NOMEM; }
-  if (rc_adapter_open(a, "mem://reach") != RC_OK) {
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
     rc_mem_free(a);
     return RC_ERR_ADAPTER;
   }

@@ -93,7 +93,7 @@ const THROUGH_BY_OWNER_SQL3: string = "SELECT \"user_id\", \"post_id\" FROM \"us
 fn new_adapter(out: RcAdapter**) -> int32 {
   var a: RcAdapter* = rc_mem_adapter();
   if (a == 0) { return RC_ERR_NOMEM; }
-  if (rc_adapter_open(a, "mem://reach") != RC_OK) {
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
     rc_mem_free(a);
     return RC_ERR_ADAPTER;
   }

@@ -1,9 +1,9 @@
-// reach/migration/version.mettle — up-only migrations, one transaction each.
+// flux_orm/migration/version.mettle — up-only migrations, one transaction each.
 //
 // The ledger is the truth about what has run, and it lives in the same store
 // as the schema it describes, so the two cannot be committed separately:
 //
-//   _reach_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+//   _flux_orm_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL,
 //                      applied_at INTEGER NOT NULL)
 //
 // A run is: create the ledger if absent, read the applied versions, refuse if
@@ -26,7 +26,7 @@ import "../core/value";
 import "../core/buf";
 import "../adapter/adapter";
 
-export const RC_MIG_LEDGER: string = "_reach_migrations";
+export const RC_MIG_LEDGER: string = "_flux_orm_migrations";
 
 export struct RcMigration {
   version: int64;

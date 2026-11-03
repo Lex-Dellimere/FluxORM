@@ -1,4 +1,4 @@
-// reach/adapter/adapter.mettle — the driver bridge contract.
+// flux_orm/adapter/adapter.mettle — the driver bridge contract.
 //
 // An adapter is a vtable of plain function pointers, not a trait and not an
 // import cycle. The ORM never imports dacor; it holds an RcAdapter and calls

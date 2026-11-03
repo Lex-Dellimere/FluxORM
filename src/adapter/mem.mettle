@@ -1,4 +1,4 @@
-// reach/adapter/mem.mettle — the recording adapter.
+// flux_orm/adapter/mem.mettle — the recording adapter.
 //
 // This is not a database. It is the seam's executable specification: it
 // records the statement text and the bound arguments, and replays a scripted

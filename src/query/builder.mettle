@@ -1,4 +1,4 @@
-// reach/query/builder.mettle — statement text plus bound arguments. No I/O.
+// flux_orm/query/builder.mettle — statement text plus bound arguments. No I/O.
 //
 // A query is *text plus argv*: one growable RcBuf for the statement, one
 // geometric array of borrowed RcValue cells for the values. Nothing in this

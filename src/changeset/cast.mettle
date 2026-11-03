@@ -1,4 +1,4 @@
-// reach/changeset/cast.mettle — user text -> RcValue, and the one place that
+// flux_orm/changeset/cast.mettle — user text -> RcValue, and the one place that
 // is allowed to coerce.
 //
 // docs/01-architecture.md §1.9 splits casting three ways and this file is the

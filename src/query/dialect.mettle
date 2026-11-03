@@ -1,4 +1,4 @@
-// reach/query/dialect.mettle — the SQL text flavour, as a value.
+// flux_orm/query/dialect.mettle — the SQL text flavour, as a value.
 //
 // One dialect ships: "dacor". It is a value rather than a pile of string
 // literals so the text builder has exactly one place that knows what a quoted

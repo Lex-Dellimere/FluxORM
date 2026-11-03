@@ -1,4 +1,4 @@
-// reach/core/buf.mettle — a growable byte buffer for statement text.
+// flux_orm/core/buf.mettle — a growable byte buffer for statement text.
 //
 // Mettle's `+` on strings allocates a new string per operator, so building a
 // statement by concatenation is one allocation per token. This is one buffer,

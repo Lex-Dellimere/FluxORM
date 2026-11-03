@@ -1,4 +1,4 @@
-// reach/migration/ddl.mettle — CREATE TABLE from metadata.
+// flux_orm/migration/ddl.mettle — CREATE TABLE from metadata.
 //
 // The DDL is generated from the same RcMeta the write path uses, so a table
 // cannot drift from the model it was declared for: the column list, the order,

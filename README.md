@@ -1,19 +1,12 @@
-# reach
+# flux_orm
 
-An ORM for the dacor storage engine, written in Mettle.
+An ORM for the MeoSQL storage engine (formerly dacor), written in Mettle.
 
-Status: **the planned build order is complete and green** — core+adapter,
-query, changeset, relation, migration, and the cross-phase acceptance test
-(`tests/t_integration.mettle`). `tools/check.sh` → 42 passed, 0 failed.
-Open seams are listed in `docs/00-index.md`.
-
-```
-cd /home/nox/Projects/mettle/reach
-export METTLE=/home/nox/Projects/mettle/raize/mettle-build/bin/mettle  # head
-MB=/home/nox/Projects/mettle/mbuild/build/bootstrap/mbuild
-tools/check.sh        # mbuild check + test, then debug/release builds and runs
-$MB run               # the demo: insert + load through the recording adapter
-```
+Status: core+adapter, query, changeset, relation, migration, and the
+cross-phase acceptance test (`tests/t_integration.mettle`) are implemented and
+green in the interpreter, debug and release. The MeoSQL bridge
+(`src/adapter/dacor.mettle`) is a stub until MeoSQL exposes a statement/row
+API; tests run against the in-memory recording adapter.
 
 ```
   src/core/       value status meta entity buf persist   Phase 1
@@ -22,14 +15,8 @@ $MB run               # the demo: insert + load through the recording adapter
   src/changeset/  cast changeset                         Phase 3
   src/relation/   relations + batch loaders              Phase 4
   src/migration/  ddl version                            Phase 5
-  cmd/reachdemo/  end-to-end demo bin
+  tests/          models.mettle (the model template) + t_*.mettle per phase
 ```
-
-- Architecture critique and the impedance mismatches: `docs/01-architecture.md`
-- Frozen seams between phases: `docs/02-seams.md`
-- Phase-1 implementation guide + the five tests: `docs/03-phase1.md`
-- Cross-phase acceptance, as built: `docs/04-integration.md`
-- Orchestration state: `reports/director.md`
 
 ## The one design decision worth knowing
 
@@ -41,13 +28,22 @@ hand-maintained offset table, and no struct overlays.
 
 ## Toolchain
 
-mbuild project. `mbuild.toml` has no `[toolchain]` pin on purpose: reach needs
-the head compiler, selected with `METTLE` (or `mbuild --mettle`).
+mbuild project. `mbuild.toml` has no `[toolchain]` pin on purpose: flux_orm
+needs the head compiler, selected with `METTLE` (or `mbuild --mettle`).
 
 ```
 MB=/home/nox/Projects/mettle/mbuild/build/bootstrap/mbuild
-export METTLE=/home/nox/Projects/mettle/raize/mettle-build/bin/mettle
-$MB check && $MB test && $MB build -r && build/linux/release/reachdemo
+export METTLE=/home/nox/Projects/mettle/Mettle/bin/mettle
+$MB check && $MB test
+```
+
+`mbuild test` runs every `@test` in the interpreter. Each test file also has a
+`main`; build and run it in debug **and** release (head miscompiles have shown
+up in release only):
+
+```
+$METTLE --build tests/t_query.mettle -o /tmp/t_query && /tmp/t_query
+$METTLE --release --build tests/t_query.mettle -o /tmp/t_query.r && /tmp/t_query.r
 ```
 
 Imports are file-relative (`import "../core/value";`), so the compiler can be

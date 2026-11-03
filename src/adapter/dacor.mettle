@@ -1,4 +1,4 @@
-// reach/adapter/dacor.mettle — the bridge to dacor.
+// flux_orm/adapter/dacor.mettle — the bridge to dacor.
 //
 // Status: gated. dacor's phase-1 contract (dacor/PHASE1.md §5) is a pager:
 // dk_pager_open/get/release/alloc/flush and page/cell accessors. There is no

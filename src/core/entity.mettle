@@ -1,4 +1,4 @@
-// reach/core/entity.mettle — a model row's persistence state.
+// flux_orm/core/entity.mettle — a model row's persistence state.
 //
 // The model struct is what the application holds. RcEntity is what the ORM
 // knows about it: which metadata describes it, which fields are NULL, and

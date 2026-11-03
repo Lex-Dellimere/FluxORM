@@ -1,4 +1,4 @@
-// reach/core/meta.mettle — model metadata, generated from the compiler.
+// flux_orm/core/meta.mettle — model metadata, generated from the compiler.
 //
 // Mettle has compile-time reflection and nothing at run time: typeof(T).fields
 // gives every field's name, offset, size and type kind while compiling, and

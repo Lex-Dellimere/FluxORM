@@ -22,9 +22,9 @@ import "../src/migration/version";
 import "models";
 import "harness";
 
-const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_reach_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
-const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_reach_migrations\" ORDER BY \"version\" ASC";
-const LEDGER_INSERT: string = "INSERT INTO \"_reach_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
+const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_flux_orm_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
+const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_flux_orm_migrations\" ORDER BY \"version\" ASC";
+const LEDGER_INSERT: string = "INSERT INTO \"_flux_orm_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
 
 const USER_DDL: string = "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" INTEGER PRIMARY KEY, \"email\" TEXT NOT NULL UNIQUE, \"name\" TEXT NOT NULL, \"age\" INTEGER, \"active\" INTEGER NOT NULL, \"score\" REAL, \"created_at\" INTEGER NOT NULL, \"role\" INTEGER NOT NULL)";
 const POST_DDL: string = "CREATE TABLE IF NOT EXISTS \"posts\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"title\" TEXT NOT NULL, \"body\" TEXT, \"published_at\" INTEGER)";
@@ -41,7 +41,7 @@ const TWO: RcMigration[2] = [
 fn new_adapter(out: RcAdapter**) -> int32 {
   var a: RcAdapter* = rc_mem_adapter();
   if (a == 0) { return RC_ERR_NOMEM; }
-  if (rc_adapter_open(a, "mem://reach") != RC_OK) {
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
     rc_mem_free(a);
     return RC_ERR_ADAPTER;
   }
@@ -83,7 +83,7 @@ fn rc_mig_flaky(inner: RcAdapter*, fail_at: int32) -> RcAdapter {
 // --- 1. ledger statements ----------------------------------------------------
 
 fn check_ledger_statements() -> int32 {
-  if (RC_MIG_LEDGER != "_reach_migrations") { return 1; }
+  if (RC_MIG_LEDGER != "_flux_orm_migrations") { return 1; }
 
   var b: RcBuf = rc_buf_new(256);
   if (b.data == 0) { return 2; }

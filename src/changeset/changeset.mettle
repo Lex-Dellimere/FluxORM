@@ -1,4 +1,4 @@
-// reach/changeset/changeset.mettle — what the caller wants to write, and which
+// flux_orm/changeset/changeset.mettle — what the caller wants to write, and which
 // columns that actually touches.
 //
 // RcEntity.state answers "does this row differ from the store". An UPDATE needs

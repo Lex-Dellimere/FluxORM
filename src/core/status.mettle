@@ -1,4 +1,4 @@
-// reach/core/status.mettle — the one error taxonomy.
+// flux_orm/core/status.mettle — the one error taxonomy.
 //
 // Mettle has no exceptions: every call returns int32 and every failure is one
 // of these codes. Adapters map their own codes into this range; nothing above
