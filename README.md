@@ -10,6 +10,7 @@ API; tests run against the in-memory recording adapter.
 
 ```
   src/core/       value status meta entity buf persist   Phase 1
+                  session (connection + flat transaction)
   src/adapter/    adapter mem meosql                     Phase 1
   src/query/      dialect builder                        Phase 2
   src/changeset/  cast changeset                         Phase 3

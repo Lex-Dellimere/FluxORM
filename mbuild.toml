@@ -46,5 +46,8 @@ main = "tests/t_query.mettle"
 [bin.t_relation]
 main = "tests/t_relation.mettle"
 
+[bin.t_session]
+main = "tests/t_session.mettle"
+
 [bin.t_value]
 main = "tests/t_value.mettle"
