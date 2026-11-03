@@ -34,17 +34,15 @@ needs the head compiler, selected with `METTLE` (or `mbuild --mettle`).
 ```
 MB=/home/nox/Projects/mettle/mbuild/build/bootstrap/mbuild
 export METTLE=/home/nox/Projects/mettle/Mettle/bin/mettle
-$MB check && $MB test
+$MB check             # type-check every test program and what it imports
+$MB test              # every @test, in the interpreter
+$MB build && $MB build -r
+for t in build/linux/{debug,release}/t_*; do $t || echo "FAIL $t"; done
 ```
 
-`mbuild test` runs every `@test` in the interpreter. Each test file also has a
-`main`; build and run it in debug **and** release (head miscompiles have shown
-up in release only):
-
-```
-$METTLE --build tests/t_query.mettle -o /tmp/t_query && /tmp/t_query
-$METTLE --release --build tests/t_query.mettle -o /tmp/t_query.r && /tmp/t_query.r
-```
+Each `tests/t_*.mettle` is declared as a bin in `mbuild.toml`, so
+`$MB run t_query` builds and runs one. Run release as well as debug: head
+miscompiles have shown up in release only.
 
 Imports are file-relative (`import "../core/value";`), so the compiler can be
 run from anywhere.
