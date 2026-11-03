@@ -1,0 +1,14 @@
+import "std/io";
+
+struct V { ud: rawptr; f: fn(rawptr) -> int32; g: fn(rawptr, int32) -> int32; }
+
+fn call_f(v: V*) -> int32 { if (v.f == 0) { return -7; } return v.f(v.ud); }
+
+fn main() -> int32 {
+  var bare: V;
+  bare.ud = 0;
+  bare.f = 0;
+  bare.g = 0;
+  println("f={call_f(&bare)}");
+  return 0;
+}

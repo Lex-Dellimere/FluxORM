@@ -1,0 +1,230 @@
+// reach/core/persist.mettle — the Phase-1 write path (the straw man).
+//
+// This module exists so core + adapter can be tested as one thing. It builds
+// the three statements every ORM needs (insert/select-by-key/delete-by-key)
+// straight from RcMeta and binds RcValue arguments. Query/ replaces the text
+// generation in Phase 2; changeset/ replaces the "which columns changed" part
+// in Phase 3. What must *not* change is the shape: values in, rows out, no
+// cursor, no string interpolation of user data.
+
+import "std/mem";
+
+import "status";
+import "value";
+import "meta";
+import "entity";
+import "buf";
+import "../adapter/adapter";
+
+fn rc_persist_put_columns(b: RcBuf*, m: RcMeta) -> int32 {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (i > 0) {
+      var sep: int32 = rc_buf_put(b, ", ");
+      if (sep != RC_OK) { return sep; }
+    }
+    var rc: int32 = rc_buf_ident(b, m.fields[i].column);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+fn rc_persist_put_table(b: RcBuf*, m: RcMeta) -> int32 {
+  var rc: int32 = rc_buf_put(b, " FROM ");
+  if (rc != RC_OK) { return rc; }
+  return rc_buf_ident(b, m.table);
+}
+
+// Inserts one entity. An auto primary key whose null bit is set is omitted
+// from the column list and read back from the result. `e.nulls` records
+// which other fields are NULL, and those bind as RcNull.
+export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
+  if (a == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
+  var m: RcMeta = e->meta;
+  var bad: int32 = -1;
+  var rc: int32 = rc_meta_check(m, &bad);
+  if (rc != RC_OK) { return rc; }
+
+  var buf: RcBuf = rc_buf_new(128);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+
+  rc = rc_buf_put(&buf, "INSERT INTO ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(&buf, m.table);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " (");
+  if (rc != RC_OK) { return rc; }
+
+  var first: bool = true;
+  var n_args: int32 = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var skip: bool = false;
+    if ((m.fields[i].flags & RC_F_AUTO) != 0 && rc_nulls_has(e->nulls, i)) {
+      skip = true;
+    }
+    if (!skip) {
+      if (!first) {
+        rc = rc_buf_put(&buf, ", ");
+        if (rc != RC_OK) { return rc; }
+      }
+      rc = rc_buf_ident(&buf, m.fields[i].column);
+      if (rc != RC_OK) { return rc; }
+      first = false;
+      n_args = n_args + 1;
+    }
+    i = i + 1;
+  }
+  if (n_args == 0) { return RC_ERR_USAGE; }
+  rc = rc_buf_put(&buf, ") VALUES (");
+  if (rc != RC_OK) { return rc; }
+  i = 0;
+  while (i < n_args) {
+    if (i > 0) {
+      rc = rc_buf_put(&buf, ", ");
+      if (rc != RC_OK) { return rc; }
+    }
+    rc = rc_buf_put(&buf, "?");
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  rc = rc_buf_put(&buf, ")");
+  if (rc != RC_OK) { return rc; }
+
+  var args: RcValue* = malloc((int64)n_args * (int64)sizeof(RcValue));
+  if (args == 0) { return RC_ERR_NOMEM; }
+  defer free(args);
+  var k: int32 = 0;
+  i = 0;
+  while (i < m.n_fields) {
+    var skip: bool = false;
+    if ((m.fields[i].flags & RC_F_AUTO) != 0 && rc_nulls_has(e->nulls, i)) {
+      skip = true;
+    }
+    if (!skip) {
+      var v: RcValue = RcNull;
+      rc = rc_meta_get(m, e->model, e->nulls, i, &v);
+      if (rc != RC_OK) { return rc; }
+      args[k] = v;
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+
+  var want_auto: bool = false;
+  if (rc_meta_is_auto(m)) {
+    if (rc_nulls_has(e->nulls, m.pk)) { want_auto = true; }
+  }
+
+  var res: RcResult;
+  rc = rc_adapter_exec(a, rc_buf_text(&buf), args, n_args, &res);
+  if (rc != RC_OK) { return rc; }
+  defer rc_result_free(&res);
+
+  if (want_auto) {
+    if (res.last_id == 0) { return RC_ERR_ADAPTER; }
+    var pkv: RcValue = RcInt(res.last_id);
+    rc = rc_meta_set(m, e->model, &e->nulls, m.pk, pkv);
+    if (rc != RC_OK) { return rc; }
+  }
+  e->state = RC_ST_CLEAN;
+  return RC_OK;
+}
+
+// Loads one row by primary key into `model`, which must already be zeroed.
+//
+// Lifetime, and it is the one thing to get right here: a model's string fields
+// are 16-byte *views*. The loader therefore adopts cells out of the result
+// instead of copying them, and hands the result back through `owner`.
+// `*owner` must outlive every use of the model, then be freed with
+// rc_result_free. A copy per field would need an owner list inside the plain
+// Mettle struct, which is exactly what Phase 2's session arena replaces.
+export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
+                          nulls: uint64*, owner: RcResult*) -> int32 {
+  if (a == 0 || model == 0 || nulls == 0 || owner == 0) { return RC_ERR_USAGE; }
+  if (m.pk < 0) { return RC_ERR_USAGE; }
+  rc_result_init(owner);
+  var bad: int32 = -1;
+  var rc: int32 = rc_meta_check(m, &bad);
+  if (rc != RC_OK) { return rc; }
+
+  var buf: RcBuf = rc_buf_new(128);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+
+  rc = rc_buf_put(&buf, "SELECT ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_persist_put_columns(&buf, m);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_persist_put_table(&buf, m);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " WHERE ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(&buf, m.fields[m.pk].column);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " = ? LIMIT 1");
+  if (rc != RC_OK) { return rc; }
+
+  var args: RcValue[1];
+  args[0] = pk;
+  var res: RcResult;
+  rc = rc_adapter_exec(a, rc_buf_text(&buf), &args[0], 1, &res);
+  if (rc != RC_OK) { return rc; }
+  if (res.n_rows == 0) {
+    rc_result_free(&res);
+    return RC_ERR_NOT_FOUND;
+  }
+  if (res.n_cols != m.n_fields) {
+    rc_result_free(&res);
+    return RC_ERR_ADAPTER;
+  }
+
+  *nulls = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var v: RcValue = rc_result_borrow(&res, 0, i);
+    rc = rc_meta_set(m, model, nulls, i, v);
+    if (rc != RC_OK) {
+      rc_result_free(&res);
+      return rc;
+    }
+    i = i + 1;
+  }
+  *owner = res;
+  return RC_OK;
+}
+
+export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
+  if (a == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (e->state == RC_ST_DELETED) { return RC_ERR_USAGE; }
+  var m: RcMeta = e->meta;
+  if (m.pk < 0) { return RC_ERR_USAGE; }
+  if (!rc_entity_has_pk(e)) { return RC_ERR_USAGE; }
+
+  var buf: RcBuf = rc_buf_new(64);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+
+  var rc: int32 = rc_buf_put(&buf, "DELETE");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_persist_put_table(&buf, m);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " WHERE ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(&buf, m.fields[m.pk].column);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " = ?");
+  if (rc != RC_OK) { return rc; }
+
+  var args: RcValue[1];
+  args[0] = rc_entity_pk(e);
+  var res: RcResult;
+  rc = rc_adapter_exec(a, rc_buf_text(&buf), &args[0], 1, &res);
+  if (rc != RC_OK) { return rc; }
+  defer rc_result_free(&res);
+  e->state = RC_ST_DELETED;
+  return RC_OK;
+}

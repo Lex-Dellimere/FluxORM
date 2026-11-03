@@ -1,0 +1,215 @@
+// tests/models.mettle — the metadata generator, in the shape a user copies.
+//
+// This file is the template: a plain struct, one `comptime for` over its own
+// fields, one override table for the decisions a struct cannot express
+// (column names, keys, nullability, timestamps), one finalize call.
+//
+// The `comptime for` is the whole reflection story. Mettle reflects at compile
+// time and leaves nothing behind, so this file compiles to a static RcField
+// array with offsets the compiler chose. No macros, no build step, no
+// hand-maintained offset table.
+
+import "std/mem";
+
+import "../src/core/status";
+import "../src/core/value";
+import "../src/core/meta";
+
+// --- User --------------------------------------------------------------------
+
+export enum Role { Admin = 1, Member = 2 }
+
+export struct User {
+  id: int64;
+  email: string;
+  name: string;
+  age: int32;
+  active: bool;
+  score: float64;
+  created_at: int64;
+  role: Role;
+}
+
+var USER_FIELDS: RcField[8];
+var USER_META: RcMeta;
+var USER_READY: bool = false;
+
+const USER_COLS: RcColumn[8] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
+  { index: 1, column: "email", ty: RC_T_TEXT, flags: RC_F_NOT_NULL | RC_F_UNIQUE },
+  { index: 2, column: "name", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 3, column: "age", ty: RC_T_I64, flags: 0 },
+  { index: 4, column: "active", ty: RC_T_BOOL, flags: RC_F_NOT_NULL },
+  { index: 5, column: "score", ty: RC_T_F64, flags: 0 },
+  { index: 6, column: "created_at", ty: RC_T_TIME, flags: RC_F_TIMESTAMP | RC_F_NOT_NULL },
+  { index: 7, column: "role", ty: RC_T_I64, flags: RC_F_NOT_NULL },
+];
+
+// The array is passed in, not captured: a module global referenced from inside
+// a comptime-for body in an *imported* module does not resolve (head compiler).
+// Taking the destination as a parameter sidesteps it and is clearer anyway.
+fn user_fields(out: RcField*) -> int32 {
+  var i: int32 = 0;
+  comptime for f in typeof(User).fields {
+    out[i].name = f.name;
+    out[i].column = f.name;
+    out[i].kind = f.type.kind;
+    out[i].ty = rc_kind_type(f.type.kind);
+    out[i].offset = (int32)f.offset;
+    out[i].size = (int32)f.type.size;
+    out[i].flags = 0;
+    i = i + 1;
+  }
+  return i;
+}
+
+fn user_build() -> int32 {
+  var i: int32 = user_fields(&USER_FIELDS[0]);
+  USER_META.table = "users";
+  USER_META.name = "User";
+  USER_META.size = (int32)sizeof(User);
+  USER_META.fields = &USER_FIELDS[0];
+  USER_META.n_fields = i;
+  USER_META.pk = -1;
+  return rc_meta_finalize(&USER_META, &USER_COLS[0], 8);
+}
+
+export fn user_meta() -> RcMeta {
+  if (!USER_READY) {
+    user_build();
+    USER_READY = true;
+  }
+  return USER_META;
+}
+
+export fn user_meta_status() -> int32 {
+  if (!USER_READY) {
+    user_build();
+    USER_READY = true;
+  }
+  return rc_meta_check(USER_META, 0);
+}
+
+// --- Post --------------------------------------------------------------------
+
+export struct Post {
+  id: int64;
+  user_id: int64;
+  title: string;
+  body: string;
+  published_at: int64;
+}
+
+var POST_FIELDS: RcField[5];
+var POST_META: RcMeta;
+var POST_READY: bool = false;
+
+const POST_COLS: RcColumn[5] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
+  { index: 1, column: "user_id", ty: RC_T_I64, flags: RC_F_NOT_NULL },
+  { index: 2, column: "title", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 3, column: "body", ty: RC_T_TEXT, flags: 0 },
+  { index: 4, column: "published_at", ty: RC_T_TIME, flags: RC_F_TIMESTAMP },
+];
+
+fn post_fields(out: RcField*) -> int32 {
+  var i: int32 = 0;
+  comptime for f in typeof(Post).fields {
+    out[i].name = f.name;
+    out[i].column = f.name;
+    out[i].kind = f.type.kind;
+    out[i].ty = rc_kind_type(f.type.kind);
+    out[i].offset = (int32)f.offset;
+    out[i].size = (int32)f.type.size;
+    out[i].flags = 0;
+    i = i + 1;
+  }
+  return i;
+}
+
+fn post_build() -> int32 {
+  var i: int32 = post_fields(&POST_FIELDS[0]);
+  POST_META.table = "posts";
+  POST_META.name = "Post";
+  POST_META.size = (int32)sizeof(Post);
+  POST_META.fields = &POST_FIELDS[0];
+  POST_META.n_fields = i;
+  POST_META.pk = -1;
+  return rc_meta_finalize(&POST_META, &POST_COLS[0], 5);
+}
+
+export fn post_meta() -> RcMeta {
+  if (!POST_READY) {
+    post_build();
+    POST_READY = true;
+  }
+  return POST_META;
+}
+
+export fn post_meta_status() -> int32 {
+  if (!POST_READY) {
+    post_build();
+    POST_READY = true;
+  }
+  return rc_meta_check(POST_META, 0);
+}
+
+// --- Doc: a field type the wire cannot carry --------------------------------
+// `uint8[]` is a slice, kind Slice. dacor's record codec has a BLOB, but a
+// Mettle slice is a (ptr,len) view with no owner, so mapping it silently would
+// be a lifetime bug. The metadata validator must refuse it at startup.
+
+export struct Doc {
+  id: int64;
+  attachment: uint8[];
+}
+
+var DOC_FIELDS: RcField[2];
+var DOC_META: RcMeta;
+var DOC_READY: bool = false;
+
+fn doc_fields(out: RcField*) -> int32 {
+  var i: int32 = 0;
+  comptime for f in typeof(Doc).fields {
+    out[i].name = f.name;
+    out[i].column = f.name;
+    out[i].kind = f.type.kind;
+    out[i].ty = rc_kind_type(f.type.kind);
+    out[i].offset = (int32)f.offset;
+    out[i].size = (int32)f.type.size;
+    out[i].flags = 0;
+    i = i + 1;
+  }
+  return i;
+}
+
+fn doc_build() -> int32 {
+  var i: int32 = doc_fields(&DOC_FIELDS[0]);
+  DOC_META.table = "docs";
+  DOC_META.name = "Doc";
+  DOC_META.size = (int32)sizeof(Doc);
+  DOC_META.fields = &DOC_FIELDS[0];
+  DOC_META.n_fields = i;
+  DOC_META.pk = -1;
+  DOC_FIELDS[0].flags = RC_F_PK | RC_F_NOT_NULL;
+  DOC_META.pk = 0;
+  return rc_meta_check(DOC_META, 0);
+}
+
+export fn doc_meta() -> RcMeta {
+  if (!DOC_READY) {
+    doc_build();
+    DOC_READY = true;
+  }
+  return DOC_META;
+}
+
+export fn doc_meta_status() -> int32 {
+  if (!DOC_READY) {
+    doc_build();
+    DOC_READY = true;
+  }
+  return rc_meta_check(DOC_META, 0);
+}
+
+export fn doc_field_count() -> int32 { return doc_meta().n_fields; }

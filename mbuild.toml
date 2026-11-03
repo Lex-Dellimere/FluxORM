@@ -1,0 +1,20 @@
+# reach — an ORM for dacor.
+#
+# No [toolchain] pin on purpose: reach needs the head compiler (compile-time
+# reflection, `Kind`, comptime for). Pin v0.17.0 and the build fails. Select
+# head with either:
+#
+#   export METTLE=/home/nox/Projects/mettle/raize/mettle-build/bin/mettle
+#   mbuild --mettle /path/to/mettle build
+[package]
+name = "reach"
+version = "0.1.0"
+
+[build]
+targets = ["linux"]
+
+[bin.reachdemo]
+main = "cmd/reachdemo/main.mettle"
+
+[profile.release]
+flags = ["--release"]

@@ -1,0 +1,140 @@
+// tests/t_value.mettle — the value layer.
+//
+// Check 1 (type + NULL identity) and check 2 (strict casts) of Phase 1.
+// The ownership check is the one that matters: Mettle strings are borrowed
+// views, so a clone that is not a copy corrupts data the moment the source
+// buffer is reused. The check overwrites the freed block to make a shallow
+// clone fail deterministically instead of "usually".
+
+import "std/io";
+import "std/mem";
+
+import "../src/core/status";
+import "../src/core/value";
+import "harness";
+
+fn check_types() -> int32 {
+  if (rc_value_type(RcNull) != RC_T_NULL) { return 1; }
+  if (rc_value_type(RcInt(0)) != RC_T_I64) { return 2; }
+  if (rc_value_type(RcUint((uint64)0)) != RC_T_U64) { return 3; }
+  if (rc_value_type(RcFloat(0.0)) != RC_T_F64) { return 4; }
+  if (rc_value_type(RcBool(false)) != RC_T_BOOL) { return 5; }
+  if (rc_value_type(RcText("")) != RC_T_TEXT) { return 6; }
+  if (rc_value_type(RcTime(0)) != RC_T_TIME) { return 7; }
+  var b: uint8[2];
+  b[0] = 1;
+  b[1] = 2;
+  if (rc_value_type(rc_value_blob(&b[0], 2)) != RC_T_BLOB) { return 8; }
+  if (rc_value_type_name(RC_T_TIME) != "time") { return 9; }
+  return 0;
+}
+
+fn check_null_identity() -> int32 {
+  if (!rc_value_is_null(RcNull)) { return 1; }
+  if (rc_value_is_null(RcInt(0))) { return 2; }
+  // NULL is not zero, and zero is not NULL.
+  if (rc_value_same(RcNull, RcInt(0))) { return 3; }
+  if (!rc_value_same(RcNull, RcNull)) { return 4; }
+  if (!rc_value_same(RcInt(5), RcInt(5))) { return 5; }
+  if (rc_value_same(RcInt(5), RcInt(6))) { return 6; }
+  if (!rc_value_same(RcText("abc"), RcText("abc"))) { return 7; }
+  if (rc_value_same(RcText("abc"), RcText("abd"))) { return 8; }
+  // Equality never coerces across arms: 1.0 != 1.
+  if (rc_value_same(RcFloat(1.0), RcInt(1))) { return 9; }
+  if (!rc_value_same(RcFloat(1.5), RcFloat(1.5))) { return 10; }
+  return 0;
+}
+
+fn check_casts() -> int32 {
+  var i: int64 = 0;
+  var u: uint64 = 0;
+  var f: float64 = 0.0;
+  var b: bool = false;
+  var s: string;
+  if (rc_value_as_i64(RcInt(42), &i) != RC_OK) { return 1; }
+  if (i != 42) { return 2; }
+  if (rc_value_as_i64(RcBool(true), &i) != RC_OK) { return 3; }
+  if (i != 1) { return 4; }
+  if (rc_value_as_i64(RcText("1"), &i) != RC_ERR_CAST) { return 5; }
+  if (rc_value_as_i64(RcFloat(1.0), &i) != RC_ERR_CAST) { return 6; }
+  if (rc_value_as_i64(RcNull, &i) != RC_ERR_CAST) { return 7; }
+  if (rc_value_as_u64(RcInt(-1), &u) != RC_ERR_RANGE) { return 8; }
+  if (rc_value_as_u64(RcUint((uint64)18446744073709551615), &u) != RC_OK) { return 9; }
+  if (u != (uint64)18446744073709551615) { return 10; }
+  // 2^63 does not fit a signed 64-bit value.
+  if (rc_value_as_i64(RcUint((uint64)9223372036854775808), &i) != RC_ERR_RANGE) {
+    return 11;
+  }
+  // 2^53 + 1 is the first integer a float64 cannot represent.
+  if (rc_value_as_f64(RcInt(9007199254740993), &f) != RC_ERR_RANGE) { return 12; }
+  if (rc_value_as_f64(RcInt(9007199254740992), &f) != RC_OK) { return 13; }
+  // bool is strict: an integer is not a bool.
+  if (rc_value_as_bool(RcInt(1), &b) != RC_ERR_CAST) { return 14; }
+  if (rc_value_as_bool(RcBool(true), &b) != RC_OK) { return 15; }
+  if (!b) { return 16; }
+  if (rc_value_as_text(RcInt(1), &s) != RC_ERR_CAST) { return 17; }
+  return 0;
+}
+
+fn check_ownership() -> int32 {
+  // 1. Duplicate, clone, free the original, then overwrite the heap block the
+  // original pointed at. A shallow clone would now read "xxxxx".
+  var src: string = rc_text_dup("hello");
+  if (src.chars == 0) { return 1; }
+  if (src != "hello") { return 2; }
+  var owned: RcValue = RcNull;
+  if (rc_value_clone(RcText(src), &owned) != RC_OK) { return 3; }
+  rc_text_free(src);
+  var scratch: uint8* = malloc(5);
+  if (scratch == 0) { return 4; }
+  var k: int32 = 0;
+  while (k < 5) {
+    scratch[k] = (uint8)120; // 'x'
+    k = k + 1;
+  }
+  var got: string;
+  if (rc_value_as_text(owned, &got) != RC_OK) { return 5; }
+  if (got != "hello") { return 6; }
+  rc_value_release(owned);
+  free(scratch);
+
+  // 2. An empty text clones to an empty text and releases safely.
+  var empty: string = rc_text_dup("");
+  if (empty.length != (uint64)0) { return 7; }
+  var ev: RcValue = RcNull;
+  if (rc_value_clone(RcText(empty), &ev) != RC_OK) { return 8; }
+  rc_value_release(ev);
+
+  // 3. A blob round-trips through clone with its bytes.
+  var bytes: uint8[4];
+  bytes[0] = 9;
+  bytes[1] = 8;
+  bytes[2] = 7;
+  bytes[3] = 6;
+  var bv: RcValue = RcNull;
+  if (rc_value_clone(rc_value_blob(&bytes[0], 4), &bv) != RC_OK) { return 9; }
+  var blob: RcBytes;
+  if (rc_value_as_blob(bv, &blob) != RC_OK) { return 10; }
+  if (blob.len != 4) { return 11; }
+  if (blob.data[0] != 9 || blob.data[3] != 6) { return 12; }
+  if (!rc_value_same(bv, rc_value_blob(&bytes[0], 4))) { return 13; }
+  rc_value_release(bv);
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("value: type codes", check_types())) { failures = failures + 1; }
+  if (!rc_report("value: NULL is not zero", check_null_identity())) { failures = failures + 1; }
+  if (!rc_report("value: strict casts and ranges", check_casts())) { failures = failures + 1; }
+  if (!rc_report("value: clone owns text and blob", check_ownership())) { failures = failures + 1; }
+  return rc_summary(failures, 4);
+}
+
+@test fn t_value() -> int32 {
+  if (check_types() != 0) { return 1; }
+  if (check_null_identity() != 0) { return 2; }
+  if (check_casts() != 0) { return 3; }
+  if (check_ownership() != 0) { return 4; }
+  return 0;
+}

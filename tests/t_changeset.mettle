@@ -1,0 +1,627 @@
+// tests/t_changeset.mettle — Phase 3: text -> RcValue, the per-field dirty
+// mask, and the write-through to a model.
+//
+// The two things this file exists to pin are the ones that are cheap to get
+// wrong and expensive in production:
+//
+//   1. Casting is strict. " 42", "4.5" into an integer, "yes" into a boolean
+//      are refusals with a code, not a best effort.
+//   2. A put whose value equals the row's current value does NOT set a bit, so
+//      the UPDATE built from this changeset cannot rewrite (and clobber) a
+//      column nobody touched.
+//
+// The statement text is not asserted here: this phase emits no SQL.
+
+import "std/mem";
+import "std/conv";
+
+import "../src/core/status";
+import "../src/core/value";
+import "../src/core/meta";
+import "../src/core/entity";
+import "../src/changeset/cast";
+import "../src/changeset/changeset";
+import "models";
+import "harness";
+
+// 65 fields: one more than the mask can hold. rc_meta_check refuses it, so a
+// changeset over it must refuse too rather than truncate to 64 bits.
+var BIG_FIELDS: RcField[65];
+
+fn big_meta() -> RcMeta {
+  var m: RcMeta;
+  m.table = "big";
+  m.name = "Big";
+  m.size = 8;
+  m.fields = &BIG_FIELDS[0];
+  m.n_fields = 65;
+  m.pk = -1;
+  return m;
+}
+
+// A User row as the store would hand it back: id set, nullable age NULL,
+// everything else populated. Used as the baseline for the dirty checks.
+fn build_user(u: User*, out: RcEntity*) -> int32 {
+  memset((rawptr)u, 0, (int64)sizeof(User));
+  var m: RcMeta = user_meta();
+  var e: RcEntity = rc_entity_new(m, (rawptr)u);
+  if (rc_entity_set(&e, 0, RcInt(42)) != RC_OK) { return 1; }
+  if (rc_entity_set(&e, 1, RcText("ada@example.com")) != RC_OK) { return 2; }
+  if (rc_entity_set(&e, 2, RcText("Ada")) != RC_OK) { return 3; }
+  if (rc_entity_set(&e, 3, RcNull) != RC_OK) { return 4; }
+  if (rc_entity_set(&e, 4, RcBool(true)) != RC_OK) { return 5; }
+  if (rc_entity_set(&e, 5, RcFloat(9.5)) != RC_OK) { return 6; }
+  if (rc_entity_set(&e, 6, RcTime(1700000000000000)) != RC_OK) { return 7; }
+  if (rc_entity_set(&e, 7, RcInt(2)) != RC_OK) { return 8; }
+  *out = e;
+  return 0;
+}
+
+// --- helpers -----------------------------------------------------------------
+// Each helper gets its own changeset because a refusal is sticky: one error and
+// every later write on that changeset returns the same code until reset.
+
+fn put_text_ok(m: RcMeta, field: int32, s: string, want: RcValue) -> int32 {
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (cs.values == 0) { return 100; }
+  if (rc_changeset_put_text(&cs, field, s) != RC_OK) { return 101; }
+  if (!rc_value_same(cs.values[field], want)) { return 102; }
+  if (!rc_changeset_has(&cs, field)) { return 103; }
+  if (rc_changeset_n_dirty(&cs) != 1) { return 104; }
+  if (!rc_changeset_valid(&cs)) { return 105; }
+  return 0;
+}
+
+fn put_text_err(m: RcMeta, field: int32, s: string, want: int32) -> int32 {
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (cs.values == 0) { return 100; }
+  if (rc_changeset_put_text(&cs, field, s) != want) { return 101; }
+  if (rc_changeset_error_code(&cs) != want) { return 102; }
+  if (rc_changeset_error_field(&cs) != field) { return 103; }
+  if (rc_changeset_error_reason(&cs) == "") { return 104; }
+  if (rc_changeset_has(&cs, field)) { return 105; }
+  if (rc_changeset_n_dirty(&cs) != 0) { return 106; }
+  if (rc_changeset_valid(&cs)) { return 107; }
+  return 0;
+}
+
+// Pointer identity, not content equality: `.chars` is the borrowed view, so an
+// identical address proves nothing was copied.
+fn view_identity(v: RcValue, src: string) -> int32 {
+  match (v) {
+    case RcText(s): {
+      if (s.chars != src.chars) { return 1; }
+      if (s.length != src.length) { return 2; }
+      return 0;
+    }
+    case RcNull: { return 3; }
+    case RcInt(_i): { return 3; }
+    case RcUint(_u): { return 3; }
+    case RcFloat(_f): { return 3; }
+    case RcBool(_b): { return 3; }
+    case RcTime(_t): { return 3; }
+    case RcBlob(_x): { return 3; }
+  }
+  return 4;
+}
+
+// --- 1. cast matrix ----------------------------------------------------------
+// Field indexes: User = id 0, email 1, name 2, age 3, active 4, score 5,
+// created_at 6, role 7. Post = id 0, user_id 1, title 2, body 3, published_at 4.
+
+fn check_cast_matrix() -> int32 {
+  var m: RcMeta = user_meta();
+  var pm: RcMeta = post_meta();
+  var c: int32 = 0;
+
+  // "42" / "-7" into RC_T_I64.
+  c = put_text_ok(m, 3, "42", RcInt(42));
+  if (c != 0) { return 1; }
+  c = put_text_ok(m, 3, "-7", RcInt(-7));
+  if (c != 0) { return 2; }
+
+  // No float -> int.
+  c = put_text_err(m, 3, "4.5", RC_ERR_CAST);
+  if (c != 0) { return 3; }
+
+  // Too many digits: the text is an integer, but not an int64 one.
+  c = put_text_err(m, 3, "9999999999999999999999", RC_ERR_RANGE);
+  if (c != 0) { return 4; }
+
+  // No trimming, either side.
+  c = put_text_err(m, 3, " 42", RC_ERR_CAST);
+  if (c != 0) { return 5; }
+  c = put_text_err(m, 3, "42 ", RC_ERR_CAST);
+  if (c != 0) { return 6; }
+
+  // Not a number at all.
+  c = put_text_err(m, 3, "abc", RC_ERR_CAST);
+  if (c != 0) { return 7; }
+
+  // "" on a NOT NULL field is a constraint violation, not a NULL.
+  c = put_text_err(m, 2, "", RC_ERR_CONSTRAINT);
+  if (c != 0) { return 8; }
+
+  // "4.5" into RC_T_F64.
+  c = put_text_ok(m, 5, "4.5", RcFloat(4.5));
+  if (c != 0) { return 9; }
+
+  // The four boolean spellings, and nothing else.
+  c = put_text_ok(m, 4, "1", RcBool(true));
+  if (c != 0) { return 10; }
+  c = put_text_ok(m, 4, "0", RcBool(false));
+  if (c != 0) { return 11; }
+  c = put_text_ok(m, 4, "true", RcBool(true));
+  if (c != 0) { return 12; }
+  c = put_text_ok(m, 4, "false", RcBool(false));
+  if (c != 0) { return 13; }
+  c = put_text_err(m, 4, "yes", RC_ERR_CAST);
+  if (c != 0) { return 14; }
+  c = put_text_err(m, 4, "2", RC_ERR_CAST);
+  if (c != 0) { return 15; }
+
+  // Any non-empty text into RC_T_TEXT.
+  c = put_text_ok(m, 2, "Ada", RcText("Ada"));
+  if (c != 0) { return 16; }
+
+  // "" into a nullable RC_T_TEXT is a NULL.
+  c = put_text_ok(pm, 3, "", RcNull);
+  if (c != 0) { return 17; }
+
+  // unix micros, parsed as an int64.
+  c = put_text_ok(m, 6, "1700000000000000", RcTime(1700000000000000));
+  if (c != 0) { return 18; }
+
+  // One byte over the policy limit is RC_ERR_RANGE. The real limit itself is
+  // not asserted here: it would mean a 1 MiB content compare for no extra
+  // information about the guard.
+  var over: int64 = RC_CS_MAX_TEXT + (int64)1;
+  var buf: uint8* = malloc(over);
+  if (buf == 0) { return 19; }
+  defer free((rawptr)buf);
+  buf[0] = 97;
+  var too_long: string = str_from_bytes((cstring)buf, over);
+  c = put_text_err(m, 2, too_long, RC_ERR_RANGE);
+  if (c != 0) { return 20; }
+
+  // Exactly the limit is accepted (the guard is "longer than", not "at least").
+  // No content comparison here: that would read 1 MiB for no extra signal.
+  var at_limit: string = str_from_bytes((cstring)buf, RC_CS_MAX_TEXT);
+  var cs_lim: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs_lim);
+  if (rc_changeset_put_text(&cs_lim, 2, at_limit) != RC_OK) { return 21; }
+  if (!rc_changeset_has(&cs_lim, 2)) { return 22; }
+  if (rc_changeset_error_code(&cs_lim) != RC_OK) { return 23; }
+  return 0;
+}
+
+// --- 2. empty text is null only when nullable --------------------------------
+
+fn check_empty_text() -> int32 {
+  var pm: RcMeta = post_meta();
+  var p: Post;
+  memset((rawptr)&p, 0, (int64)sizeof(Post));
+  var pe: RcEntity = rc_entity_new(pm, (rawptr)&p);
+  var cs: RcChangeset = rc_changeset_new(pm);
+  defer rc_changeset_free(&cs);
+
+  // Post.body is nullable: "" is a NULL and it is dirty (no baseline).
+  if (rc_changeset_put_text(&cs, 3, "") != RC_OK) { return 1; }
+  if (!rc_value_is_null(cs.values[3])) { return 2; }
+  if (!rc_changeset_has(&cs, 3)) { return 3; }
+  if (rc_changeset_n_dirty(&cs) != 1) { return 4; }
+  // ... and apply puts the null bit where core/meta keeps it.
+  if (rc_changeset_apply(&cs, &pe) != RC_OK) { return 5; }
+  if (!rc_nulls_has(pe.nulls, 3)) { return 6; }
+
+  var m: RcMeta = user_meta();
+  var cs2: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs2);
+  // User.name is NOT NULL text.
+  if (rc_changeset_put_text(&cs2, 2, "") != RC_ERR_CONSTRAINT) { return 7; }
+  if (rc_changeset_error_field(&cs2) != 2) { return 8; }
+  if (rc_changeset_error_code(&cs2) != RC_ERR_CONSTRAINT) { return 9; }
+  if (rc_changeset_valid(&cs2)) { return 10; }
+  if (rc_changeset_has(&cs2, 2)) { return 11; }
+
+  // The same rule for a nullable integer: "" is absent, i.e. NULL.
+  var cs3: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs3);
+  if (rc_changeset_put_text(&cs3, 3, "") != RC_OK) { return 12; }
+  if (!rc_value_is_null(cs3.values[3])) { return 13; }
+  if (!rc_changeset_valid(&cs3)) { return 14; }
+
+  // ... and for a NOT NULL integer it is a violation.
+  var cs4: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs4);
+  if (rc_changeset_put_text(&cs4, 7, "") != RC_ERR_CONSTRAINT) { return 15; }
+  if (rc_changeset_error_field(&cs4) != 7) { return 16; }
+
+  // The same rule at the RcValue seam: put_null and put(RcNull) both refuse a
+  // NOT NULL column, with the field index, before anything is stored.
+  var cs5: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs5);
+  if (rc_changeset_put_null(&cs5, 2) != RC_ERR_CONSTRAINT) { return 17; }
+  if (rc_changeset_error_field(&cs5) != 2) { return 18; }
+  if (rc_changeset_has(&cs5, 2)) { return 19; }
+  if (rc_changeset_valid(&cs5)) { return 20; }
+
+  var cs6: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs6);
+  if (rc_changeset_put(&cs6, 2, RcNull) != RC_ERR_CONSTRAINT) { return 21; }
+  if (rc_changeset_error_code(&cs6) != RC_ERR_CONSTRAINT) { return 22; }
+  return 0;
+}
+
+// --- 3. identical value is not dirty -----------------------------------------
+
+fn check_identical_not_dirty() -> int32 {
+  var u: User;
+  var e: RcEntity;
+  var c: int32 = build_user(&u, &e);
+  if (c != 0) { return c; }
+
+  var m: RcMeta = user_meta();
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_bind(&cs, (rawptr)&u, e.nulls) != RC_OK) { return 10; }
+
+  // Exactly the values the row already holds.
+  if (rc_changeset_put(&cs, 0, RcInt(42)) != RC_OK) { return 11; }
+  if (rc_changeset_put(&cs, 1, RcText("ada@example.com")) != RC_OK) { return 12; }
+  if (rc_changeset_put(&cs, 2, RcText("Ada")) != RC_OK) { return 13; }
+  if (rc_changeset_put(&cs, 3, RcNull) != RC_OK) { return 14; }
+  if (rc_changeset_put(&cs, 4, RcBool(true)) != RC_OK) { return 15; }
+  if (rc_changeset_put(&cs, 5, RcFloat(9.5)) != RC_OK) { return 16; }
+  if (rc_changeset_put(&cs, 6, RcTime(1700000000000000)) != RC_OK) { return 17; }
+  if (rc_changeset_put(&cs, 7, RcInt(2)) != RC_OK) { return 18; }
+
+  // NULL in the row, NULL left alone: nothing to write.
+  if (rc_changeset_n_dirty(&cs) != 0) { return 19; }
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (rc_changeset_has(&cs, i)) { return 20; }
+    i = i + 1;
+  }
+
+  // One field changed: exactly one bit.
+  if (rc_changeset_put(&cs, 2, RcText("Grace")) != RC_OK) { return 21; }
+  if (rc_changeset_n_dirty(&cs) != 1) { return 22; }
+  if (!rc_changeset_has(&cs, 2)) { return 23; }
+  i = 0;
+  while (i < m.n_fields) {
+    if (i != 2 && rc_changeset_has(&cs, i)) { return 24; }
+    i = i + 1;
+  }
+
+  // Putting the original value back clears the bit again.
+  if (rc_changeset_put(&cs, 2, RcText("Ada")) != RC_OK) { return 25; }
+  if (rc_changeset_n_dirty(&cs) != 0) { return 26; }
+  if (rc_changeset_has(&cs, 2)) { return 27; }
+
+  // A NULL put on a nullable column that is already NULL is still not a
+  // change (rc_changeset_put_null goes through the same comparison).
+  if (rc_changeset_put_null(&cs, 3) != RC_OK) { return 32; }
+  if (rc_changeset_n_dirty(&cs) != 0) { return 33; }
+
+  // Last wins: two puts on one field, one bit, the second value.
+  if (rc_changeset_put(&cs, 3, RcInt(3)) != RC_OK) { return 28; }
+  if (rc_changeset_put(&cs, 3, RcInt(5)) != RC_OK) { return 29; }
+  if (rc_changeset_n_dirty(&cs) != 1) { return 30; }
+  if (!rc_value_same(cs.values[3], RcInt(5))) { return 31; }
+  return 0;
+}
+
+// --- 4. apply writes only changed fields -------------------------------------
+
+fn check_apply_only_changed() -> int32 {
+  var u: User;
+  var e: RcEntity;
+  var c: int32 = build_user(&u, &e);
+  if (c != 0) { return c; }
+  e.state = RC_ST_CLEAN;
+
+  var m: RcMeta = user_meta();
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_bind(&cs, (rawptr)&u, e.nulls) != RC_OK) { return 10; }
+  if (rc_changeset_put(&cs, 2, RcText("Grace")) != RC_OK) { return 11; }
+
+  // Every field, before the write.
+  var before: RcValue[8];
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (rc_entity_get(&e, i, &before[i]) != RC_OK) { return 12; }
+    i = i + 1;
+  }
+
+  if (rc_changeset_apply(&cs, &e) != RC_OK) { return 13; }
+  // CLEAN -> DIRTY, because at least one field was written.
+  if (e.state != RC_ST_DIRTY) { return 14; }
+  if (u.name != "Grace") { return 15; }
+
+  var after: RcValue = RcNull;
+  i = 0;
+  while (i < m.n_fields) {
+    if (rc_entity_get(&e, i, &after) != RC_OK) { return 16; }
+    if (i == 2) {
+      if (rc_value_same(before[2], after)) { return 17; }
+      if (!rc_value_same(after, RcText("Grace"))) { return 18; }
+    } else {
+      // A field whose bit is clear is byte-for-byte what it was.
+      if (!rc_value_same(before[i], after)) { return 19; }
+    }
+    i = i + 1;
+  }
+
+  // The mask survives apply: the caller still needs it for the column list.
+  if (!rc_changeset_has(&cs, 2)) { return 20; }
+  if (rc_changeset_n_dirty(&cs) != 1) { return 21; }
+  return 0;
+}
+
+// --- 5. new entity stays new -------------------------------------------------
+
+fn check_new_entity_stays_new() -> int32 {
+  var u: User;
+  memset((rawptr)&u, 0, (int64)sizeof(User));
+  var m: RcMeta = user_meta();
+  var e: RcEntity = rc_entity_new(m, (rawptr)&u);
+
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_put(&cs, 1, RcText("new@example.com")) != RC_OK) { return 1; }
+  if (rc_changeset_put(&cs, 2, RcText("New")) != RC_OK) { return 2; }
+  if (rc_changeset_put(&cs, 4, RcBool(true)) != RC_OK) { return 3; }
+  if (rc_changeset_put(&cs, 6, RcTime(1700000000000000)) != RC_OK) { return 4; }
+  if (rc_changeset_put(&cs, 7, RcInt(2)) != RC_OK) { return 5; }
+  // The auto key is never put, so it is never dirty.
+  if (rc_changeset_has(&cs, 0)) { return 6; }
+
+  if (rc_changeset_apply(&cs, &e) != RC_OK) { return 7; }
+  // rc_entity_set's frozen rule: NEW is not dirty.
+  if (e.state != RC_ST_NEW) { return 8; }
+  if (u.email != "new@example.com") { return 9; }
+  if (u.name != "New") { return 10; }
+  if (!u.active) { return 11; }
+  if (u.created_at != 1700000000000000) { return 12; }
+  if (u.role != Role.Member) { return 13; }
+  // The key is still absent.
+  if (!rc_nulls_has(e.nulls, 0)) { return 14; }
+  if (rc_entity_has_pk(&e)) { return 15; }
+  return 0;
+}
+
+// --- 6. strict put refuses coercion ------------------------------------------
+
+fn check_strict_put() -> int32 {
+  var m: RcMeta = user_meta();
+
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  // Text into an integer column: put_text's job, not put's.
+  if (rc_changeset_put(&cs, 3, RcText("42")) != RC_ERR_CAST) { return 1; }
+  if (rc_changeset_error_field(&cs) != 3) { return 2; }
+  if (rc_changeset_has(&cs, 3)) { return 3; }
+
+  // Integer into a text column.
+  var cs2: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs2);
+  if (rc_changeset_put(&cs2, 1, RcInt(1)) != RC_ERR_CAST) { return 4; }
+  if (rc_changeset_error_field(&cs2) != 1) { return 5; }
+
+  // Int into a float column: the value layer's narrowing is not a licence to
+  // coerce at this seam.
+  var cs3: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs3);
+  if (rc_changeset_put(&cs3, 5, RcInt(1)) != RC_ERR_CAST) { return 6; }
+
+  // Text into a boolean column, even the canonical spelling.
+  var cs4: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs4);
+  if (rc_changeset_put(&cs4, 4, RcText("true")) != RC_ERR_CAST) { return 7; }
+
+  // A TIME column takes RcTime, not the bare int64 it shares a width with.
+  var cs5: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs5);
+  if (rc_changeset_put(&cs5, 6, RcInt(1700000000000000)) != RC_ERR_CAST) { return 8; }
+
+  // The matching arms, including the integer family (int/uint share INTEGER and
+  // core/meta range-checks the narrowing).
+  var cs6: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs6);
+  if (rc_changeset_put(&cs6, 6, RcTime(5)) != RC_OK) { return 9; }
+  if (rc_changeset_put(&cs6, 3, RcUint((uint64)7)) != RC_OK) { return 10; }
+  if (rc_changeset_n_dirty(&cs6) != 2) { return 11; }
+
+  // Doc has a field the wire cannot carry, so its meta fails rc_meta_check: the
+  // changeset carries no storage and never truncates to the fields it likes.
+  var dm: RcMeta = doc_meta();
+  var dc: RcChangeset = rc_changeset_new(dm);
+  defer rc_changeset_free(&dc);
+  if (dc.values != 0) { return 12; }
+  if (dc.n_values != 0) { return 13; }
+  if (rc_changeset_error_code(&dc) != RC_ERR_UNSUPPORTED) { return 14; }
+  if (rc_changeset_error_reason(&dc) == "") { return 15; }
+  if (rc_changeset_put(&dc, 1, RcInt(1)) != RC_ERR_UNSUPPORTED) { return 16; }
+  if (rc_changeset_put_text(&dc, 1, "1") != RC_ERR_UNSUPPORTED) { return 17; }
+  if (rc_changeset_valid(&dc)) { return 18; }
+
+  // 65 fields: refused, not truncated to 64 bits.
+  var bm: RcMeta = big_meta();
+  var bc: RcChangeset = rc_changeset_new(bm);
+  defer rc_changeset_free(&bc);
+  if (bc.values != 0) { return 19; }
+  if (bc.n_values != 0) { return 20; }
+  if (rc_changeset_error_code(&bc) != RC_ERR_UNSUPPORTED) { return 21; }
+  if (rc_changeset_put(&bc, 0, RcInt(1)) != RC_ERR_UNSUPPORTED) { return 22; }
+  return 0;
+}
+
+// --- 7. errors carry field and code ------------------------------------------
+
+fn check_errors() -> int32 {
+  var m: RcMeta = user_meta();
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (!rc_changeset_valid(&cs)) { return 1; }
+  if (rc_changeset_error_code(&cs) != RC_OK) { return 2; }
+  if (rc_changeset_error_field(&cs) != -1) { return 3; }
+  if (rc_changeset_error_reason(&cs) != "") { return 4; }
+
+  // Unknown name: there is no field index to report.
+  if (rc_changeset_put_name(&cs, "nope", RcInt(1)) != RC_ERR_USAGE) { return 5; }
+  if (rc_changeset_error_field(&cs) != -1) { return 6; }
+  if (rc_changeset_error_code(&cs) != RC_ERR_USAGE) { return 7; }
+  if (rc_changeset_error_reason(&cs) == "") { return 8; }
+  if (rc_changeset_valid(&cs)) { return 9; }
+
+  // The error is sticky: the next write is refused with the same code and does
+  // not become dirty.
+  if (rc_changeset_put(&cs, 1, RcText("x@example.com")) != RC_ERR_USAGE) { return 10; }
+  if (rc_changeset_n_dirty(&cs) != 0) { return 11; }
+  if (rc_changeset_has(&cs, 1)) { return 12; }
+
+  // An invalid changeset writes nothing at all.
+  var u: User;
+  var e: RcEntity;
+  var c: int32 = build_user(&u, &e);
+  if (c != 0) { return c; }
+  e.state = RC_ST_CLEAN;
+  if (rc_changeset_apply(&cs, &e) != RC_ERR_USAGE) { return 13; }
+  if (e.state != RC_ST_CLEAN) { return 14; }
+  if (u.name != "Ada") { return 15; }
+
+  // A field index outside [0, n_fields) is reported with the index.
+  var cs2: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs2);
+  if (rc_changeset_put(&cs2, 99, RcInt(1)) != RC_ERR_USAGE) { return 16; }
+  if (rc_changeset_error_field(&cs2) != 99) { return 17; }
+  if (rc_changeset_error_code(&cs2) != RC_ERR_USAGE) { return 18; }
+
+  var cs3: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs3);
+  if (rc_changeset_put(&cs3, -1, RcInt(1)) != RC_ERR_USAGE) { return 19; }
+  if (rc_changeset_error_field(&cs3) != -1) { return 20; }
+  if (rc_changeset_put_text(&cs3, 8, "1") != RC_ERR_USAGE) { return 21; }
+
+  // put_name resolves a field name and a column name alike.
+  var cs4: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs4);
+  if (rc_changeset_put_name(&cs4, "email", RcText("e@example.com")) != RC_OK) { return 22; }
+  if (!rc_changeset_has(&cs4, 1)) { return 23; }
+  if (!rc_value_same(cs4.values[1], RcText("e@example.com"))) { return 24; }
+  if (rc_changeset_put_name(&cs4, "created_at", RcTime(7)) != RC_OK) { return 25; }
+  if (!rc_changeset_has(&cs4, 6)) { return 26; }
+
+  // apply refuses a DELETED entity, and a changeset over another table.
+  var cs5: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs5);
+  if (rc_changeset_put(&cs5, 2, RcText("Nope")) != RC_OK) { return 27; }
+  e.state = RC_ST_DELETED;
+  if (rc_changeset_apply(&cs5, &e) != RC_ERR_USAGE) { return 28; }
+  if (rc_changeset_error_code(&cs5) != RC_ERR_USAGE) { return 29; }
+  // Refused up front, before the first field: no field index, no partial write.
+  if (rc_changeset_error_field(&cs5) != -1) { return 47; }
+  if (u.name != "Ada") { return 30; }
+
+  // core/meta does the final narrowing, and its code and field index come back
+  // unchanged: age is an int32 field, so 3000000000 is a RANGE at write time,
+  // not a CAST at put time.
+  var cs6: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs6);
+  var u2: User;
+  var e2: RcEntity;
+  if (build_user(&u2, &e2) != 0) { return 31; }
+  e2.state = RC_ST_CLEAN;
+  if (rc_changeset_put(&cs6, 3, RcInt((int64)3000000000)) != RC_OK) { return 32; }
+  if (rc_changeset_apply(&cs6, &e2) != RC_ERR_RANGE) { return 33; }
+  if (rc_changeset_error_field(&cs6) != 3) { return 34; }
+  if (rc_changeset_error_code(&cs6) != RC_ERR_RANGE) { return 35; }
+  if (e2.state != RC_ST_CLEAN) { return 36; }
+  if (!rc_nulls_has(e2.nulls, 3)) { return 37; }
+
+  // A baseline needs a model.
+  var cs7: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs7);
+  if (rc_changeset_bind(&cs7, 0, (uint64)0) != RC_ERR_USAGE) { return 38; }
+  if (rc_changeset_error_field(&cs7) != -1) { return 39; }
+
+  // reset clears the mask, the cells and the recorded error, but keeps the meta.
+  if (rc_changeset_reset(&cs2) != RC_OK) { return 40; }
+  if (rc_changeset_error_code(&cs2) != RC_OK) { return 41; }
+  if (rc_changeset_error_field(&cs2) != -1) { return 42; }
+  if (rc_changeset_n_dirty(&cs2) != 0) { return 43; }
+  if (!rc_changeset_valid(&cs2)) { return 44; }
+  if (rc_changeset_put(&cs2, 2, RcText("Again")) != RC_OK) { return 45; }
+  if (!rc_changeset_has(&cs2, 2)) { return 46; }
+  return 0;
+}
+
+// --- 8. borrowed text is not copied ------------------------------------------
+
+fn check_borrowed_text() -> int32 {
+  // A heap buffer, so pointer identity cannot be an accident of a literal.
+  var src: string = rc_text_dup("borrowed-ada");
+  defer rc_text_free(src);
+  if (src.chars == 0) { return 1; }
+  if (src.length != (uint64)12) { return 2; }
+
+  var m: RcMeta = user_meta();
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_put_text(&cs, 2, src) != RC_OK) { return 3; }
+  var id1: int32 = view_identity(cs.values[2], src);
+  if (id1 != 0) { return 10 + id1; }
+  // The cell still reads as the same bytes ...
+  if (!rc_value_same(cs.values[2], RcText(src))) { return 4; }
+
+  // ... and the same holds for put with a RcText arm.
+  var cs2: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs2);
+  if (rc_changeset_put(&cs2, 2, RcText(src)) != RC_OK) { return 5; }
+  var id2: int32 = view_identity(cs2.values[2], src);
+  if (id2 != 0) { return 20 + id2; }
+
+  // A literal is borrowed the same way: no copy, same address.
+  var lit: string = "literal-name";
+  var cs3: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs3);
+  if (rc_changeset_put_text(&cs3, 2, lit) != RC_OK) { return 6; }
+  var id3: int32 = view_identity(cs3.values[2], lit);
+  if (id3 != 0) { return 30 + id3; }
+
+  // Freeing the changeset must not free the caller's buffer: src is still
+  // readable here, and rc_text_free below is the only owner.
+  if (src != "borrowed-ada") { return 7; }
+  return 0;
+}
+
+// --- runner ------------------------------------------------------------------
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("changeset: cast matrix", check_cast_matrix())) { failures = failures + 1; }
+  if (!rc_report("changeset: empty text is null only when nullable", check_empty_text())) { failures = failures + 1; }
+  if (!rc_report("changeset: identical value is not dirty", check_identical_not_dirty())) { failures = failures + 1; }
+  if (!rc_report("changeset: apply writes only changed fields", check_apply_only_changed())) { failures = failures + 1; }
+  if (!rc_report("changeset: new entity stays new", check_new_entity_stays_new())) { failures = failures + 1; }
+  if (!rc_report("changeset: strict put refuses coercion", check_strict_put())) { failures = failures + 1; }
+  if (!rc_report("changeset: errors carry field and code", check_errors())) { failures = failures + 1; }
+  if (!rc_report("changeset: borrowed text is not copied", check_borrowed_text())) { failures = failures + 1; }
+  return rc_summary(failures, 8);
+}
+
+@test fn t_changeset() -> int32 {
+  if (check_cast_matrix() != 0) { return 1; }
+  if (check_empty_text() != 0) { return 2; }
+  if (check_identical_not_dirty() != 0) { return 3; }
+  if (check_apply_only_changed() != 0) { return 4; }
+  if (check_new_entity_stays_new() != 0) { return 5; }
+  if (check_strict_put() != 0) { return 6; }
+  if (check_errors() != 0) { return 7; }
+  if (check_borrowed_text() != 0) { return 8; }
+  return 0;
+}

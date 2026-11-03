@@ -1,0 +1,440 @@
+// tests/t_migration.mettle — Phase 5: up-only migrations against the seam.
+//
+// Every statement is asserted verbatim. "Close enough SQL" is how an ORM ends
+// up quoting an identifier with user data in it, and a ledger whose text drifts
+// silently is a ledger nobody can audit.
+//
+// The exec sequence is asserted by call count, because the sequence *is* the
+// contract: ledger DDL, ledger SELECT, then (up_sql, ledger INSERT) per missing
+// version. A run that reorders those has a different failure story than the one
+// this module documents.
+
+import "std/io";
+import "std/mem";
+
+import "../src/core/status";
+import "../src/core/value";
+import "../src/core/buf";
+import "../src/adapter/adapter";
+import "../src/adapter/mem";
+import "../src/migration/ddl";
+import "../src/migration/version";
+import "models";
+import "harness";
+
+const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_reach_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
+const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_reach_migrations\" ORDER BY \"version\" ASC";
+const LEDGER_INSERT: string = "INSERT INTO \"_reach_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
+
+const USER_DDL: string = "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" INTEGER PRIMARY KEY, \"email\" TEXT NOT NULL UNIQUE, \"name\" TEXT NOT NULL, \"age\" INTEGER, \"active\" INTEGER NOT NULL, \"score\" REAL, \"created_at\" INTEGER NOT NULL, \"role\" INTEGER NOT NULL)";
+const POST_DDL: string = "CREATE TABLE IF NOT EXISTS \"posts\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"title\" TEXT NOT NULL, \"body\" TEXT, \"published_at\" INTEGER)";
+
+const CLOCK: int64 = 1700000000000123;
+
+// The migration list a real application would compile in: a const table, in
+// ascending order, checked once at startup.
+const TWO: RcMigration[2] = [
+  { version: 1, name: "create users", up_sql: "CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY)" },
+  { version: 2, name: "create posts", up_sql: "CREATE TABLE \"posts\" (\"id\" INTEGER PRIMARY KEY)" },
+];
+
+fn new_adapter(out: RcAdapter**) -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return RC_ERR_NOMEM; }
+  if (rc_adapter_open(a, "mem://reach") != RC_OK) {
+    rc_mem_free(a);
+    return RC_ERR_ADAPTER;
+  }
+  *out = a;
+  return RC_OK;
+}
+
+// --- a counting adapter ------------------------------------------------------
+// rc_mem_fail_next fires on the *next* exec, and the next exec after arming is
+// the ledger DDL — not the migration the test wants to fail. So the failure is
+// armed from a wrapper that counts execs and arms on the one it wants. The
+// failure itself is still mem's (it records nothing, and it is one-shot); only
+// the timing is supplied here. No frozen file is touched.
+//
+// The wrapper is a *copy* of the mem vtable with `exec` replaced, so ud stays
+// mem's and begin/commit/rollback/close keep working unchanged.
+var RC_MIG_INNER: RcAdapter* = 0;
+var RC_MIG_CALLS: int32 = 0;
+var RC_MIG_FAIL_AT: int32 = 0;
+
+fn rc_mig_flaky_exec(ud: rawptr, sql: string, args: RcValue*, n_args: int32,
+                     out: RcResult*) -> int32 {
+  RC_MIG_CALLS = RC_MIG_CALLS + 1;
+  if (RC_MIG_CALLS == RC_MIG_FAIL_AT) {
+    rc_mem_fail_next(RC_MIG_INNER, RC_ERR_ADAPTER);
+  }
+  return rc_adapter_exec(RC_MIG_INNER, sql, args, n_args, out);
+}
+
+fn rc_mig_flaky(inner: RcAdapter*, fail_at: int32) -> RcAdapter {
+  var a: RcAdapter = *inner;
+  a.exec = &rc_mig_flaky_exec;
+  RC_MIG_INNER = inner;
+  RC_MIG_CALLS = 0;
+  RC_MIG_FAIL_AT = fail_at;
+  return a;
+}
+
+// --- 1. ledger statements ----------------------------------------------------
+
+fn check_ledger_statements() -> int32 {
+  if (RC_MIG_LEDGER != "_reach_migrations") { return 1; }
+
+  var b: RcBuf = rc_buf_new(256);
+  if (b.data == 0) { return 2; }
+  defer rc_buf_free(&b);
+
+  if (rc_migration_ledger_ddl(&b) != RC_OK) { return 3; }
+  if (rc_buf_text(&b) != LEDGER_DDL) { return 4; }
+
+  rc_buf_clear(&b);
+  if (rc_migration_ledger_select(&b) != RC_OK) { return 5; }
+  if (rc_buf_text(&b) != LEDGER_SELECT) { return 6; }
+
+  rc_buf_clear(&b);
+  if (rc_migration_ledger_insert(&b) != RC_OK) { return 7; }
+  if (rc_buf_text(&b) != LEDGER_INSERT) { return 8; }
+
+  // A null buffer is caller misuse, not a crash.
+  if (rc_migration_ledger_ddl(0) != RC_ERR_USAGE) { return 9; }
+  if (rc_migration_ledger_select(0) != RC_ERR_USAGE) { return 10; }
+  if (rc_migration_ledger_insert(0) != RC_ERR_USAGE) { return 11; }
+  return 0;
+}
+
+// --- 2. CREATE TABLE from metadata ------------------------------------------
+
+fn check_create_table() -> int32 {
+  var b: RcBuf = rc_buf_new(256);
+  if (b.data == 0) { return 1; }
+  defer rc_buf_free(&b);
+
+  if (rc_migration_create_table(user_meta(), &b) != RC_OK) { return 2; }
+  if (rc_buf_text(&b) != USER_DDL) { return 3; }
+
+  rc_buf_clear(&b);
+  if (rc_migration_create_table(post_meta(), &b) != RC_OK) { return 4; }
+  if (rc_buf_text(&b) != POST_DDL) { return 5; }
+
+  // Doc carries a `uint8[]` field: the wire cannot describe it, so the whole
+  // call is refused and the buffer is untouched — no partial statement.
+  rc_buf_clear(&b);
+  if (rc_migration_create_table(doc_meta(), &b) != RC_ERR_UNSUPPORTED) { return 6; }
+  if (b.len != (int64)0) { return 7; }
+
+  // The refusal leaves the builder usable.
+  if (rc_migration_create_table(user_meta(), &b) != RC_OK) { return 8; }
+  if (rc_buf_text(&b) != USER_DDL) { return 9; }
+
+  if (rc_migration_create_table(user_meta(), 0) != RC_ERR_USAGE) { return 10; }
+  return 0;
+}
+
+// --- 3. only the missing versions run ---------------------------------------
+
+fn check_applies_missing() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+
+  // mem pops one scripted step per exec, in call order: ledger DDL, ledger
+  // SELECT (one row: version 1), migration 2's up_sql, ledger INSERT.
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 2; }
+  var row: RcValue[1];
+  row[0] = RcInt(1);
+  if (rc_mem_push_rows(a, &row[0], 1, 1) != RC_OK) { return 3; }
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 4; }
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 5; }
+
+  // The clock is a seam: nothing is invented when nothing is injected.
+  rc_migration_set_clock(0);
+  if (rc_migration_now_micros() != 0) { return 6; }
+  rc_migration_set_clock(CLOCK);
+  if (rc_migration_now_micros() != CLOCK) { return 7; }
+
+  var s: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  var rep: RcMigrationReport;
+  var rc: int32 = rc_migration_run(a, &s, &rep);
+  if (rc != RC_OK) { return 8; }
+  if (rep.code != RC_OK) { return 9; }
+  if (rep.applied != 1) { return 10; }
+  if (rep.up_to != 2) { return 11; }
+  if (rep.failed_version != 0) { return 12; }
+
+  if (rc_mem_commits(a) != 1) { return 13; }
+  if (rc_mem_rollbacks(a) != 0) { return 14; }
+  if (rc_mem_tx_depth(a) != 0) { return 15; }
+
+  // DDL, SELECT, up_sql(2), INSERT: four execs, and version 1 never re-runs.
+  if (rc_mem_call_count(a) != 4) { return 16; }
+  if (rc_mem_last_sql(a) != LEDGER_INSERT) { return 17; }
+  if (rc_mem_arg_count(a) != 3) { return 18; }
+  var args: RcValue* = rc_mem_last_args(a);
+  if (args == 0) { return 19; }
+  if (!rc_value_same(args[0], RcInt(2))) { return 20; }
+  if (!rc_value_same(args[1], RcText("create posts"))) { return 21; }
+  if (!rc_value_same(args[2], RcTime(CLOCK))) { return 22; }
+
+  rc_migration_set_clock(0);
+
+  // A ledger read that is not one column wide is an adapter fault. Reading
+  // column 0 anyway would silently treat a shifted row as "not applied" and
+  // re-run migrations, which is the expensive direction of this bug.
+  var a2: RcAdapter* = 0;
+  if (new_adapter(&a2) != RC_OK) { return 23; }
+  defer rc_mem_free(a2);
+  if (rc_mem_push_ok(a2, 0, 0) != RC_OK) { return 24; }
+  var wide: RcValue[2];
+  wide[0] = RcInt(1);
+  wide[1] = RcInt(2);
+  if (rc_mem_push_rows(a2, &wide[0], 1, 2) != RC_OK) { return 25; }
+  var rep2: RcMigrationReport;
+  if (rc_migration_run(a2, &s, &rep2) != RC_ERR_ADAPTER) { return 26; }
+  if (rep2.code != RC_ERR_ADAPTER) { return 27; }
+  if (rep2.applied != 0) { return 28; }
+  if (rc_mem_commits(a2) != 0) { return 29; }
+  if (rc_mem_tx_depth(a2) != 0) { return 30; }
+  return 0;
+}
+
+// --- 4. one transaction per migration ---------------------------------------
+
+fn check_one_tx_each() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+
+  // Empty ledger: DDL, SELECT, then up_sql+INSERT for each of the two.
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 2; }
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 3; }
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 4; }
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 5; }
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 6; }
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 7; }
+
+  rc_migration_set_clock(CLOCK);
+  var s: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  var rep: RcMigrationReport;
+  var rc: int32 = rc_migration_run(a, &s, &rep);
+  if (rc != RC_OK) { return 8; }
+  if (rep.applied != 2) { return 9; }
+  if (rep.up_to != 2) { return 10; }
+  if (rc_mem_commits(a) != 2) { return 11; }
+  if (rc_mem_rollbacks(a) != 0) { return 12; }
+  if (rc_mem_tx_depth(a) != 0) { return 13; }
+  if (rc_mem_call_count(a) != 6) { return 14; }
+
+  // A second run against a ledger that already has both versions is a no-op
+  // beyond the two ledger statements: idempotent, and nothing re-applies.
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 15; }
+  var rows: RcValue[2];
+  rows[0] = RcInt(1);
+  rows[1] = RcInt(2);
+  if (rc_mem_push_rows(a, &rows[0], 2, 1) != RC_OK) { return 16; }
+  rc = rc_migration_run(a, &s, &rep);
+  if (rc != RC_OK) { return 17; }
+  if (rep.applied != 0) { return 18; }
+  if (rep.up_to != 2) { return 19; }
+  if (rc_mem_commits(a) != 2) { return 20; }
+  if (rc_mem_call_count(a) != 8) { return 21; }
+
+  rc_migration_set_clock(0);
+  return 0;
+}
+
+// --- 5. failure rolls back and names the version ----------------------------
+
+// 5a. mem's arming is one-shot and fires on the next exec, which is the ledger
+// DDL: a failure before any transaction starts leaves no transaction state.
+fn check_fail_before_tx() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+
+  if (rc_mem_fail_next(a, RC_ERR_ADAPTER) != RC_OK) { return 2; }
+  var s: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  var rep: RcMigrationReport;
+  var rc: int32 = rc_migration_run(a, &s, &rep);
+  if (rc != RC_ERR_ADAPTER) { return 3; }
+  if (rep.code != RC_ERR_ADAPTER) { return 4; }
+  if (rep.applied != 0) { return 5; }
+  if (rep.failed_version != 0) { return 6; }
+  if (rc_mem_commits(a) != 0) { return 7; }
+  if (rc_mem_rollbacks(a) != 0) { return 8; }
+  if (rc_mem_tx_depth(a) != 0) { return 9; }
+  if (rc_mem_call_count(a) != 0) { return 10; }
+  return 0;
+}
+
+// 5b. The migration's own statement fails inside its transaction: rollback,
+// the failing version reported, and the ledger row never written.
+fn check_fail_in_migration() -> int32 {
+  var inner: RcAdapter* = 0;
+  if (new_adapter(&inner) != RC_OK) { return 1; }
+  defer rc_mem_free(inner);
+
+  // DDL, SELECT, then exec 3 = version 1's up_sql, which is the one that fails.
+  if (rc_mem_push_ok(inner, 0, 0) != RC_OK) { return 2; }
+  if (rc_mem_push_ok(inner, 0, 0) != RC_OK) { return 3; }
+
+  var a: RcAdapter = rc_mig_flaky(inner, 3);
+  var s: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  var rep: RcMigrationReport;
+  var rc: int32 = rc_migration_run(&a, &s, &rep);
+  if (rc != RC_ERR_ADAPTER) { return 4; }
+  if (rep.code != RC_ERR_ADAPTER) { return 5; }
+  if (rep.failed_version != 1) { return 6; }
+  if (rep.applied != 0) { return 7; }
+  if (rc_mem_rollbacks(inner) != 1) { return 8; }
+  if (rc_mem_commits(inner) != 0) { return 9; }
+  if (rc_mem_tx_depth(inner) != 0) { return 10; }
+  // The ledger INSERT never became the last statement: the transaction died
+  // before bookkeeping, so schema and ledger still agree.
+  if (rc_mem_last_sql(inner) != LEDGER_SELECT) { return 11; }
+  if (rc_mem_last_sql(inner) == LEDGER_INSERT) { return 12; }
+  return 0;
+}
+
+fn check_failure_rolls_back() -> int32 {
+  var rc: int32 = check_fail_before_tx();
+  if (rc != 0) { return rc; }
+  rc = check_fail_in_migration();
+  if (rc != 0) { return 100 + rc; }
+  return 0;
+}
+
+// --- 6. store ahead of code -------------------------------------------------
+
+fn check_store_ahead() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 2; }
+  var row: RcValue[1];
+  row[0] = RcInt(9);
+  if (rc_mem_push_rows(a, &row[0], 1, 1) != RC_OK) { return 3; }
+
+  var s: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  var rep: RcMigrationReport;
+  var rc: int32 = rc_migration_run(a, &s, &rep);
+  if (rc != RC_ERR_CONFLICT) { return 4; }
+  if (rep.code != RC_ERR_CONFLICT) { return 5; }
+  if (rep.failed_version != 9) { return 6; }
+  if (rep.applied != 0) { return 7; }
+  if (rc_mem_commits(a) != 0) { return 8; }
+  if (rc_mem_rollbacks(a) != 0) { return 9; }
+  if (rc_mem_tx_depth(a) != 0) { return 10; }
+  // DDL and SELECT only: no transaction was ever started.
+  if (rc_mem_call_count(a) != 2) { return 11; }
+  return 0;
+}
+
+// --- 7. malformed sets ------------------------------------------------------
+
+fn check_refused(a: RcAdapter*, s: RcMigrationSet) -> int32 {
+  if (rc_migration_check(s) != RC_ERR_USAGE) { return 1; }
+  var rep: RcMigrationReport;
+  var rc: int32 = rc_migration_run(a, &s, &rep);
+  if (rc != RC_ERR_USAGE) { return 2; }
+  if (rep.code != RC_ERR_USAGE) { return 3; }
+  if (rep.applied != 0) { return 4; }
+  if (rep.failed_version != 0) { return 5; }
+  if (rc_mem_call_count(a) != 0) { return 6; }
+  return 0;
+}
+
+fn check_invalid_sets() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+
+  var dup: RcMigration[2];
+  dup[0] = { version: 1, name: "one", up_sql: "CREATE TABLE a" };
+  dup[1] = { version: 1, name: "one again", up_sql: "CREATE TABLE b" };
+  if (check_refused(a, rc_migration_set(&dup[0], 2)) != 0) { return 2; }
+
+  var desc: RcMigration[2];
+  desc[0] = { version: 2, name: "two", up_sql: "CREATE TABLE b" };
+  desc[1] = { version: 1, name: "one", up_sql: "CREATE TABLE a" };
+  if (check_refused(a, rc_migration_set(&desc[0], 2)) != 0) { return 3; }
+
+  var noname: RcMigration[1];
+  noname[0] = { version: 1, name: "", up_sql: "CREATE TABLE a" };
+  if (check_refused(a, rc_migration_set(&noname[0], 1)) != 0) { return 4; }
+
+  var nosql: RcMigration[1];
+  nosql[0] = { version: 1, name: "empty", up_sql: "" };
+  if (check_refused(a, rc_migration_set(&nosql[0], 1)) != 0) { return 5; }
+
+  var zero: RcMigration[1];
+  zero[0] = { version: 0, name: "zero", up_sql: "CREATE TABLE a" };
+  if (check_refused(a, rc_migration_set(&zero[0], 1)) != 0) { return 6; }
+
+  // No items, but a count: a caller bug, not an empty set.
+  if (check_refused(a, rc_migration_set(0, 2)) != 0) { return 7; }
+  // A negative count is a caller bug too.
+  if (check_refused(a, rc_migration_set(0, -1)) != 0) { return 8; }
+
+  // An empty set is legal (nothing to do), and it still checks the ledger.
+  var empty: RcMigrationSet = rc_migration_set(0, 0);
+  if (rc_migration_check(empty) != RC_OK) { return 9; }
+
+  // Null arguments are caller misuse and never reach the store.
+  var good: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  var rep: RcMigrationReport;
+  if (rc_migration_run((RcAdapter*)0, &good, &rep) != RC_ERR_USAGE) { return 10; }
+  if (rep.code != RC_ERR_USAGE) { return 11; }
+  if (rc_migration_run(a, (RcMigrationSet*)0, &rep) != RC_ERR_USAGE) { return 12; }
+  if (rc_migration_run(a, &good, (RcMigrationReport*)0) != RC_ERR_USAGE) { return 13; }
+  if (rc_mem_call_count(a) != 0) { return 14; }
+  return 0;
+}
+
+// --- 8. down is unsupported -------------------------------------------------
+
+fn check_down_unsupported() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+
+  var s: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  if (rc_migration_down(a, &s, 2) != RC_ERR_UNSUPPORTED) { return 2; }
+  if (rc_migration_down(a, &s, 1) != RC_ERR_UNSUPPORTED) { return 3; }
+  // Up-only means down never reaches the store.
+  if (rc_mem_call_count(a) != 0) { return 4; }
+  if (rc_mem_tx_depth(a) != 0) { return 5; }
+  return 0;
+}
+
+// --- runner -----------------------------------------------------------------
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("migration: ledger statements are exact", check_ledger_statements())) { failures = failures + 1; }
+  if (!rc_report("migration: create table matches metadata", check_create_table())) { failures = failures + 1; }
+  if (!rc_report("migration: applies only missing versions", check_applies_missing())) { failures = failures + 1; }
+  if (!rc_report("migration: each migration commits its own transaction", check_one_tx_each())) { failures = failures + 1; }
+  if (!rc_report("migration: failure rolls back and reports the version", check_failure_rolls_back())) { failures = failures + 1; }
+  if (!rc_report("migration: store ahead of code is refused", check_store_ahead())) { failures = failures + 1; }
+  if (!rc_report("migration: invalid sets are refused", check_invalid_sets())) { failures = failures + 1; }
+  if (!rc_report("migration: down is unsupported", check_down_unsupported())) { failures = failures + 1; }
+  return rc_summary(failures, 8);
+}
+
+@test fn t_migration() -> int32 {
+  if (check_ledger_statements() != 0) { return 1; }
+  if (check_create_table() != 0) { return 2; }
+  if (check_applies_missing() != 0) { return 3; }
+  if (check_one_tx_each() != 0) { return 4; }
+  if (check_failure_rolls_back() != 0) { return 5; }
+  if (check_store_ahead() != 0) { return 6; }
+  if (check_invalid_sets() != 0) { return 7; }
+  if (check_down_unsupported() != 0) { return 8; }
+  return 0;
+}

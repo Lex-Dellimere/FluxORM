@@ -1,0 +1,26 @@
+// tests/harness.mettle — the two-line harness both runners use.
+//
+// `mettle test` runs the @test entry; the built binary runs main(). Both call
+// the same check_* functions, so a behaviour is verified by the interpreter and
+// by real codegen. (Externs like malloc work in the interpreter, but memcpy is
+// not guaranteed to, which is why the binary runner is not optional.)
+
+import "std/io";
+
+export fn rc_report(name: string, code: int32) -> bool {
+  if (code == 0) {
+    println("  ok   {name}");
+    return true;
+  }
+  println("  FAIL {name} code={code}");
+  return false;
+}
+
+export fn rc_summary(failures: int32, total: int32) -> int32 {
+  if (failures == 0) {
+    println("{total} checks passed");
+    return 0;
+  }
+  println("{failures} of {total} checks FAILED");
+  return 1;
+}

@@ -1,0 +1,76 @@
+// reach/core/entity.mettle — a model row's persistence state.
+//
+// The model struct is what the application holds. RcEntity is what the ORM
+// knows about it: which metadata describes it, which fields are NULL, and
+// whether it is in the store. Keeping this beside the struct (not inside it)
+// is what lets a plain Mettle struct with no nullable scalars be a model.
+
+import "status";
+import "value";
+import "meta";
+
+export const RC_ST_NEW: int32 = 0;     // not in the store
+export const RC_ST_CLEAN: int32 = 1;   // matches the store
+export const RC_ST_DIRTY: int32 = 2;   // loaded, changed in memory
+export const RC_ST_DELETED: int32 = 3; // removed from the store
+
+export struct RcEntity {
+  meta: RcMeta;
+  model: rawptr;
+  nulls: uint64;
+  state: int32;
+}
+
+export fn rc_entity_state_name(s: int32) -> string {
+  if (s == RC_ST_NEW) { return "new"; }
+  if (s == RC_ST_CLEAN) { return "clean"; }
+  if (s == RC_ST_DIRTY) { return "dirty"; }
+  if (s == RC_ST_DELETED) { return "deleted"; }
+  return "unknown";
+}
+
+export fn rc_entity_new(m: RcMeta, model: rawptr) -> RcEntity {
+  var e: RcEntity;
+  e.meta = m;
+  e.model = model;
+  e.nulls = 0;
+  e.state = RC_ST_NEW;
+  // An auto key is absent until the store assigns it, and "absent" is a null.
+  var pk: int32 = rc_meta_pk(m);
+  if (pk >= 0) {
+    if ((m.fields[pk].flags & RC_F_AUTO) != 0) {
+      e.nulls = rc_nulls_set(e.nulls, pk);
+    }
+  }
+  return e;
+}
+
+export fn rc_entity_get(e: RcEntity*, i: int32, out: RcValue*) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  return rc_meta_get(e.meta, e.model, e.nulls, i, out);
+}
+
+export fn rc_entity_set(e: RcEntity*, i: int32, v: RcValue) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  if (e.state == RC_ST_DELETED) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_set(e.meta, e.model, &e.nulls, i, v);
+  if (rc != RC_OK) { return rc; }
+  if (e.state == RC_ST_CLEAN) { e.state = RC_ST_DIRTY; }
+  return RC_OK;
+}
+
+// The primary key value, or RcNull when the row has none yet.
+export fn rc_entity_pk(e: RcEntity*) -> RcValue {
+  if (e == 0) { return RcNull; }
+  var pk: int32 = rc_meta_pk(e->meta);
+  if (pk < 0) { return RcNull; }
+  var v: RcValue = RcNull;
+  if (rc_meta_get(e->meta, e->model, e->nulls, pk, &v) != RC_OK) { return RcNull; }
+  return v;
+}
+
+export fn rc_entity_has_pk(e: RcEntity*) -> bool {
+  var v: RcValue = rc_entity_pk(e);
+  if (rc_value_is_null(v)) { return false; }
+  return true;
+}

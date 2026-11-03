@@ -1,0 +1,224 @@
+// tests/t_adapter.mettle — the driver seam.
+//
+// Check 5 (a failed statement leaves no partial state) plus the seam's
+// contract: arguments arrive in order, NULL survives the boundary, a closed
+// or absent capability is an error and not a call through null, and the
+// transaction state machine refuses nesting instead of pretending.
+
+import "std/io";
+import "std/mem";
+
+import "../src/core/status";
+import "../src/core/value";
+import "../src/adapter/adapter";
+import "../src/adapter/mem";
+import "../src/adapter/dacor";
+import "harness";
+
+fn check_binding() -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return 1; }
+  defer rc_mem_free(a);
+  if (a.name != "mem") { return 2; }
+  if (rc_adapter_ping(a) != RC_ERR_CLOSED) { return 3; }
+  if (rc_adapter_open(a, "") != RC_ERR_USAGE) { return 4; }
+  if (rc_adapter_open(a, "mem://test") != RC_OK) { return 5; }
+  if (!rc_mem_is_open(a)) { return 6; }
+  if (rc_adapter_ping(a) != RC_OK) { return 7; }
+
+  var args: RcValue[4];
+  args[0] = RcInt(7);
+  args[1] = RcText("héllo");
+  args[2] = RcNull;
+  args[3] = RcBool(true);
+  var sql: string = "INSERT INTO \"t\" (\"a\", \"b\", \"c\", \"d\") VALUES (?, ?, ?, ?)";
+  var r: RcResult;
+  if (rc_adapter_exec(a, sql, &args[0], 4, &r) != RC_OK) { return 10; }
+  rc_result_free(&r);
+
+  if (rc_mem_call_count(a) != 1) { return 11; }
+  if (rc_mem_arg_count(a) != 4) { return 12; }
+  if (rc_mem_last_sql(a) != sql) { return 13; }
+  var rec: RcValue* = rc_mem_last_args(a);
+  if (rec == 0) { return 14; }
+  if (!rc_value_same(rec[0], RcInt(7))) { return 15; }
+  if (!rc_value_same(rec[1], RcText("héllo"))) { return 16; }
+  if (!rc_value_is_null(rec[2])) { return 17; }
+  if (!rc_value_same(rec[3], RcBool(true))) { return 18; }
+  if (rc_value_type(rec[3]) != RC_T_BOOL) { return 19; }
+
+  // The next statement replaces the recorded one, so the record is not sticky.
+  var r2: RcResult;
+  if (rc_adapter_exec(a, "SELECT 1", (RcValue*)0, 0, &r2) != RC_OK) { return 20; }
+  rc_result_free(&r2);
+  if (rc_mem_call_count(a) != 2) { return 21; }
+  if (rc_mem_arg_count(a) != 0) { return 22; }
+  if (rc_mem_last_sql(a) != "SELECT 1") { return 23; }
+  return 0;
+}
+
+fn check_failure_is_total() -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return 1; }
+  defer rc_mem_free(a);
+  if (rc_adapter_open(a, "mem://test") != RC_OK) { return 2; }
+
+  var r: RcResult;
+  if (rc_adapter_exec(a, "INSERT INTO t VALUES (?)", (RcValue*)0, 1, &r) != RC_ERR_USAGE) {
+    return 3;
+  }
+  if (rc_mem_call_count(a) != 0) { return 4; } // never reached the driver
+
+  var args: RcValue[2];
+  args[0] = RcInt(1);
+  args[1] = RcInt(2);
+  if (rc_adapter_exec(a, "UPDATE t SET a = ?", &args[0], 2, &r) != RC_OK) { return 5; }
+  rc_result_free(&r);
+  if (rc_mem_call_count(a) != 1) { return 6; }
+
+  // An injected write conflict: the call fails and records nothing.
+  if (rc_mem_fail_next(a, RC_ERR_CONFLICT) != RC_OK) { return 7; }
+  var failing: RcValue[1];
+  failing[0] = RcInt(9);
+  if (rc_adapter_exec(a, "UPDATE t SET a = ?", &failing[0], 1, &r) != RC_ERR_CONFLICT) {
+    return 8;
+  }
+  if (rc_mem_call_count(a) != 1) { return 9; }
+  if (rc_mem_last_sql(a) != "UPDATE t SET a = ?") { return 10; }
+  if (rc_mem_arg_count(a) != 2) { return 11; }
+  if (!rc_value_same(rc_mem_last_args(a)[0], RcInt(1))) { return 12; }
+
+  // The failure is one-shot; the next call succeeds.
+  if (rc_adapter_exec(a, "SELECT 1", (RcValue*)0, 0, &r) != RC_OK) { return 13; }
+  rc_result_free(&r);
+  if (rc_mem_call_count(a) != 2) { return 14; }
+
+  // A null vtable is an error, not a crash.
+  if (rc_adapter_exec((RcAdapter*)0, "SELECT 1", (RcValue*)0, 0, &r) != RC_ERR_USAGE) {
+    return 15;
+  }
+  // A missing capability is unsupported, not a null call.
+  var bare: RcAdapter = rc_adapter_empty();
+  if (bare.name != "none") { return 18; }
+  if (rc_adapter_exec(&bare, "SELECT 1", (RcValue*)0, 0, &r) != RC_ERR_UNSUPPORTED) {
+    return 16;
+  }
+  if (rc_adapter_begin(&bare, RC_TX_DEFAULT) != RC_ERR_UNSUPPORTED) { return 17; }
+  return 0;
+}
+
+fn check_transactions() -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return 1; }
+  defer rc_mem_free(a);
+  if (rc_adapter_open(a, "mem://test") != RC_OK) { return 2; }
+
+  if (rc_adapter_commit(a) != RC_ERR_TX) { return 3; }   // commit with no tx
+  if (rc_adapter_rollback(a) != RC_ERR_TX) { return 4; }
+  if (rc_adapter_begin(a, RC_TX_DEFAULT) != RC_OK) { return 5; }
+  if (rc_mem_tx_depth(a) != 1) { return 6; }
+  // No nesting: a second begin is a boundary bug, not a savepoint.
+  if (rc_adapter_begin(a, RC_TX_DEFAULT) != RC_ERR_TX) { return 7; }
+  if (rc_adapter_begin(a, 99) != RC_ERR_USAGE) { return 8; } // bad mode first
+  if (rc_adapter_commit(a) != RC_OK) { return 9; }
+  if (rc_mem_tx_depth(a) != 0) { return 10; }
+  if (rc_mem_commits(a) != 1) { return 11; }
+  if (rc_adapter_commit(a) != RC_ERR_TX) { return 12; }
+
+  if (rc_adapter_begin(a, RC_TX_IMMEDIATE) != RC_OK) { return 13; }
+  // Closing inside a transaction would drop the rollback; refuse it.
+  if (rc_adapter_close(a) != RC_ERR_TX) { return 14; }
+  if (rc_adapter_rollback(a) != RC_OK) { return 15; }
+  if (rc_mem_rollbacks(a) != 1) { return 16; }
+  if (rc_adapter_close(a) != RC_OK) { return 17; }
+  if (rc_adapter_close(a) != RC_OK) { return 18; } // idempotent
+  if (rc_adapter_ping(a) != RC_ERR_CLOSED) { return 19; }
+  return 0;
+}
+
+fn check_result_rows() -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return 1; }
+  defer rc_mem_free(a);
+  if (rc_adapter_open(a, "mem://test") != RC_OK) { return 2; }
+
+  var vals: RcValue[4];
+  vals[0] = RcInt(1);
+  vals[1] = RcText("one");
+  vals[2] = RcNull;
+  vals[3] = RcFloat(2.5);
+  if (rc_mem_push_rows(a, &vals[0], 2, 2) != RC_OK) { return 3; }
+
+  var r: RcResult;
+  if (rc_adapter_exec(a, "SELECT a, b", (RcValue*)0, 0, &r) != RC_OK) { return 4; }
+  defer rc_result_free(&r);
+  if (r.n_rows != 2) { return 5; }
+  if (r.n_cols != 2) { return 6; }
+  if (r.rows[0].n != 2) { return 7; }
+
+  var s: string;
+  if (rc_result_text(&r, 0, 1, &s) != RC_OK) { return 8; }
+  if (s != "one") { return 9; }
+  if (!rc_value_is_null(r.rows[1].values[0])) { return 10; }
+  if (!rc_value_same(r.rows[1].values[1], RcFloat(2.5))) { return 11; }
+
+  var i: int64 = 0;
+  if (rc_result_i64(&r, 0, 0, &i) != RC_OK) { return 12; }
+  if (i != 1) { return 13; }
+  if (rc_result_i64(&r, 0, 1, &i) != RC_ERR_CAST) { return 14; }
+  if (rc_result_get(&r, 5, 0, &vals[0]) != RC_ERR_USAGE) { return 15; }
+
+  // Freeing twice is safe; a result is a value, not a handle.
+  rc_result_free(&r);
+  rc_result_free(&r);
+  if (r.n_rows != 0) { return 16; }
+  return 0;
+}
+
+fn check_dacor_is_gated() -> int32 {
+  if (rc_dacor_supported()) { return 1; }
+  if (rc_dacor_affinity(RC_T_TEXT) != "TEXT") { return 2; }
+  if (rc_dacor_affinity(RC_T_F64) != "REAL") { return 3; }
+  if (rc_dacor_affinity(RC_T_TIME) != "INTEGER") { return 4; }
+  if (rc_dacor_affinity(RC_T_I64) != "INTEGER") { return 5; }
+  if (rc_dacor_affinity(RC_T_BOOL) != "INTEGER") { return 6; }
+  if (rc_dacor_affinity(RC_T_BLOB) != "BLOB") { return 7; }
+  if (rc_dacor_affinity(RC_T_NULL) != "") { return 8; }
+
+  var a: RcAdapter* = rc_dacor_adapter("test.db", RC_DACOR_CREATE | RC_DACOR_WRITE);
+  if (a == 0) { return 9; }
+  defer rc_dacor_adapter_free(a);
+  if (a.name != "dacor") { return 10; }
+  // Every entry point refuses until dacor's api/ exists. Nothing may silently
+  // succeed here and let a caller believe in a store that is not there.
+  if (rc_adapter_open(a, "test.db") != RC_ERR_UNSUPPORTED) { return 11; }
+  var r: RcResult;
+  if (rc_adapter_exec(a, "SELECT 1", (RcValue*)0, 0, &r) != RC_ERR_UNSUPPORTED) {
+    return 12;
+  }
+  if (rc_adapter_begin(a, RC_TX_IMMEDIATE) != RC_ERR_UNSUPPORTED) { return 13; }
+  if (rc_adapter_commit(a) != RC_ERR_UNSUPPORTED) { return 14; }
+  if (rc_adapter_rollback(a) != RC_ERR_UNSUPPORTED) { return 15; }
+  if (rc_adapter_ping(a) != RC_ERR_UNSUPPORTED) { return 16; }
+  if (rc_adapter_close(a) != RC_ERR_UNSUPPORTED) { return 17; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("adapter: binding order and types", check_binding())) { failures = failures + 1; }
+  if (!rc_report("adapter: failure leaves no state", check_failure_is_total())) { failures = failures + 1; }
+  if (!rc_report("adapter: transaction states", check_transactions())) { failures = failures + 1; }
+  if (!rc_report("adapter: result ownership", check_result_rows())) { failures = failures + 1; }
+  if (!rc_report("adapter: dacor is gated, not faked", check_dacor_is_gated())) { failures = failures + 1; }
+  return rc_summary(failures, 5);
+}
+
+@test fn t_adapter() -> int32 {
+  if (check_binding() != 0) { return 1; }
+  if (check_failure_is_total() != 0) { return 2; }
+  if (check_transactions() != 0) { return 3; }
+  if (check_result_rows() != 0) { return 4; }
+  if (check_dacor_is_gated() != 0) { return 5; }
+  return 0;
+}

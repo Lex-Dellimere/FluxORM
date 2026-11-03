@@ -1,0 +1,77 @@
+// reach/query/dialect.mettle — the SQL text flavour, as a value.
+//
+// One dialect ships: "dacor". It is a value rather than a pile of string
+// literals so the text builder has exactly one place that knows what a quoted
+// identifier and a placeholder look like, and so a later phase can ask "does
+// this store spell LIMIT that way?" without editing the builder.
+//
+// Ownership note (resolves the docs/02-seams.md vs. adapter/ overlap): this
+// file owns `RcDialect` for the whole tree. `adapter/` is not written in this
+// wave, so there is exactly one definition and no duplicate export.
+//
+// Byte-equality contract: `rc_dialect_ident(rc_dialect_default(), b, s)` must
+// produce exactly the same bytes as `rc_buf_ident(b, s)`. Routing every
+// identifier through the dialect is a refactor, not a behaviour change, and
+// tests/t_query.mettle asserts that equality on a plain name, a name with an
+// embedded double quote, the empty string, and a name with a backslash.
+//
+// `quote` is one *character*, not a string: it is the opening delimiter, and an
+// embedded delimiter is doubled. That is the SQL standard rule and it is what
+// core/buf already does.
+
+import "../core/status";
+import "../core/buf";
+
+export struct RcDialect {
+  name: string;        // "dacor"
+  quote: string;       // "\""
+  placeholder: string; // "?"
+  has_limit: bool;     // true — the store understands literal LIMIT n
+}
+
+export fn rc_dialect_default() -> RcDialect {
+  var d: RcDialect;
+  d.name = "dacor";
+  d.quote = "\"";
+  d.placeholder = "?";
+  d.has_limit = true;
+  return d;
+}
+
+export fn rc_dialect_name(d: RcDialect) -> string { return d.name; }
+
+// The opening delimiter byte. A dialect with an empty `quote` falls back to the
+// double quote rather than emitting an unquoted identifier: refusing to quote
+// is how a column name becomes SQL.
+fn rc_dialect_quote_char(d: RcDialect) -> uint8 {
+  if (d.quote.length == (uint64)0) { return (uint8)34; }
+  if (d.quote.chars == 0) { return (uint8)34; }
+  return d.quote.chars[0];
+}
+
+export fn rc_dialect_ident(d: RcDialect, b: RcBuf*, name: string) -> int32 {
+  if (b == 0) { return RC_ERR_USAGE; }
+  if (name.length > (uint64)0 && name.chars == 0) { return RC_ERR_USAGE; }
+  var q: uint8 = rc_dialect_quote_char(d);
+  var rc: int32 = rc_buf_putc(b, q);
+  if (rc != RC_OK) { return rc; }
+  var i: int64 = 0;
+  var n: int64 = (int64)name.length;
+  while (i < n) {
+    var c: uint8 = name.chars[i];
+    if (c == q) {
+      rc = rc_buf_putc(b, q);
+      if (rc != RC_OK) { return rc; }
+    }
+    rc = rc_buf_putc(b, c);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return rc_buf_putc(b, q);
+}
+
+export fn rc_dialect_placeholder(d: RcDialect, b: RcBuf*) -> int32 {
+  if (b == 0) { return RC_ERR_USAGE; }
+  if (d.placeholder.length == (uint64)0) { return RC_ERR_USAGE; }
+  return rc_buf_put(b, d.placeholder);
+}

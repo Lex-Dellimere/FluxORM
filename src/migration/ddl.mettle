@@ -1,0 +1,107 @@
+// reach/migration/ddl.mettle — CREATE TABLE from metadata.
+//
+// The DDL is generated from the same RcMeta the write path uses, so a table
+// cannot drift from the model it was declared for: the column list, the order,
+// the key and the nullability all come from one source.
+//
+// Affinity is the SQLite family (INTEGER/REAL/TEXT/BLOB), which is also what
+// dacor stores. The *wire* type decides the column, never the Mettle type: a
+// `bool` is INTEGER because dacor has no BOOL, and an `int64` overridden to
+// RC_T_TIME is INTEGER because micros are an integer.
+//
+// Nothing here interpolates a value. Identifiers go through rc_buf_ident, the
+// same helper query/'s default dialect uses, so there is exactly one quoting
+// rule in the codebase and it doubles an embedded quote.
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/buf";
+
+// Wire type -> column affinity. RC_T_UNSUPPORTED, and any wire type a later
+// phase adds without teaching this table about it, returns the empty string;
+// the caller treats that as a refusal rather than emitting a column with no
+// type.
+fn rc_migration_affinity(ty: int32) -> string {
+  if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) {
+    return "INTEGER";
+  }
+  if (ty == RC_T_F64) { return "REAL"; }
+  if (ty == RC_T_TEXT) { return "TEXT"; }
+  if (ty == RC_T_BLOB) { return "BLOB"; }
+  return "";
+}
+
+// Appends `CREATE TABLE IF NOT EXISTS "<table>" (...)` to `b`.
+//
+// Two refusals happen before a single byte is written, because a half-built
+// statement left in the caller's buffer is the class of partial state this
+// module exists to prevent:
+//
+//   1. rc_meta_check fails -> its code (USAGE for a malformed table,
+//      UNSUPPORTED for a field type the wire cannot carry, e.g. Doc's slice).
+//   2. a field whose affinity is unknown -> RC_ERR_UNSUPPORTED.
+//
+// Column spelling, in this order: quoted column, one space, affinity, then
+// ` PRIMARY KEY` (only on meta.pk), then ` NOT NULL` (when RC_F_NOT_NULL and
+// not already implied by PRIMARY KEY), then ` UNIQUE`.
+//
+// RC_F_AUTO adds no keyword: `INTEGER PRIMARY KEY` is the whole story. The
+// store assigns the rowid, so emitting AUTOINCREMENT would create a second
+// sequence that the ledger, the model and the store would then have to agree
+// about — and there is nothing to agree with.
+export fn rc_migration_create_table(m: RcMeta, b: RcBuf*) -> int32 {
+  if (b == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (rc_migration_affinity(m.fields[i].ty).length == (uint64)0) {
+      return RC_ERR_UNSUPPORTED;
+    }
+    i = i + 1;
+  }
+
+  rc = rc_buf_put(b, "CREATE TABLE IF NOT EXISTS ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(b, m.table);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(b, " (");
+  if (rc != RC_OK) { return rc; }
+
+  i = 0;
+  while (i < m.n_fields) {
+    var f: RcField = m.fields[i];
+    if (i > 0) {
+      rc = rc_buf_put(b, ", ");
+      if (rc != RC_OK) { return rc; }
+    }
+    rc = rc_buf_ident(b, f.column);
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_put(b, " ");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_put(b, rc_migration_affinity(f.ty));
+    if (rc != RC_OK) { return rc; }
+
+    var is_pk: bool = false;
+    if (i == m.pk) {
+      is_pk = true;
+      rc = rc_buf_put(b, " PRIMARY KEY");
+      if (rc != RC_OK) { return rc; }
+    }
+    // Keyword order note: the directive's verbatim expected text is
+    // `"email" TEXT NOT NULL UNIQUE`, so NOT NULL precedes UNIQUE. Its prose
+    // lists UNIQUE first; the asserted strings are what this emits.
+    if ((f.flags & RC_F_NOT_NULL) != 0 && !is_pk) {
+      rc = rc_buf_put(b, " NOT NULL");
+      if (rc != RC_OK) { return rc; }
+    }
+    if ((f.flags & RC_F_UNIQUE) != 0) {
+      rc = rc_buf_put(b, " UNIQUE");
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  return rc_buf_put(b, ")");
+}

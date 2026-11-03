@@ -1,0 +1,652 @@
+// reach/query/builder.mettle — statement text plus bound arguments. No I/O.
+//
+// A query is *text plus argv*: one growable RcBuf for the statement, one
+// geometric array of borrowed RcValue cells for the values. Nothing in this
+// file talks to a store; `rc_query_exec` hands the two to the adapter and is a
+// single guarded call (see the bottom of this file).
+//
+// ---------------------------------------------------------------------------
+// Statement shapes (frozen; relation/ and changeset/ rely on them verbatim)
+// ---------------------------------------------------------------------------
+//
+//   SELECT "id", "email", ... FROM "users"
+//     +  " WHERE \"col\" = ?"        (first where)   /  " AND \"col\" = ?"
+//     +  " WHERE \"col\" IS NULL"    /  " AND \"col\" IS NULL"
+//     +  " WHERE \"col\" IS NOT NULL"/  " AND \"col\" IS NOT NULL"
+//     +  " WHERE \"col\" IN (?, ?)"  /  " AND \"col\" IN (?, ?)"
+//     +  " ORDER BY \"col\" ASC"     /  ", \"col2\" DESC"
+//     +  " LIMIT 10"                 (literal, not a placeholder)
+//     +  " OFFSET 5"                 (literal)
+//     +  " JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\""
+//     +  " LEFT JOIN ..."
+//
+//   INSERT INTO "users" ("email", "name", ...) VALUES (?, ?, ...), (?, ?, ...)
+//
+// Clause order in the emitted text is always
+//   SELECT .. FROM .. [JOIN ..] [WHERE ..] [ORDER BY ..] [LIMIT n] [OFFSET n]
+// regardless of the order the caller made the calls in: a JOIN appended after a
+// WHERE is spliced back in front of it (see rc_query_join). Clause-order
+// *violations* are refused with RC_ERR_USAGE instead of emitting garbage text.
+//
+// ---------------------------------------------------------------------------
+// Argument order — the one sentence relation/ needs
+// ---------------------------------------------------------------------------
+//
+//   JOIN emits no placeholders, so `q->args` is exactly the order of the
+//   `rc_query_*` calls that appended a placeholder, which is also the order of
+//   the `?` characters in the text: WHERE terms bind left to right, and an IN
+//   list binds its values in the caller's array order.
+//
+// Therefore the argument order does not depend on when the join was added, and
+// a query built join-then-where is byte-identical to the same query built
+// where-then-join. Both are asserted by tests/t_query.mettle.
+//
+// ---------------------------------------------------------------------------
+// Three-valued logic
+// ---------------------------------------------------------------------------
+//
+// SQL says `col = NULL` is UNKNOWN, never true, so a NULL equality is *not* a
+// placeholder: `rc_query_where_eq(q, f, RcNull)` refuses to bind and emits
+// `"col" IS NULL` (the same text as `rc_query_where_null`). `= NULL` cannot be
+// produced by this module at all, and the test asserts that the byte string
+// never appears. `rc_query_where_not_null` emits `IS NOT NULL`. An IN list is
+// not rewritten: a NULL element inside `vals` binds as a NULL placeholder
+// (UNKNOWN per SQL), because rewriting `IN (?)` into `(.. OR col IS NULL)`
+// would need equality analysis the builder does not have.
+//
+// ---------------------------------------------------------------------------
+// Ownership and allocation
+// ---------------------------------------------------------------------------
+//
+//   `q->args` holds *borrowed* RcValue cells, exactly like the adapter's
+//   argument array. `rc_query_push_arg` / `where_eq` / `where_in` copy the
+//   24-byte cell, never the text behind it. The caller keeps the buffer alive
+//   until the statement has run, and `rc_query_free` frees the argv array and
+//   the text buffer but never calls rc_value_release on a cell. The test
+//   "args are borrowed" frees the query and then reads the heap text again.
+//
+//   Hot path: after construction, `where_*` / `order_by` / `limit` / `offset` /
+//   `join` allocate nothing unless the text buffer or the argv array has to
+//   grow (geometric doubling, both). A query is constructed with an 8-cell argv
+//   and a 128-byte text buffer, so the common 1–8 predicate statement performs
+//   zero allocations after `rc_query_select`.
+//
+//   `rc_query_sql` returns a borrowed view into the text buffer, valid until
+//   the next mutation or `rc_query_free`; it never copies.
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/buf";
+import "../adapter/adapter";
+import "dialect";
+
+// JOIN flavours. Exported because relation/ names them at its call sites.
+export const RC_JOIN_INNER: int32 = 0;
+export const RC_JOIN_LEFT: int32 = 1;
+
+// Internal statement kinds and clause phases. Not exported: they are not part
+// of the seam and they are not status codes.
+const Q_KIND_SELECT: int32 = 0;
+const Q_KIND_INSERT: int32 = 1;
+
+const Q_PHASE_FROM: int32 = 0;   // base text only; JOIN still allowed
+const Q_PHASE_WHERE: int32 = 1;  // WHERE ...; more AND terms allowed
+const Q_PHASE_ORDER: int32 = 2;  // ORDER BY ...
+const Q_PHASE_LIMIT: int32 = 3;  // LIMIT ...
+const Q_PHASE_OFFSET: int32 = 4; // OFFSET ...
+
+// Construction values; both are pre-sized so a typical statement (eight-column
+// SELECT + three predicates + ORDER BY + LIMIT) does not reallocate while being
+// built. test "query: no growth after construction" pins that: it asserts the
+// buffer capacity and argv capacity do not move.
+const Q_ARG_CAP: int32 = 8;
+const Q_TEXT_CAP: int64 = 256;
+
+export struct RcQuery {
+  meta: RcMeta;    // the table the statement is about
+  dial: RcDialect; // quoting / placeholder / LIMIT support
+  buf: RcBuf;      // statement text
+  args: RcValue*;  // borrowed cells, ownership stays with the caller
+  n_args: int32;
+  n_cap: int32;    // argv capacity in cells
+  kind: int32;     // Q_KIND_*
+  phase: int32;    // Q_PHASE_*, enforces clause order
+  tail: int64;     // insertion point for JOIN clauses (end of FROM ... JOIN ..)
+  n_order: int32;  // ORDER BY terms already emitted
+  n_rows: int32;   // batch INSERT: rows, 0 for SELECT
+  n_cols: int32;   // batch INSERT: emitted columns per row, 0 for SELECT
+  err: int32;      // sticky construction failure; RC_OK when the query is usable
+}
+
+// --- internal helpers --------------------------------------------------------
+
+fn rc_query_put(q: RcQuery*, s: string) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_buf_put(&q->buf, s);
+}
+
+fn rc_query_put_ident(q: RcQuery*, s: string) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_dialect_ident(q->dial, &q->buf, s);
+}
+
+fn rc_query_put_question(q: RcQuery*) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_dialect_placeholder(q->dial, &q->buf);
+}
+
+// Grows the argv array geometrically. The cells are borrowed, so a grow is a
+// realloc of the array only — never a value copy of the text behind a cell.
+fn rc_query_args_reserve(q: RcQuery*, need: int32) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (need < 0) { return RC_ERR_USAGE; }
+  if (need == 0) { return RC_OK; }
+  if (q->n_args > 2147483647 - need) { return RC_ERR_RANGE; }
+  var want: int32 = q->n_args + need;
+  if (want <= q->n_cap) { return RC_OK; }
+  var cap: int32 = q->n_cap;
+  if (cap < Q_ARG_CAP) { cap = Q_ARG_CAP; }
+  while (cap < want) {
+    if (cap > 1073741823) { return RC_ERR_RANGE; }
+    cap = cap * 2;
+  }
+  var p: rawptr = realloc((rawptr)q->args, (int64)cap * (int64)sizeof(RcValue));
+  if (p == 0) { return RC_ERR_NOMEM; }
+  q->args = (RcValue*)p;
+  q->n_cap = cap;
+  return RC_OK;
+}
+
+// Reserves + appends one borrowed cell. Callers reserve before they touch the
+// text, so a failure here leaves both the text and the argv untouched.
+fn rc_query_take_arg(q: RcQuery*, v: RcValue) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_query_args_reserve(q, 1);
+  if (rc != RC_OK) { return rc; }
+  q->args[q->n_args] = v;
+  q->n_args = q->n_args + 1;
+  return RC_OK;
+}
+
+fn rc_query_fail(q: RcQuery*, code: int32) -> RcQuery {
+  rc_query_free(q);
+  q->err = code;
+  return *q;
+}
+
+fn rc_query_init(m: RcMeta, kind: int32) -> RcQuery {
+  var q: RcQuery;
+  q.meta = m;
+  q.dial = rc_dialect_default();
+  q.buf = rc_buf_new(Q_TEXT_CAP);
+  q.args = 0;
+  q.n_args = 0;
+  q.n_cap = 0;
+  q.kind = kind;
+  q.phase = Q_PHASE_FROM;
+  q.tail = 0;
+  q.n_order = 0;
+  q.n_rows = 0;
+  q.n_cols = 0;
+  q.err = RC_OK;
+  if (q.buf.data == 0) {
+    q.err = RC_ERR_NOMEM;
+    return q;
+  }
+  var rc: int32 = rc_query_args_reserve(&q, Q_ARG_CAP);
+  if (rc != RC_OK) {
+    rc_buf_free(&q.buf);
+    q.err = rc;
+  }
+  return q;
+}
+
+// Every SELECT-side mutation starts with this: a constructed query, of the
+// right kind, whose construction did not fail.
+fn rc_query_ready_select(q: RcQuery*) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind != Q_KIND_SELECT) { return RC_ERR_USAGE; }
+  return RC_OK;
+}
+
+fn rc_query_put_columns(q: RcQuery*, m: RcMeta) -> int32 {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (i > 0) {
+      var sep: int32 = rc_query_put(q, ", ");
+      if (sep != RC_OK) { return sep; }
+    }
+    var rc: int32 = rc_query_put_ident(q, m.fields[i].column);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+fn rc_query_is_auto_col(m: RcMeta, i: int32) -> bool {
+  if ((m.fields[i].flags & RC_F_AUTO) != 0) { return true; }
+  return false;
+}
+
+fn rc_query_count_insert_cols(m: RcMeta) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (!rc_query_is_auto_col(m, i)) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+// " WHERE " for the first term, " AND " for the rest. Refuses once ORDER BY /
+// LIMIT / OFFSET has been emitted: a WHERE after ORDER BY is a caller bug, and
+// quietly appending it would build a statement that does not parse.
+fn rc_query_begin_where(q: RcQuery*) -> int32 {
+  if (q->phase > Q_PHASE_WHERE) { return RC_ERR_USAGE; }
+  var rc: int32 = RC_OK;
+  if (q->phase == Q_PHASE_FROM) {
+    rc = rc_query_put(q, " WHERE ");
+  } else {
+    rc = rc_query_put(q, " AND ");
+  }
+  if (rc != RC_OK) { return rc; }
+  q->phase = Q_PHASE_WHERE;
+  return RC_OK;
+}
+
+// In-place byte reversal, used to splice a JOIN in front of an already-written
+// WHERE/ORDER BY tail without a temporary allocation.
+fn rc_query_reverse(p: uint8*, n: int64) {
+  if (n <= 1) { return; }
+  var i: int64 = 0;
+  var j: int64 = n - 1;
+  while (i < j) {
+    var t: uint8 = p[i];
+    p[i] = p[j];
+    p[j] = t;
+    i = i + 1;
+    j = j - 1;
+  }
+}
+
+// Rotates [p, p+n) left by k bytes: [A][B] -> [B][A] where |A| == k. Three
+// reversals, no scratch space, so a join costs no allocation.
+fn rc_query_rotate_left(p: uint8*, n: int64, k: int64) {
+  if (n <= 1 || k <= 0 || k >= n) { return; }
+  rc_query_reverse(p, k);
+  rc_query_reverse(p + k, n - k);
+  rc_query_reverse(p, n);
+}
+
+// --- constructors ------------------------------------------------------------
+
+// Builds `SELECT cols FROM "table"` with the columns in RcMeta order, exactly
+// like core/persist's column helper. A meta that fails rc_meta_check yields a
+// query whose `err` is that code: rc_query_sql is empty and rc_query_exec
+// returns the code without touching the adapter. (The signature has no error
+// out-parameter on purpose — construction is one call, and a broken table is a
+// startup bug, not a per-statement branch.)
+export fn rc_query_select(m: RcMeta) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_SELECT);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, "SELECT ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_columns(&q, m);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, " FROM ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_ident(&q, m.table);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  // JOIN clauses are spliced in here, in call order.
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Builds a multi-row INSERT. An RC_F_AUTO primary key is always omitted: batch
+// rows share one column list, so there is no per-row null bitmap to consult
+// (that is the difference from rc_persist_insert, which omits the auto key only
+// when *this* entity's key is absent).
+export fn rc_query_insert_batch(m: RcMeta, n_rows: int32) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_INSERT);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  if (n_rows <= 0) { return rc_query_fail(&q, RC_ERR_USAGE); }
+  var n_cols: int32 = rc_query_count_insert_cols(m);
+  if (n_cols <= 0) { return rc_query_fail(&q, RC_ERR_USAGE); }
+  if (n_rows > 2147483647 / n_cols) { return rc_query_fail(&q, RC_ERR_USAGE); }
+
+  rc = rc_query_put(&q, "INSERT INTO ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_ident(&q, m.table);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, " (");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var first: bool = true;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (!rc_query_is_auto_col(m, i)) {
+      if (!first) {
+        rc = rc_query_put(&q, ", ");
+        if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      }
+      rc = rc_query_put_ident(&q, m.fields[i].column);
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      first = false;
+    }
+    i = i + 1;
+  }
+  rc = rc_query_put(&q, ") VALUES ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var r: int32 = 0;
+  while (r < n_rows) {
+    if (r > 0) {
+      rc = rc_query_put(&q, ", ");
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    }
+    rc = rc_query_put(&q, "(");
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    var c: int32 = 0;
+    while (c < n_cols) {
+      if (c > 0) {
+        rc = rc_query_put(&q, ", ");
+        if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      }
+      rc = rc_query_put_question(&q);
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      c = c + 1;
+    }
+    rc = rc_query_put(&q, ")");
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    r = r + 1;
+  }
+  q.n_rows = n_rows;
+  q.n_cols = n_cols;
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Appends one borrowed value cell to a batch INSERT. Refused once the batch is
+// full, so a half-filled statement can never be executed as if it were whole.
+export fn rc_query_push_arg(q: RcQuery*, v: RcValue) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind != Q_KIND_INSERT) { return RC_ERR_USAGE; }
+  if (q->n_rows <= 0 || q->n_cols <= 0) { return RC_ERR_USAGE; }
+  var want: int32 = q->n_rows * q->n_cols;
+  if (q->n_args >= want) { return RC_ERR_USAGE; }
+  return rc_query_take_arg(q, v);
+}
+
+// --- WHERE -------------------------------------------------------------------
+
+export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  if (rc_value_is_null(v)) { return rc_query_where_null(q, field); }
+
+  // Reserve the argv cell before touching the text: if anything below fails,
+  // the text is rolled back to its exact previous length and no arg was taken.
+  rc = rc_query_args_reserve(q, 1);
+  if (rc != RC_OK) { return rc; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " = "); }
+  if (rc == RC_OK) { rc = rc_query_put_question(q); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  var take: int32 = rc_query_take_arg(q, v);
+  if (take != RC_OK) {
+    q->buf.len = mark;
+    return take;
+  }
+  return RC_OK;
+}
+
+export fn rc_query_where_null(q: RcQuery*, field: int32) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " IS NULL"); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  return RC_OK;
+}
+
+export fn rc_query_where_not_null(q: RcQuery*, field: int32) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " IS NOT NULL"); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  return RC_OK;
+}
+
+// `IN (?, ?, ?)` — one placeholder per value, in array order. An empty list is
+// refused: `IN ()` is a syntax error in every store, and "match nothing" is the
+// caller's decision to make (it can add an always-false predicate), not one the
+// builder should invent.
+export fn rc_query_where_in(q: RcQuery*, field: int32, vals: RcValue*,
+                            n: int32) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  if (n <= 0) { return RC_ERR_USAGE; }
+  if (vals == 0) { return RC_ERR_USAGE; }
+
+  rc = rc_query_args_reserve(q, n);
+  if (rc != RC_OK) { return rc; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " IN ("); }
+  var i: int32 = 0;
+  while (rc == RC_OK && i < n) {
+    if (i > 0) { rc = rc_query_put(q, ", "); }
+    if (rc == RC_OK) { rc = rc_query_put_question(q); }
+    i = i + 1;
+  }
+  if (rc == RC_OK) { rc = rc_query_put(q, ")"); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  i = 0;
+  while (i < n) {
+    q->args[q->n_args] = vals[i];
+    q->n_args = q->n_args + 1;
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// --- ORDER BY / LIMIT / OFFSET ----------------------------------------------
+
+export fn rc_query_order_by(q: RcQuery*, field: int32, asc: bool) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  // ORDER BY before LIMIT; refused once LIMIT/OFFSET has been emitted.
+  if (q->phase > Q_PHASE_ORDER) { return RC_ERR_USAGE; }
+  var mark: int64 = q->buf.len;
+  if (q->n_order == 0) {
+    rc = rc_query_put(q, " ORDER BY ");
+  } else {
+    rc = rc_query_put(q, ", ");
+  }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) {
+    if (asc) {
+      rc = rc_query_put(q, " ASC");
+    } else {
+      rc = rc_query_put(q, " DESC");
+    }
+  }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  q->n_order = q->n_order + 1;
+  q->phase = Q_PHASE_ORDER;
+  return RC_OK;
+}
+
+// `LIMIT 10`: the number is part of the text (rc_buf_put_i64), never a bound
+// value. The literal is an ORM-chosen, caller-counted number, not user data, so
+// this is the one place a non-placeholder appears.
+export fn rc_query_limit(q: RcQuery*, n: int64) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (n < 0) { return RC_ERR_USAGE; }
+  if (!q->dial.has_limit) { return RC_ERR_UNSUPPORTED; }
+  if (q->phase > Q_PHASE_ORDER) { return RC_ERR_USAGE; }  // limit twice is a bug
+  var mark: int64 = q->buf.len;
+  rc = rc_query_put(q, " LIMIT ");
+  if (rc == RC_OK) { rc = rc_buf_put_i64(&q->buf, n); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  q->phase = Q_PHASE_LIMIT;
+  return RC_OK;
+}
+
+export fn rc_query_offset(q: RcQuery*, n: int64) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (n < 0) { return RC_ERR_USAGE; }
+  if (q->phase > Q_PHASE_LIMIT) { return RC_ERR_USAGE; }  // offset twice
+  var mark: int64 = q->buf.len;
+  rc = rc_query_put(q, " OFFSET ");
+  if (rc == RC_OK) { rc = rc_buf_put_i64(&q->buf, n); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  q->phase = Q_PHASE_OFFSET;
+  return RC_OK;
+}
+
+// --- JOIN --------------------------------------------------------------------
+
+// ` JOIN "posts" ON "users"."id" = "posts"."user_id"`, `LEFT JOIN` for outer.
+// The clause is inserted after the FROM clause even when WHERE/ORDER BY text is
+// already in the buffer, so the emitted clause order is stable and the caller
+// does not have to remember call order. No placeholders: ON compares two
+// columns, so this cannot shift argv positions.
+export fn rc_query_join(q: RcQuery*, target: RcMeta, local_field: int32,
+                        foreign_field: int32, kind: int32) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (kind != RC_JOIN_INNER && kind != RC_JOIN_LEFT) { return RC_ERR_USAGE; }
+  if (local_field < 0 || local_field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  if (foreign_field < 0 || foreign_field >= target.n_fields) {
+    return RC_ERR_USAGE;
+  }
+  // Not after LIMIT/OFFSET: the statement is closed at that point.
+  if (q->phase > Q_PHASE_ORDER) { return RC_ERR_USAGE; }
+
+  var mark: int64 = q->buf.len;
+  if (kind == RC_JOIN_LEFT) {
+    rc = rc_query_put(q, " LEFT JOIN ");
+  } else {
+    rc = rc_query_put(q, " JOIN ");
+  }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, target.table); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " ON "); }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.table); }
+  if (rc == RC_OK) { rc = rc_query_put(q, "."); }
+  if (rc == RC_OK) {
+    rc = rc_query_put_ident(q, q->meta.fields[local_field].column);
+  }
+  if (rc == RC_OK) { rc = rc_query_put(q, " = "); }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, target.table); }
+  if (rc == RC_OK) { rc = rc_query_put(q, "."); }
+  if (rc == RC_OK) {
+    rc = rc_query_put_ident(q, target.fields[foreign_field].column);
+  }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+
+  // The clause was appended at the end; rotate it back in front of any
+  // WHERE/ORDER BY tail that is already there.
+  var at: int64 = q->tail;
+  var jlen: int64 = q->buf.len - mark;
+  var la: int64 = mark - at;
+  if (la > 0) {
+    rc_query_rotate_left(q->buf.data + at, la + jlen, la);
+  }
+  q->tail = at + jlen;
+  return RC_OK;
+}
+
+// --- accessors ---------------------------------------------------------------
+
+// Borrowed view of the statement text; valid until the next mutation or free.
+export fn rc_query_sql(q: RcQuery*) -> string {
+  if (q == 0) { return ""; }
+  return rc_buf_text(&q->buf);
+}
+
+// Borrowed argv cells; the query owns the array, the caller owns the values.
+export fn rc_query_args(q: RcQuery*) -> RcValue* {
+  if (q == 0) { return 0; }
+  return q->args;
+}
+
+export fn rc_query_n_args(q: RcQuery*) -> int32 {
+  if (q == 0) { return 0; }
+  return q->n_args;
+}
+
+// --- execution ---------------------------------------------------------------
+
+// One guarded adapter call: text + argv in, result out. The only extra work is
+// refusing to run a batch INSERT whose argv is not exactly n_rows * n_cols
+// cells, because a short argv is a driver-level "wrong number of arguments",
+// not a partial insert.
+export fn rc_query_exec(q: RcQuery*, a: RcAdapter*, out: RcResult*) -> int32 {
+  if (q == 0 || a == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind == Q_KIND_INSERT) {
+    if (q->n_rows <= 0 || q->n_cols <= 0) { return RC_ERR_USAGE; }
+    if (q->n_args != q->n_rows * q->n_cols) { return RC_ERR_USAGE; }
+  }
+  return rc_adapter_exec(a, rc_buf_text(&q->buf), q->args, q->n_args, out);
+}
+
+// Frees the text buffer and the argv array. It does NOT release the cells: they
+// are borrowed, and freeing them here would double-free the caller's text.
+export fn rc_query_free(q: RcQuery*) {
+  if (q == 0) { return; }
+  rc_buf_free(&q->buf);
+  if (q->args != 0) {
+    free(q->args);
+    q->args = 0;
+  }
+  q->n_args = 0;
+  q->n_cap = 0;
+}

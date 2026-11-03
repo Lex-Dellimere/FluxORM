@@ -1,0 +1,264 @@
+// tests/t_meta.mettle — model metadata.
+//
+// Check 3 (the generated registry is complete and self-consistent) and check 4
+// (typed access, NULL bitmap, range rejection). If these pass, the ORM knows a
+// struct's shape without a single hand-written offset and can refuse a bad
+// table before it ever reaches the store.
+
+import "std/io";
+import "std/mem";
+
+import "../src/core/status";
+import "../src/core/value";
+import "../src/core/meta";
+import "../src/core/entity";
+import "models";
+import "harness";
+
+fn check_generated() -> int32 {
+  var m: RcMeta = user_meta();
+  if (user_meta_status() != RC_OK) { return 1; }
+  if (m.table != "users") { return 2; }
+  if (m.name != "User") { return 3; }
+  if (m.n_fields != 8) { return 4; }
+  if (m.pk != 0) { return 5; }
+  if (m.size != (int32)sizeof(User)) { return 6; }
+
+  if (m.fields[0].name != "id") { return 10; }
+  if (m.fields[1].name != "email") { return 11; }
+  if (m.fields[2].name != "name") { return 12; }
+  if (m.fields[3].name != "age") { return 13; }
+  if (m.fields[4].name != "active") { return 14; }
+  if (m.fields[5].name != "score") { return 15; }
+  if (m.fields[6].name != "created_at") { return 16; }
+  if (m.fields[7].name != "role") { return 17; }
+
+  // Compiler-reported kinds survive into the registry.
+  if (m.fields[0].kind != Kind.Int64) { return 20; }
+  if (m.fields[3].kind != Kind.Int32) { return 21; }
+  if (m.fields[4].kind != Kind.Bool) { return 22; }
+  if (m.fields[5].kind != Kind.Float64) { return 23; }
+  if (m.fields[1].kind != Kind.String) { return 24; }
+  if (m.fields[7].kind != Kind.Enum) { return 25; }
+
+  // The override table decides the wire type, not the Mettle type.
+  if (m.fields[0].ty != RC_T_I64) { return 30; }
+  if (m.fields[1].ty != RC_T_TEXT) { return 31; }
+  if (m.fields[3].ty != RC_T_I64) { return 32; }  // int32 widens on the wire
+  if (m.fields[4].ty != RC_T_BOOL) { return 33; }
+  if (m.fields[5].ty != RC_T_F64) { return 34; }
+  if (m.fields[6].ty != RC_T_TIME) { return 35; } // declared TIMESTAMP
+  if (m.fields[7].ty != RC_T_I64) { return 36; }  // enum is an integer
+
+  if ((m.fields[0].flags & RC_F_PK) == 0) { return 40; }
+  if ((m.fields[0].flags & RC_F_AUTO) == 0) { return 41; }
+  if ((m.fields[1].flags & RC_F_UNIQUE) == 0) { return 42; }
+  if ((m.fields[3].flags & RC_F_NOT_NULL) != 0) { return 43; }
+  if ((m.fields[6].flags & RC_F_TIMESTAMP) == 0) { return 44; }
+
+  // Offsets come from the compiler and are ordered as declared, with each
+  // field inside the struct.
+  if (m.fields[0].offset != 0) { return 50; }
+  var i: int32 = 1;
+  while (i < m.n_fields) {
+    if (m.fields[i].offset <= m.fields[i - 1].offset) { return 51; }
+    if (m.fields[i].offset + m.fields[i].size > m.size) { return 52; }
+    i = i + 1;
+  }
+  if (m.fields[1].size != 16) { return 53; } // string view: ptr + length
+  if (m.fields[4].size != 1) { return 54; }  // bool
+  if (m.fields[0].size != 8) { return 55; }  // int64
+
+  if (rc_meta_find(m, "email") != 1) { return 60; }
+  if (rc_meta_find(m, "id") != 0) { return 61; }
+  if (rc_meta_find(m, "nope") != -1) { return 62; }
+  if (!rc_meta_is_auto(m)) { return 63; }
+  if (rc_meta_pk(m) != 0) { return 64; }
+  if (rc_meta_field(m, 99).ty != RC_T_UNSUPPORTED) { return 65; }
+
+  var pm: RcMeta = post_meta();
+  if (post_meta_status() != RC_OK) { return 70; }
+  if (pm.n_fields != 5) { return 71; }
+  if (pm.table != "posts") { return 72; }
+  if (rc_meta_find(pm, "user_id") != 1) { return 73; }
+  return 0;
+}
+
+fn check_access() -> int32 {
+  var m: RcMeta = user_meta();
+  var u: User;
+  memset((rawptr)&u, 0, (int64)sizeof(User));
+  var e: RcEntity = rc_entity_new(m, (rawptr)&u);
+
+  // An auto key starts absent, and "absent" is exactly one null bit.
+  if (e.state != RC_ST_NEW) { return 1; }
+  if (!rc_nulls_has(e.nulls, 0)) { return 2; }
+  if (rc_entity_has_pk(&e)) { return 3; }
+
+  if (rc_entity_set(&e, 1, RcText("a@example.com")) != RC_OK) { return 4; }
+  if (rc_entity_set(&e, 2, RcText("Ada")) != RC_OK) { return 5; }
+  if (rc_entity_set(&e, 3, RcInt(36)) != RC_OK) { return 6; }
+  if (rc_entity_set(&e, 4, RcBool(true)) != RC_OK) { return 7; }
+  if (rc_entity_set(&e, 5, RcFloat(9.5)) != RC_OK) { return 8; }
+  if (rc_entity_set(&e, 6, RcTime(1700000000000000)) != RC_OK) { return 9; }
+  if (rc_entity_set(&e, 7, RcInt(2)) != RC_OK) { return 10; }
+
+  // The write went through the compiler's layout, not ours.
+  if (u.age != 36) { return 11; }
+  if (!u.active) { return 12; }
+  if (u.score != 9.5) { return 13; }
+  if (u.email != "a@example.com") { return 14; }
+  if (u.created_at != 1700000000000000) { return 15; }
+
+  var v: RcValue = RcNull;
+  if (rc_entity_get(&e, 3, &v) != RC_OK) { return 16; }
+  if (!rc_value_same(v, RcInt(36))) { return 17; }
+  if (rc_entity_get(&e, 7, &v) != RC_OK) { return 18; }
+  if (!rc_value_same(v, RcInt(2))) { return 19; }
+
+  // int32 range is enforced on the way in, not discovered by the store.
+  if (rc_entity_set(&e, 3, RcInt(2147483648)) != RC_ERR_RANGE) { return 20; }
+  if (u.age != 36) { return 21; }
+  if (rc_entity_set(&e, 3, RcInt(-2147483648)) != RC_OK) { return 22; }
+  if (u.age != -2147483648) { return 23; }
+
+  // Type checks are strict, and a rejected write changes nothing.
+  if (rc_entity_set(&e, 5, RcText("nope")) != RC_ERR_CAST) { return 30; }
+  if (u.score != 9.5) { return 31; }
+  if (rc_entity_set(&e, 4, RcInt(1)) != RC_ERR_CAST) { return 32; }
+
+  // NOT NULL refuses a null.
+  if (rc_entity_set(&e, 1, RcNull) != RC_ERR_CONSTRAINT) { return 40; }
+  if (u.email != "a@example.com") { return 41; }
+
+  // A nullable field accepts a null, records it, and clears the storage.
+  if (rc_entity_set(&e, 3, RcNull) != RC_OK) { return 42; }
+  if (u.age != 0) { return 43; }
+  if (!rc_nulls_has(e.nulls, 3)) { return 44; }
+  if (rc_entity_get(&e, 3, &v) != RC_OK) { return 45; }
+  if (!rc_value_is_null(v)) { return 46; }
+
+  // Clearing the null restores a value and clears the bit.
+  if (rc_entity_set(&e, 3, RcInt(7)) != RC_OK) { return 47; }
+  if (rc_nulls_has(e.nulls, 3)) { return 48; }
+  if (u.age != 7) { return 49; }
+
+  // Explicitly setting the auto key clears its null bit.
+  if (rc_entity_set(&e, 0, RcInt(100)) != RC_OK) { return 50; }
+  if (rc_nulls_has(e.nulls, 0)) { return 51; }
+  if (!rc_entity_has_pk(&e)) { return 52; }
+  if (!rc_value_same(rc_entity_pk(&e), RcInt(100))) { return 53; }
+
+  // A row that has never been stored is NEW, not DIRTY: dirty means "differs
+  // from what the store holds", and this row has no stored counterpart yet.
+  if (e.state != RC_ST_NEW) { return 60; }
+  if (rc_entity_state_name(e.state) != "new") { return 61; }
+
+  // An out-of-range index is a caller bug, not a crash.
+  if (rc_entity_set(&e, 99, RcInt(1)) != RC_ERR_USAGE) { return 70; }
+  if (rc_entity_get(&e, -1, &v) != RC_ERR_USAGE) { return 71; }
+  return 0;
+}
+
+fn valid_fields(f: RcField*) {
+  var i: int32 = 0;
+  while (i < 3) {
+    f[i].kind = Kind.Int64;
+    f[i].ty = RC_T_I64;
+    f[i].offset = i * 8;
+    f[i].size = 8;
+    f[i].flags = 0;
+    i = i + 1;
+  }
+  f[0].name = "a";
+  f[0].column = "a";
+  f[1].name = "b";
+  f[1].column = "b";
+  f[2].name = "c";
+  f[2].column = "c";
+}
+
+fn check_validation() -> int32 {
+  var f: RcField[3];
+  var m: RcMeta;
+
+  // The baseline is valid; every case below is one mutation of it.
+  valid_fields(&f[0]);
+  m.table = "t";
+  m.name = "T";
+  m.size = 24;
+  m.fields = &f[0];
+  m.n_fields = 3;
+  m.pk = -1;
+  if (rc_meta_check(m, (int32*)0) != RC_OK) { return 1; }
+
+  // A duplicate column name would make SELECT ambiguous.
+  valid_fields(&f[0]);
+  f[1].column = "a";
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 2; }
+
+  // Two primary keys.
+  valid_fields(&f[0]);
+  f[0].flags = RC_F_PK | RC_F_NOT_NULL;
+  f[1].flags = RC_F_PK | RC_F_NOT_NULL;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 3; }
+
+  // Auto without PK: the store cannot know what to assign.
+  valid_fields(&f[0]);
+  f[1].flags = RC_F_AUTO;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 4; }
+
+  // PK must be NOT NULL.
+  valid_fields(&f[0]);
+  f[0].flags = RC_F_PK;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 5; }
+
+  // Auto key must be an integer.
+  valid_fields(&f[0]);
+  f[0].flags = RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL;
+  f[0].ty = RC_T_TEXT;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_UNSUPPORTED) { return 6; }
+
+  // A field that runs off the end of the struct.
+  valid_fields(&f[0]);
+  f[2].offset = 20;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 7; }
+
+  // A type the wire cannot carry.
+  valid_fields(&f[0]);
+  f[2].ty = RC_T_UNSUPPORTED;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_UNSUPPORTED) { return 8; }
+
+  // Zero fields.
+  valid_fields(&f[0]);
+  m.n_fields = 0;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 9; }
+  m.n_fields = 3;
+
+  // The offending index is reported.
+  var bad: int32 = -1;
+  valid_fields(&f[0]);
+  f[2].ty = RC_T_UNSUPPORTED;
+  if (rc_meta_check(m, &bad) != RC_ERR_UNSUPPORTED) { return 10; }
+  if (bad != 2) { return 11; }
+
+  // A slice (uint8[]) has no owned representation and is refused at startup.
+  if (doc_field_count() != 2) { return 20; }
+  if (doc_meta_status() != RC_ERR_UNSUPPORTED) { return 21; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("meta: registry generated from typeof", check_generated())) { failures = failures + 1; }
+  if (!rc_report("meta: access, nulls and ranges", check_access())) { failures = failures + 1; }
+  if (!rc_report("meta: invalid tables are refused", check_validation())) { failures = failures + 1; }
+  return rc_summary(failures, 3);
+}
+
+@test fn t_meta() -> int32 {
+  if (check_generated() != 0) { return 1; }
+  if (check_access() != 0) { return 2; }
+  if (check_validation() != 0) { return 3; }
+  return 0;
+}
