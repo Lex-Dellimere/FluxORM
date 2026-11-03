@@ -1,5 +1,5 @@
-// tests/t_changeset.mettle — Phase 3: text -> RcValue, the per-field dirty
-// mask, and the write-through to a model.
+// tests/t_changeset.mettle — text -> RcValue, the per-field dirty mask, the
+// write-through to a model, and save.
 //
 // The two things this file exists to pin are the ones that are cheap to get
 // wrong and expensive in production:

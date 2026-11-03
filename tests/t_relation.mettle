@@ -1,4 +1,4 @@
-// tests/t_relation.mettle — Phase 4: relations and the batch loader.
+// tests/t_relation.mettle — relations and the batch loader.
 //
 // The assertion that matters in this file is not the SQL text (though every
 // statement is compared with `==` against a literal, never "contains"); it is
@@ -430,8 +430,8 @@ fn check_belongs_to() -> int32 {
   if (out.idx[1] != 1) { return 17; }
   if (out.idx[2] != 2) { return 18; }
 
-  // The three-distinct-key shape, so the exact three-placeholder statement the
-  // directive pins is also asserted (a second statement, still one exec).
+  // Three distinct keys, so the three-placeholder statement is asserted too
+  // (a second statement, still one exec).
   if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 19; }
   var keys3: RcValue[3];
   keys3[0] = RcInt(7);

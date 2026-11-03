@@ -1,4 +1,4 @@
-// tests/t_migration.mettle — Phase 5: up-only migrations against the seam.
+// tests/t_migration.mettle — up-only migrations through the adapter.
 //
 // Every statement is asserted verbatim. "Close enough SQL" is how an ORM ends
 // up quoting an identifier with user data in it, and a ledger whose text drifts

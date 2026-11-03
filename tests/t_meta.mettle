@@ -1,7 +1,7 @@
 // tests/t_meta.mettle — model metadata.
 //
-// Check 3 (the generated registry is complete and self-consistent) and check 4
-// (typed access, NULL bitmap, range rejection). If these pass, the ORM knows a
+// The generated registry is complete and self-consistent, and typed access,
+// the NULL bitmap and range rejection work. If these pass, the ORM knows a
 // struct's shape without a single hand-written offset and can refuse a bad
 // table before it ever reaches the store.
 

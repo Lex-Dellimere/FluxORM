@@ -2,12 +2,8 @@
 //
 // One dialect ships: "meosql". It is a value rather than a pile of string
 // literals so the text builder has exactly one place that knows what a quoted
-// identifier and a placeholder look like, and so a later phase can ask "does
-// this store spell LIMIT that way?" without editing the builder.
-//
-// Ownership note (resolves the docs/02-seams.md vs. adapter/ overlap): this
-// file owns `RcDialect` for the whole tree. `adapter/` is not written in this
-// wave, so there is exactly one definition and no duplicate export.
+// identifier and a placeholder look like, and so a store's differences (does
+// it spell LIMIT that way?) live here and not in the builder.
 //
 // Byte-equality contract: `rc_dialect_ident(rc_dialect_default(), b, s)` must
 // produce exactly the same bytes as `rc_buf_ident(b, s)`. Routing every

@@ -1,7 +1,6 @@
 // tests/t_adapter.mettle — the driver seam.
 //
-// Check 5 (a failed statement leaves no partial state) plus the seam's
-// contract: arguments arrive in order, NULL survives the boundary, a closed
+// A failed statement leaves no partial state, and the seam's contract holds: arguments arrive in order, NULL survives the boundary, a closed
 // or absent capability is an error and not a call through null, and the
 // transaction state machine refuses nesting instead of pretending.
 

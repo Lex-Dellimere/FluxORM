@@ -1,36 +1,19 @@
 // flux_orm/core/session.mettle — one connection and its transaction.
 //
-// A session is what owns "this connection, this transaction". It is not a
-// global: a caller makes one per connection (and per thread, see below) and
-// passes it. Everything that reads or writes takes the session's adapter.
+// Make one session per connection and pass it around; it is not a global.
 //
-// Nesting is flattened here, because neither the store nor the recording
-// adapter nests: MeoSQL answers a nested begin with MEO_ERR_TX (DECISIONS.md
-// D8), and so does adapter/mem. Only the outermost begin reaches the adapter.
-// An inner begin/commit pair only counts depth. An inner rollback cannot undo
-// part of a flat transaction, so it marks the whole transaction doomed: the
-// outermost commit then rolls back instead and answers RC_ERR_TX, so the
-// caller learns that nothing was written. Savepoints would allow a partial
-// rollback; neither store has them yet.
-//
-//   begin   depth 0 -> adapter begin, depth 1     depth n -> n + 1
-//   commit  depth 1 -> adapter commit (or rollback when doomed), depth 0
-//           depth n -> n - 1                       depth 0 -> RC_ERR_TX
-//   rollback depth 1 -> adapter rollback, depth 0
-//           depth n -> n - 1, doomed               depth 0 -> RC_ERR_TX
+// Nesting is flattened here, because MeoSQL and adapter/mem both refuse a
+// nested begin. Only the outermost begin/commit reaches the adapter; inner
+// levels only count depth. An inner rollback cannot undo part of a flat
+// transaction, so it dooms the whole one: the outer commit rolls back and
+// returns RC_ERR_TX.
 //
 // A failed commit leaves no transaction open: the session rolls back whatever
-// the adapter still holds (ignoring a TX answer, which means there was nothing
-// left) and returns the commit's code. With a distributed store a failed
-// commit can be ambiguous (the write may have landed); the code says it
-// failed, not that nothing changed.
+// the adapter still holds. With a distributed store a failed commit can be
+// ambiguous (the write may have landed).
 //
-// Threads: one session belongs to one thread while a transaction is open.
-// MeoSQL's v1 lock is held by the thread that called begin, and a commit from
-// another thread is MEO_ERR_TX.
-//
-// Still to come on this struct (architecture notes): the arena that loaded
-// text points into, the identity map, hooks, and the statement cache.
+// One thread per session while a transaction is open: MeoSQL's lock belongs
+// to the thread that called begin.
 
 import "status";
 import "../adapter/adapter";

@@ -1,11 +1,8 @@
-// flux_orm/core/persist.mettle — the Phase-1 write path (the straw man).
+// flux_orm/core/persist.mettle — insert, load by key, delete by key.
 //
-// This module exists so core + adapter can be tested as one thing. It builds
-// the three statements every ORM needs (insert/select-by-key/delete-by-key)
-// straight from RcMeta and binds RcValue arguments. Query/ replaces the text
-// generation in Phase 2; changeset/ replaces the "which columns changed" part
-// in Phase 3. What must *not* change is the shape: values in, rows out, no
-// cursor, no string interpolation of user data.
+// Builds the three single-row statements straight from RcMeta and binds
+// RcValue arguments: values in, rows out, no cursor, no user data in the
+// statement text. Queries are query/'s; updates are changeset/'s.
 
 import "std/mem";
 
@@ -147,7 +144,7 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
 // instead of copying them, and hands the result back through `owner`.
 // `*owner` must outlive every use of the model, then be freed with
 // rc_result_free. A copy per field would need an owner list inside the plain
-// Mettle struct, which is exactly what Phase 2's session arena replaces.
+// Mettle struct; a session arena is the planned owner.
 export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
                           nulls: uint64*, owner: RcResult*) -> int32 {
   if (a == 0 || model == 0 || nulls == 0 || owner == 0) { return RC_ERR_USAGE; }

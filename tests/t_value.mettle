@@ -1,7 +1,6 @@
 // tests/t_value.mettle — the value layer.
 //
-// Check 1 (type + NULL identity) and check 2 (strict casts) of Phase 1.
-// The ownership check is the one that matters: Mettle strings are borrowed
+// Types, NULL identity, strict casts and ownership. The ownership check is the one that matters: Mettle strings are borrowed
 // views, so a clone that is not a copy corrupts data the moment the source
 // buffer is reused. The check overwrites the freed block to make a shallow
 // clone fail deterministically instead of "usually".

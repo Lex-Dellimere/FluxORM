@@ -1,7 +1,6 @@
 // tests/t_persist.mettle — core + adapter, together.
 //
-// This is the integration test of Phase 1: a real model, generated metadata,
-// the write path, and a real adapter boundary. The statement text is asserted
+// A real model, generated metadata, the write path, and the adapter boundary. The statement text is asserted
 // exactly, because "close enough SQL" is how an ORM ends up quoting an
 // identifier with user data in it.
 

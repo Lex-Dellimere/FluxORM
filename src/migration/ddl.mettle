@@ -90,9 +90,7 @@ export fn rc_migration_create_table(m: RcMeta, b: RcBuf*) -> int32 {
       rc = rc_buf_put(b, " PRIMARY KEY");
       if (rc != RC_OK) { return rc; }
     }
-    // Keyword order note: the directive's verbatim expected text is
-    // `"email" TEXT NOT NULL UNIQUE`, so NOT NULL precedes UNIQUE. Its prose
-    // lists UNIQUE first; the asserted strings are what this emits.
+    // NOT NULL comes before UNIQUE: `"email" TEXT NOT NULL UNIQUE`.
     if ((f.flags & RC_F_NOT_NULL) != 0 && !is_pk) {
       rc = rc_buf_put(b, " NOT NULL");
       if (rc != RC_OK) { return rc; }

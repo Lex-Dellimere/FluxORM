@@ -1,4 +1,4 @@
-// tests/t_query.mettle — Phase 2: the statement builder.
+// tests/t_query.mettle — the statement builder.
 //
 // Every SQL assertion compares the *whole* statement with `==` against a
 // literal. "Close enough SQL" is how an ORM ends up quoting a column name with
@@ -7,9 +7,7 @@
 // and for nothing else.
 //
 // The select assertion is pinned to the literal core/persist emits
-// (SELECT_SQL in tests/t_persist.mettle): Phase 2 supersedes that text
-// generation without changing its shape, and this file is where that claim is
-// checked.
+// (SELECT_SQL in tests/t_persist.mettle), so both build the same shape.
 
 import "std/io";
 import "std/mem";
@@ -26,8 +24,8 @@ import "models";
 import "harness";
 
 // The exact statement core/persist builds for a load-by-key. Duplicated from
-// tests/t_persist.mettle on purpose: if Phase 1's text ever changes, both files
-// have to be edited, which is the point of freezing a shape.
+// tests/t_persist.mettle on purpose: if that text changes, both files have to
+// be edited.
 const SELECT_SQL: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" WHERE \"id\" = ? LIMIT 1";
 const SELECT_BASE: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\"";
 const INSERT_BATCH_SQL: string = "INSERT INTO \"users\" (\"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\") VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)";
@@ -82,7 +80,7 @@ fn check_select_text() -> int32 {
   if (rc_query_args(&q) == 0) { return 3; }   // pre-sized argv, zero used
   if (rc_dialect_name(q.dial) != "meosql") { return 4; }
 
-  // The Phase-1 statement: WHERE pk = ? LIMIT 1, built from where_eq + limit.
+  // persist's load statement: WHERE pk = ? LIMIT 1, from where_eq + limit.
   if (rc_query_where_eq(&q, 0, RcInt(42)) != RC_OK) { return 5; }
   if (rc_query_limit(&q, 1) != RC_OK) { return 6; }
   if (rc_query_sql(&q) != SELECT_SQL) { return 7; }

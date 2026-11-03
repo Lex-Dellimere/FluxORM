@@ -1,45 +1,26 @@
-// tests/t_integration.mettle — Phase 6: every phase in one binary.
+// tests/t_integration.mettle — every layer in one binary.
 //
-// `tools/check.sh` runs each phase file alone, and a phase that passes alone can
-// still fail at the seam. This file is the seam: one model set, one adapter, the
-// scenario of docs/04-integration.md driven through migration/, core/persist,
-// query/, changeset/ and relation/ together, in one process, against real
-// metadata and real adapters.
+// Each t_*.mettle tests one layer; this one drives migration/, core/persist,
+// query/, changeset/ and relation/ together against one model set and one
+// adapter, because a layer that passes alone can still fail at the seam.
 //
-// Where docs/04-integration.md and the code disagree, the code wins and the
-// divergence is stated at the assertion that shows it:
+// Notes on what is asserted where:
 //
-//   * rc_migration_create_table takes (RcMeta, RcBuf*) and returns a code; the
-//     emitted text starts with `CREATE TABLE IF NOT EXISTS`.
-//   * the ledger SELECT reads one column, `"version"`, `ORDER BY "version" ASC`.
-//   * the age predicate is an IN list (rc_query_where_cmp exists; the
-//     scenario predates it).
-//   * adapter/mem replays scripted rows; it does not evaluate SQL, so "the NULL
-//     row is excluded" is asserted where the logic lives — the builder's
-//     three-valued `IS NULL` and the entity's null bitmap — not in a result set.
-//   * rc_changeset_save emits the UPDATE, and it names only the dirty columns.
-//   * there is no session and no cache, so a repeated preload is a second
-//     statement by design, not a cache hit.
-//   * a mismatched relation key type is RC_ERR_CAST in rc_relation_check.
-//   * an unknown changeset field name is RC_ERR_USAGE with error_field() == -1
-//     and the static reason "unknown field name".
-//   * an empty change set is not an error: rc_changeset_save writes nothing
-//     and never calls the store.
+//   * adapter/mem replays scripted rows and does not evaluate SQL, so "the NULL
+//     row is excluded" is asserted where the logic lives (the builder's
+//     `IS NULL` and the entity's null bitmap), not in a result set.
+//   * there is no cache, so a repeated preload is a second statement.
+//   * an empty change set is not an error: rc_changeset_save writes nothing.
 //
-// Every statement is compared with `==` against a literal, never by substring.
-// The only substring helper below is a *negative* one: it proves the byte string
-// `= NULL` never appears, which is an absence no `==` can state.
+// Every statement is compared with `==` against a literal. The one substring
+// helper only proves that `= NULL` never appears.
 //
-// The mem adapter replays a FIFO, so the rows pushed for a statement are pushed
-// at that statement's index in call order and the text is asserted immediately
-// after the call that consumed them. A statement reordered by the code under
-// test would misalign the script, and the call count at the end is what catches
-// it.
+// mem replays a FIFO, so rows are pushed in call order and each statement is
+// asserted right after the call that consumed them; the final call count
+// catches a reordered statement.
 //
-// The @test entry walks the same table of function pointers main() walks (see
-// the runner): a direct call chain from a @test makes the head compiler's
-// interpreter segfault while lowering IR. That workaround is reported, not
-// silent.
+// The @test entry calls main(): a direct call chain of the checks from a
+// @test makes the head compiler's interpreter segfault while lowering IR.
 
 import "std/io";
 import "std/mem";
@@ -372,8 +353,7 @@ fn check_query() -> int32 {
   if (rc_meta_find(m, "age") != 3) { return 2; }
   if (rc_meta_find(m, "name") != 2) { return 3; }
 
-  // docs/04 §3 names rc_query_where_gt; the builder has eq / null / not_null /
-  // in. The age predicate is therefore an IN list, built from field indexes.
+  // The age predicate is an IN list, built from field indexes.
   var ages: RcValue[2];
   ages[0] = RcInt(31);
   ages[1] = RcInt(32);
@@ -624,8 +604,8 @@ fn check_relations() -> int32 {
   if (p.title != "third") { return 28; }
   if (rc_nulls_has(pn, 3)) { return 29; }   // this post has a body
 
-  // docs/04 §5 also wants an owner with zero posts. One of the three pinned
-  // placeholders cannot also carry a fourth owner, so this is a second load:
+  // An owner with zero posts. Three placeholders cannot carry a fourth owner,
+  // so this is a second load:
   // four keys, still one exec, and group 3 is an empty slice inside a non-null
   // index array — not a null pointer.
   var keys4: RcValue[4];

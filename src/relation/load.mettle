@@ -1,10 +1,8 @@
-// src/relation/load.mettle — the batch loader: one statement per relation.
+// flux_orm/relation/load.mettle — the batch loader: one statement per relation.
 //
-// This file is the whole point of Phase 4, and the whole point fits in one
-// sentence: **N owners cost one statement, not N**. It never loops over owners
-// issuing statements. It collects the distinct owner keys, binds them into one
-// `WHERE fk IN (?, ?, ...)`, runs it once, then groups the returned rows in
-// memory by the foreign key.
+// N owners cost one statement, not N. The loader collects the distinct owner
+// keys, binds them into one `WHERE fk IN (?, ?, ...)`, runs it once, then
+// groups the returned rows in memory by the foreign key.
 //
 //   HAS_MANY           1 exec   SELECT ... FROM "posts" WHERE "user_id" IN (?,...)
 //   BELONGS_TO         1 exec   SELECT ... FROM "users" WHERE "id" IN (?,...)
@@ -54,8 +52,7 @@ export struct RcRelationResult {
   n_execs: int32;      // 1 for HAS_MANY/BELONGS_TO, 2 for THROUGH, 0 for empty keys
   through: RcResult;   // THROUGH only: the mapping rows
   // Target metadata, carried so `rc_relation_hydrate` can write a model
-  // without a meta argument (its signature is fixed by the directive and has
-  // none). Nothing else is stored here: this is metadata, not a session.
+  // without a meta argument.
   meta: RcMeta;
 }
 

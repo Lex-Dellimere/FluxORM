@@ -147,8 +147,8 @@ fn rc_mem_begin(ud: rawptr, mode: int32) -> int32 {
   if (mode != RC_TX_DEFAULT && mode != RC_TX_DEFERRED && mode != RC_TX_IMMEDIATE) {
     return RC_ERR_USAGE;
   }
-  // No nesting. Savepoints are a phase-3+ decision; silent nesting hides a
-  // boundary bug in the caller.
+  // No nesting, like MeoSQL: silent nesting hides a boundary bug in the caller.
+  // core/session flattens nesting above this.
   if (m.tx_depth != 0) { return RC_ERR_TX; }
   m.tx_depth = 1;
   return RC_OK;
