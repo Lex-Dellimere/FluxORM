@@ -1,2 +1,5 @@
 build/
 .mbuild/
+docs/
+cmd/
+pi/
