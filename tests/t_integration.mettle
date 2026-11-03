@@ -12,7 +12,8 @@
 //   * rc_migration_create_table takes (RcMeta, RcBuf*) and returns a code; the
 //     emitted text starts with `CREATE TABLE IF NOT EXISTS`.
 //   * the ledger SELECT reads one column, `"version"`, `ORDER BY "version" ASC`.
-//   * the builder has no `where_gt`; the age predicate is an IN list.
+//   * the age predicate is an IN list (rc_query_where_cmp exists; the
+//     scenario predates it).
 //   * adapter/mem replays scripted rows; it does not evaluate SQL, so "the NULL
 //     row is excluded" is asserted where the logic lives — the builder's
 //     three-valued `IS NULL` and the entity's null bitmap — not in a result set.

@@ -11,6 +11,7 @@
 //
 //   SELECT "id", "email", ... FROM "users"
 //     +  " WHERE \"col\" = ?"        (first where)   /  " AND \"col\" = ?"
+//     +  " WHERE \"col\" < ?"   (also <=, >, >=, <>: rc_query_where_cmp)
 //     +  " WHERE \"col\" IS NULL"    /  " AND \"col\" IS NULL"
 //     +  " WHERE \"col\" IS NOT NULL"/  " AND \"col\" IS NOT NULL"
 //     +  " WHERE \"col\" IN (?, ?)"  /  " AND \"col\" IN (?, ?)"
@@ -55,7 +56,10 @@
 // placeholder: `rc_query_where_eq(q, f, RcNull)` refuses to bind and emits
 // `"col" IS NULL` (the same text as `rc_query_where_null`). `= NULL` cannot be
 // produced by this module at all, and the test asserts that the byte string
-// never appears. `rc_query_where_not_null` emits `IS NOT NULL`. An IN list is
+// never appears. `rc_query_where_not_null` emits `IS NOT NULL`, and so does a
+// `<>` against RcNull. An ordering (`<`, `<=`, `>`, `>=`) against NULL is
+// UNKNOWN for every row, so it is refused with RC_ERR_USAGE rather than built
+// as a predicate that silently matches nothing. An IN list is
 // not rewritten: a NULL element inside `vals` binds as a NULL placeholder
 // (UNKNOWN per SQL), because rewriting `IN (?)` into `(.. OR col IS NULL)`
 // would need equality analysis the builder does not have.
@@ -92,6 +96,14 @@ import "dialect";
 // JOIN flavours. Exported because relation/ names them at its call sites.
 export const RC_JOIN_INNER: int32 = 0;
 export const RC_JOIN_LEFT: int32 = 1;
+
+// Comparison operators for rc_query_where_cmp.
+export const RC_CMP_EQ: int32 = 0; // =
+export const RC_CMP_NE: int32 = 1; // <>
+export const RC_CMP_LT: int32 = 2; // <
+export const RC_CMP_LE: int32 = 3; // <=
+export const RC_CMP_GT: int32 = 4; // >
+export const RC_CMP_GE: int32 = 5; // >=
 
 // Internal statement kinds and clause phases. Not exported: they are not part
 // of the seam and they are not status codes.
@@ -460,11 +472,31 @@ export fn rc_query_push_arg(q: RcQuery*, v: RcValue) -> int32 {
 
 // --- WHERE -------------------------------------------------------------------
 
-export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
+// The operator's text with its surrounding spaces, or "" for an unknown op.
+fn rc_query_cmp_text(op: int32) -> string {
+  if (op == RC_CMP_EQ) { return " = "; }
+  if (op == RC_CMP_NE) { return " <> "; }
+  if (op == RC_CMP_LT) { return " < "; }
+  if (op == RC_CMP_LE) { return " <= "; }
+  if (op == RC_CMP_GT) { return " > "; }
+  if (op == RC_CMP_GE) { return " >= "; }
+  return "";
+}
+
+// `"col" <op> ?`. A NULL value never binds: `=` becomes IS NULL, `<>` becomes
+// IS NOT NULL, and an ordering is refused (see "Three-valued logic").
+export fn rc_query_where_cmp(q: RcQuery*, field: int32, op: int32,
+                             v: RcValue) -> int32 {
   var rc: int32 = rc_query_ready_where(q);
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
-  if (rc_value_is_null(v)) { return rc_query_where_null(q, field); }
+  var text: string = rc_query_cmp_text(op);
+  if (text == "") { return RC_ERR_USAGE; }
+  if (rc_value_is_null(v)) {
+    if (op == RC_CMP_EQ) { return rc_query_where_null(q, field); }
+    if (op == RC_CMP_NE) { return rc_query_where_not_null(q, field); }
+    return RC_ERR_USAGE;
+  }
 
   // Reserve the argv cell before touching the text: if anything below fails,
   // the text is rolled back to its exact previous length and no arg was taken.
@@ -473,7 +505,7 @@ export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
   var mark: int64 = q->buf.len;
   rc = rc_query_begin_where(q);
   if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
-  if (rc == RC_OK) { rc = rc_query_put(q, " = "); }
+  if (rc == RC_OK) { rc = rc_query_put(q, text); }
   if (rc == RC_OK) { rc = rc_query_put_question(q); }
   if (rc != RC_OK) {
     q->buf.len = mark;
@@ -485,6 +517,10 @@ export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
     return take;
   }
   return RC_OK;
+}
+
+export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
+  return rc_query_where_cmp(q, field, RC_CMP_EQ, v);
 }
 
 export fn rc_query_where_null(q: RcQuery*, field: int32) -> int32 {

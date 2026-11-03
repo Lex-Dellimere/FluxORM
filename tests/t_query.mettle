@@ -728,6 +728,60 @@ fn check_update_refusals() -> int32 {
   return 0;
 }
 
+// --- 14. comparison operators ------------------------------------------------
+
+fn check_where_cmp() -> int32 {
+  var m: RcMeta = user_meta();
+  var q: RcQuery = rc_query_select(m);
+  defer rc_query_free(&q);
+
+  if (rc_query_where_cmp(&q, 3, RC_CMP_GE, RcInt(18)) != RC_OK) { return 1; }
+  if (rc_query_where_cmp(&q, 3, RC_CMP_LT, RcInt(65)) != RC_OK) { return 2; }
+  if (rc_query_where_cmp(&q, 5, RC_CMP_GT, RcFloat(1.5)) != RC_OK) { return 3; }
+  if (rc_query_where_cmp(&q, 5, RC_CMP_LE, RcFloat(9.5)) != RC_OK) { return 4; }
+  if (rc_query_where_cmp(&q, 7, RC_CMP_NE, RcInt(1)) != RC_OK) { return 5; }
+  if (rc_query_where_cmp(&q, 1, RC_CMP_EQ, RcText("ada@example.com")) != RC_OK) { return 6; }
+  var want: string = SELECT_BASE + " WHERE \"age\" >= ? AND \"age\" < ? AND \"score\" > ? AND \"score\" <= ? AND \"role\" <> ? AND \"email\" = ?";
+  if (rc_query_sql(&q) != want) { return 7; }
+  if (rc_query_n_args(&q) != 6) { return 8; }
+  var args: RcValue* = rc_query_args(&q);
+  if (!rc_value_same(args[0], RcInt(18))) { return 9; }
+  if (!rc_value_same(args[1], RcInt(65))) { return 10; }
+  if (!rc_value_same(args[4], RcInt(1))) { return 11; }
+
+  // NULL never binds. = is IS NULL, <> is IS NOT NULL, an ordering is refused
+  // and leaves the statement exactly as it was.
+  var qn: RcQuery = rc_query_select(m);
+  defer rc_query_free(&qn);
+  if (rc_query_where_cmp(&qn, 3, RC_CMP_NE, RcNull) != RC_OK) { return 12; }
+  if (rc_query_where_cmp(&qn, 5, RC_CMP_EQ, RcNull) != RC_OK) { return 13; }
+  var before: string = SELECT_BASE + " WHERE \"age\" IS NOT NULL AND \"score\" IS NULL";
+  if (rc_query_sql(&qn) != before) { return 14; }
+  if (rc_query_where_cmp(&qn, 3, RC_CMP_LT, RcNull) != RC_ERR_USAGE) { return 15; }
+  if (rc_query_where_cmp(&qn, 3, RC_CMP_GE, RcNull) != RC_ERR_USAGE) { return 16; }
+  if (rc_query_sql(&qn) != before) { return 17; }
+  if (rc_query_n_args(&qn) != 0) { return 18; }
+  if (has_text(rc_query_sql(&qn), "NULL ?")) { return 19; }
+
+  // Unknown operator and bad field index are refused without changing the text.
+  if (rc_query_where_cmp(&qn, 3, 99, RcInt(1)) != RC_ERR_USAGE) { return 20; }
+  if (rc_query_where_cmp(&qn, -1, RC_CMP_LT, RcInt(1)) != RC_ERR_USAGE) { return 21; }
+  if (rc_query_where_cmp(&qn, 8, RC_CMP_LT, RcInt(1)) != RC_ERR_USAGE) { return 22; }
+  if (rc_query_sql(&qn) != before) { return 23; }
+
+  // After ORDER BY a WHERE term is a clause-order bug.
+  if (rc_query_order_by(&qn, 0, true) != RC_OK) { return 24; }
+  if (rc_query_where_cmp(&qn, 3, RC_CMP_GT, RcInt(1)) != RC_ERR_USAGE) { return 25; }
+
+  // An UPDATE can be keyed by a comparison too.
+  var qu: RcQuery = rc_query_update(m, rc_nulls_set((uint64)0, 4));
+  defer rc_query_free(&qu);
+  if (rc_query_push_arg(&qu, RcBool(false)) != RC_OK) { return 26; }
+  if (rc_query_where_cmp(&qu, 6, RC_CMP_LT, RcTime(1700000000000000)) != RC_OK) { return 27; }
+  if (rc_query_sql(&qu) != "UPDATE \"users\" SET \"active\" = ? WHERE \"created_at\" < ?") { return 28; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("query: select text matches persist", check_select_text())) { failures = failures + 1; }
@@ -743,7 +797,8 @@ export fn main() -> int32 {
   if (!rc_report("query: no growth after construction", check_no_growth())) { failures = failures + 1; }
   if (!rc_report("query: update from a dirty mask", check_update())) { failures = failures + 1; }
   if (!rc_report("query: unsafe updates are refused", check_update_refusals())) { failures = failures + 1; }
-  return rc_summary(failures, 13);
+  if (!rc_report("query: comparison operators", check_where_cmp())) { failures = failures + 1; }
+  return rc_summary(failures, 14);
 }
 
 @test fn t_query() -> int32 {
@@ -760,5 +815,6 @@ export fn main() -> int32 {
   if (check_no_growth() != 0) { return 11; }
   if (check_update() != 0) { return 12; }
   if (check_update_refusals() != 0) { return 13; }
+  if (check_where_cmp() != 0) { return 14; }
   return 0;
 }
