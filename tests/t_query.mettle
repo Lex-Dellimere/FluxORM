@@ -627,6 +627,107 @@ fn check_exec_thin() -> int32 {
   return 0;
 }
 
+// --- 12. update from a dirty mask --------------------------------------------
+
+// A copy of User's fields with one field marked read-only. The copy matters:
+// user_meta() hands out a pointer to the shared field table.
+var RO_FIELDS: RcField[8];
+
+fn read_only_meta(field: int32) -> RcMeta {
+  var m: RcMeta = user_meta();
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    RO_FIELDS[i] = m.fields[i];
+    i = i + 1;
+  }
+  RO_FIELDS[field].flags = RO_FIELDS[field].flags | RC_F_READ_ONLY;
+  m.fields = &RO_FIELDS[0];
+  return m;
+}
+
+fn check_update() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var m: RcMeta = user_meta();
+
+  // name (2) and age (3): SET in field order, then the key.
+  var mask: uint64 = rc_nulls_set(rc_nulls_set((uint64)0, 3), 2);
+  var q: RcQuery = rc_query_update(m, mask);
+  defer rc_query_free(&q);
+  if (q.err != RC_OK) { return 2; }
+  if (rc_query_sql(&q) != "UPDATE \"users\" SET \"name\" = ?, \"age\" = ?") { return 3; }
+
+  // WHERE before the SET values are all in would bind out of order.
+  if (rc_query_where_eq(&q, 0, RcInt(42)) != RC_ERR_USAGE) { return 4; }
+  var res: RcResult;
+  if (rc_query_exec(&q, a, &res) != RC_ERR_USAGE) { return 5; }
+  if (rc_query_push_arg(&q, RcText("Grace")) != RC_OK) { return 6; }
+  if (rc_query_push_arg(&q, RcInt(37)) != RC_OK) { return 7; }
+  if (rc_query_push_arg(&q, RcInt(1)) != RC_ERR_USAGE) { return 8; }
+
+  // No WHERE yet: an UPDATE of every row is refused, and the store is not called.
+  if (rc_query_exec(&q, a, &res) != RC_ERR_USAGE) { return 9; }
+  if (rc_mem_call_count(a) != 0) { return 10; }
+
+  // SELECT-only clauses stay SELECT-only.
+  if (rc_query_order_by(&q, 0, true) != RC_ERR_USAGE) { return 11; }
+  if (rc_query_limit(&q, 1) != RC_ERR_USAGE) { return 12; }
+
+  if (rc_query_where_eq(&q, 0, RcInt(42)) != RC_OK) { return 13; }
+  var want: string = "UPDATE \"users\" SET \"name\" = ?, \"age\" = ? WHERE \"id\" = ?";
+  if (rc_query_sql(&q) != want) { return 14; }
+  if (rc_query_n_args(&q) != 3) { return 15; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 16; }
+  if (rc_query_exec(&q, a, &res) != RC_OK) { return 17; }
+  if (res.affected != 1) { return 18; }
+  rc_result_free(&res);
+  if (rc_mem_last_sql(a) != want) { return 19; }
+  var args: RcValue* = rc_mem_last_args(a);
+  if (!rc_value_same(args[0], RcText("Grace"))) { return 20; }
+  if (!rc_value_same(args[1], RcInt(37))) { return 21; }
+  if (!rc_value_same(args[2], RcInt(42))) { return 22; }
+
+  // A NULL SET value is a bound NULL; a NULL key match is IS NULL, never = NULL.
+  var qn: RcQuery = rc_query_update(m, rc_nulls_set((uint64)0, 3));
+  defer rc_query_free(&qn);
+  if (rc_query_push_arg(&qn, RcNull) != RC_OK) { return 23; }
+  if (rc_query_where_eq(&qn, 5, RcNull) != RC_OK) { return 24; }
+  if (rc_query_sql(&qn) != "UPDATE \"users\" SET \"age\" = ? WHERE \"score\" IS NULL") { return 25; }
+  if (has_text(rc_query_sql(&qn), "= NULL")) { return 26; }
+  return 0;
+}
+
+fn update_refused(m: RcMeta, mask: uint64) -> int32 {
+  var q: RcQuery = rc_query_update(m, mask);
+  defer rc_query_free(&q);
+  if (q.err != RC_ERR_USAGE) { return 1; }
+  if (rc_query_sql(&q) != "") { return 2; }
+  if (rc_query_push_arg(&q, RcInt(1)) != RC_ERR_USAGE) { return 3; }
+  return 0;
+}
+
+fn check_update_refusals() -> int32 {
+  var m: RcMeta = user_meta();
+  // Nothing to write.
+  if (update_refused(m, (uint64)0) != 0) { return 1; }
+  // The primary key is the row's identity, not an UPDATE column.
+  if (update_refused(m, rc_nulls_set((uint64)0, 0)) != 0) { return 2; }
+  // A bit past the last field is a mask from some other table.
+  if (update_refused(m, rc_nulls_set(rc_nulls_set((uint64)0, 2), 8)) != 0) { return 3; }
+  // RC_F_READ_ONLY is never written after insert.
+  var ro: RcMeta = read_only_meta(1);
+  if (update_refused(ro, rc_nulls_set((uint64)0, 1)) != 0) { return 4; }
+  var ok: RcQuery = rc_query_update(ro, rc_nulls_set((uint64)0, 2));
+  defer rc_query_free(&ok);
+  if (ok.err != RC_OK) { return 5; }
+  // A SELECT does not take SET values.
+  var sel: RcQuery = rc_query_select(m);
+  defer rc_query_free(&sel);
+  if (rc_query_push_arg(&sel, RcInt(1)) != RC_ERR_USAGE) { return 6; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("query: select text matches persist", check_select_text())) { failures = failures + 1; }
@@ -640,7 +741,9 @@ export fn main() -> int32 {
   if (!rc_report("query: args are borrowed", check_borrowed_args())) { failures = failures + 1; }
   if (!rc_report("query: exec is a thin call", check_exec_thin())) { failures = failures + 1; }
   if (!rc_report("query: no growth after construction", check_no_growth())) { failures = failures + 1; }
-  return rc_summary(failures, 11);
+  if (!rc_report("query: update from a dirty mask", check_update())) { failures = failures + 1; }
+  if (!rc_report("query: unsafe updates are refused", check_update_refusals())) { failures = failures + 1; }
+  return rc_summary(failures, 13);
 }
 
 @test fn t_query() -> int32 {
@@ -655,5 +758,7 @@ export fn main() -> int32 {
   if (check_borrowed_args() != 0) { return 9; }
   if (check_exec_thin() != 0) { return 10; }
   if (check_no_growth() != 0) { return 11; }
+  if (check_update() != 0) { return 12; }
+  if (check_update_refusals() != 0) { return 13; }
   return 0;
 }

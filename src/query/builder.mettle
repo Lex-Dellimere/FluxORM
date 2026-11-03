@@ -22,6 +22,9 @@
 //
 //   INSERT INTO "users" ("email", "name", ...) VALUES (?, ?, ...), (?, ?, ...)
 //
+//   UPDATE "users" SET "name" = ?, "age" = ?
+//     +  " WHERE \"id\" = ?"  ...    (the same WHERE terms as SELECT; at least one)
+//
 // Clause order in the emitted text is always
 //   SELECT .. FROM .. [JOIN ..] [WHERE ..] [ORDER BY ..] [LIMIT n] [OFFSET n]
 // regardless of the order the caller made the calls in: a JOIN appended after a
@@ -31,6 +34,9 @@
 // ---------------------------------------------------------------------------
 // Argument order — the one sentence relation/ needs
 // ---------------------------------------------------------------------------
+//
+//   An UPDATE binds its SET values first (rc_query_push_arg, in field order),
+//   then its WHERE terms; a WHERE term is refused until every SET value is in.
 //
 //   JOIN emits no placeholders, so `q->args` is exactly the order of the
 //   `rc_query_*` calls that appended a placeholder, which is also the order of
@@ -91,6 +97,7 @@ export const RC_JOIN_LEFT: int32 = 1;
 // of the seam and they are not status codes.
 const Q_KIND_SELECT: int32 = 0;
 const Q_KIND_INSERT: int32 = 1;
+const Q_KIND_UPDATE: int32 = 2;
 
 const Q_PHASE_FROM: int32 = 0;   // base text only; JOIN still allowed
 const Q_PHASE_WHERE: int32 = 1;  // WHERE ...; more AND terms allowed
@@ -116,8 +123,8 @@ export struct RcQuery {
   phase: int32;    // Q_PHASE_*, enforces clause order
   tail: int64;     // insertion point for JOIN clauses (end of FROM ... JOIN ..)
   n_order: int32;  // ORDER BY terms already emitted
-  n_rows: int32;   // batch INSERT: rows, 0 for SELECT
-  n_cols: int32;   // batch INSERT: emitted columns per row, 0 for SELECT
+  n_rows: int32;   // batch INSERT: rows; UPDATE: 1; SELECT: 0
+  n_cols: int32;   // batch INSERT: columns per row; UPDATE: SET columns
   err: int32;      // sticky construction failure; RC_OK when the query is usable
 }
 
@@ -211,6 +218,19 @@ fn rc_query_ready_select(q: RcQuery*) -> int32 {
   if (q->err != RC_OK) { return q->err; }
   if (q->kind != Q_KIND_SELECT) { return RC_ERR_USAGE; }
   return RC_OK;
+}
+
+// WHERE terms are allowed on a SELECT, and on an UPDATE once every SET value
+// has been pushed, so the argv order always matches the `?` order.
+fn rc_query_ready_where(q: RcQuery*) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind == Q_KIND_SELECT) { return RC_OK; }
+  if (q->kind == Q_KIND_UPDATE) {
+    if (q->n_args != q->n_cols) { return RC_ERR_USAGE; }
+    return RC_OK;
+  }
+  return RC_ERR_USAGE;
 }
 
 fn rc_query_put_columns(q: RcQuery*, m: RcMeta) -> int32 {
@@ -372,12 +392,66 @@ export fn rc_query_insert_batch(m: RcMeta, n_rows: int32) -> RcQuery {
   return q;
 }
 
-// Appends one borrowed value cell to a batch INSERT. Refused once the batch is
-// full, so a half-filled statement can never be executed as if it were whole.
+// Builds `UPDATE "table" SET "a" = ?, "b" = ?` for the fields whose bit is set
+// in `mask` (a changeset's dirty mask), in field order. The SET values follow
+// through rc_query_push_arg in the same order, then at least one WHERE term:
+// rc_query_exec refuses an UPDATE without one, because it would rewrite every
+// row in the table.
+//
+// Refused with RC_ERR_USAGE: an empty mask, a bit past n_fields, the primary
+// key (a row's identity is not an UPDATE column; the WHERE needs it), and an
+// RC_F_READ_ONLY field (never written after insert).
+export fn rc_query_update(m: RcMeta, mask: uint64) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_UPDATE);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  if (mask == (uint64)0) { return rc_query_fail(&q, RC_ERR_USAGE); }
+  var i: int32 = m.n_fields;
+  while (i < RC_MAX_FIELDS) {
+    if (rc_nulls_has(mask, i)) { return rc_query_fail(&q, RC_ERR_USAGE); }
+    i = i + 1;
+  }
+
+  rc = rc_query_put(&q, "UPDATE ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_ident(&q, m.table);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, " SET ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var n_cols: int32 = 0;
+  i = 0;
+  while (i < m.n_fields) {
+    if (rc_nulls_has(mask, i)) {
+      if (i == m.pk) { return rc_query_fail(&q, RC_ERR_USAGE); }
+      if ((m.fields[i].flags & RC_F_READ_ONLY) != 0) {
+        return rc_query_fail(&q, RC_ERR_USAGE);
+      }
+      if (n_cols > 0) {
+        rc = rc_query_put(&q, ", ");
+        if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      }
+      rc = rc_query_put_ident(&q, m.fields[i].column);
+      if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
+      if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      n_cols = n_cols + 1;
+    }
+    i = i + 1;
+  }
+  q.n_rows = 1;
+  q.n_cols = n_cols;
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Appends one borrowed value cell to a batch INSERT, or one SET value to an
+// UPDATE. Refused once the row data is complete, so a half-filled statement can
+// never be executed as if it were whole.
 export fn rc_query_push_arg(q: RcQuery*, v: RcValue) -> int32 {
   if (q == 0) { return RC_ERR_USAGE; }
   if (q->err != RC_OK) { return q->err; }
-  if (q->kind != Q_KIND_INSERT) { return RC_ERR_USAGE; }
+  if (q->kind != Q_KIND_INSERT && q->kind != Q_KIND_UPDATE) { return RC_ERR_USAGE; }
   if (q->n_rows <= 0 || q->n_cols <= 0) { return RC_ERR_USAGE; }
   var want: int32 = q->n_rows * q->n_cols;
   if (q->n_args >= want) { return RC_ERR_USAGE; }
@@ -387,7 +461,7 @@ export fn rc_query_push_arg(q: RcQuery*, v: RcValue) -> int32 {
 // --- WHERE -------------------------------------------------------------------
 
 export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
-  var rc: int32 = rc_query_ready_select(q);
+  var rc: int32 = rc_query_ready_where(q);
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
   if (rc_value_is_null(v)) { return rc_query_where_null(q, field); }
@@ -414,7 +488,7 @@ export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
 }
 
 export fn rc_query_where_null(q: RcQuery*, field: int32) -> int32 {
-  var rc: int32 = rc_query_ready_select(q);
+  var rc: int32 = rc_query_ready_where(q);
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
   var mark: int64 = q->buf.len;
@@ -429,7 +503,7 @@ export fn rc_query_where_null(q: RcQuery*, field: int32) -> int32 {
 }
 
 export fn rc_query_where_not_null(q: RcQuery*, field: int32) -> int32 {
-  var rc: int32 = rc_query_ready_select(q);
+  var rc: int32 = rc_query_ready_where(q);
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
   var mark: int64 = q->buf.len;
@@ -449,7 +523,7 @@ export fn rc_query_where_not_null(q: RcQuery*, field: int32) -> int32 {
 // builder should invent.
 export fn rc_query_where_in(q: RcQuery*, field: int32, vals: RcValue*,
                             n: int32) -> int32 {
-  var rc: int32 = rc_query_ready_select(q);
+  var rc: int32 = rc_query_ready_where(q);
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
   if (n <= 0) { return RC_ERR_USAGE; }
@@ -627,13 +701,18 @@ export fn rc_query_n_args(q: RcQuery*) -> int32 {
 // One guarded adapter call: text + argv in, result out. The only extra work is
 // refusing to run a batch INSERT whose argv is not exactly n_rows * n_cols
 // cells, because a short argv is a driver-level "wrong number of arguments",
-// not a partial insert.
+// not a partial insert, and refusing an UPDATE that is missing SET values or
+// has no WHERE term.
 export fn rc_query_exec(q: RcQuery*, a: RcAdapter*, out: RcResult*) -> int32 {
   if (q == 0 || a == 0 || out == 0) { return RC_ERR_USAGE; }
   if (q->err != RC_OK) { return q->err; }
   if (q->kind == Q_KIND_INSERT) {
     if (q->n_rows <= 0 || q->n_cols <= 0) { return RC_ERR_USAGE; }
     if (q->n_args != q->n_rows * q->n_cols) { return RC_ERR_USAGE; }
+  }
+  if (q->kind == Q_KIND_UPDATE) {
+    if (q->n_args < q->n_cols) { return RC_ERR_USAGE; }
+    if (q->phase != Q_PHASE_WHERE) { return RC_ERR_USAGE; }
   }
   return rc_adapter_exec(a, rc_buf_text(&q->buf), q->args, q->n_args, out);
 }

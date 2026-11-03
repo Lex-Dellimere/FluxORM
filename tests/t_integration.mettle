@@ -16,15 +16,14 @@
 //   * adapter/mem replays scripted rows; it does not evaluate SQL, so "the NULL
 //     row is excluded" is asserted where the logic lives — the builder's
 //     three-valued `IS NULL` and the entity's null bitmap — not in a result set.
-//   * no phase emits UPDATE. This file therefore asserts the *mask* (and the
-//     column list it implies) instead of an `UPDATE ... SET` string.
+//   * rc_changeset_save emits the UPDATE, and it names only the dirty columns.
 //   * there is no session and no cache, so a repeated preload is a second
 //     statement by design, not a cache hit.
 //   * a mismatched relation key type is RC_ERR_CAST in rc_relation_check.
 //   * an unknown changeset field name is RC_ERR_USAGE with error_field() == -1
 //     and the static reason "unknown field name".
-//   * there is no UPDATE builder, so an empty change set is refused by nothing:
-//     n_dirty == 0 means apply writes no field and nothing reaches the store.
+//   * an empty change set is not an error: rc_changeset_save writes nothing
+//     and never calls the store.
 //
 // Every statement is compared with `==` against a literal, never by substring.
 // The only substring helper below is a *negative* one: it proves the byte string
@@ -84,10 +83,8 @@ export const POSTS_BY_USER_SQL3: string = "SELECT \"id\", \"user_id\", \"title\"
 export const POSTS_BY_USER_SQL4: string = "SELECT \"id\", \"user_id\", \"title\", \"body\", \"published_at\" FROM \"posts\" WHERE \"user_id\" IN (?, ?, ?, ?)";
 export const USERS_BY_KEY_SQL3: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" WHERE \"id\" IN (?, ?, ?)";
 
-// The column list an UPDATE would name for the two-field change in check 4,
-// quoted by core/buf's identifier rule so the projection below is the real
-// quoting and not a re-spelling of it.
-export const UPDATE_COLUMNS: string = "\"name\", \"age\"";
+// The UPDATE rc_changeset_save sends for the two-field change in check 4.
+export const UPDATE_SQL: string = "UPDATE \"users\" SET \"name\" = ?, \"age\" = ? WHERE \"id\" = ?";
 
 export const CLOCK: int64 = 1700000000000123;
 
@@ -526,34 +523,21 @@ fn check_changeset() -> int32 {
   if (rc_changeset_has(&cs, 1)) { return 19; }
   if (rc_changeset_n_dirty(&cs) != 2) { return 20; }
 
-  // No phase emits UPDATE (changeset/ owns the mask and the values), so the
-  // statement text cannot be asserted. What can: the column list the mask
-  // implies, quoted with core/buf's identifier rule — two columns, field order.
-  var b: RcBuf = rc_buf_new(64);
-  if (b.data == 0) { return 21; }
-  defer rc_buf_free(&b);
-  var first: bool = true;
-  i = 0;
-  while (i < m.n_fields) {
-    if (rc_changeset_has(&cs, i)) {
-      if (!first) {
-        if (rc_buf_put(&b, ", ") != RC_OK) { return 22; }
-      }
-      if (rc_buf_ident(&b, m.fields[i].column) != RC_OK) { return 23; }
-      first = false;
-    }
-    i = i + 1;
-  }
-  if (rc_buf_text(&b) != UPDATE_COLUMNS) { return 24; }
-  if (first) { return 25; }
-
-  // apply writes exactly those two fields and touches no store.
-  if (rc_changeset_apply(&cs, &e) != RC_OK) { return 26; }
-  if (e.state != RC_ST_DIRTY) { return 27; }
-  if (u.name != "Ada L.") { return 28; }
-  if (!rc_nulls_has(e.nulls, 3)) { return 29; }
-  if (u.age != 0) { return 30; }
-  if (rc_mem_call_count(a) != 1) { return 31; }   // only the load executed
+  // save writes exactly those two fields: one UPDATE, the dirty columns in
+  // field order, the key last.
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 21; }
+  if (rc_changeset_save(a, &cs, &e) != RC_OK) { return 22; }
+  if (rc_mem_last_sql(a) != UPDATE_SQL) { return 23; }
+  if (rc_mem_arg_count(a) != 3) { return 24; }
+  var sent: RcValue* = rc_mem_last_args(a);
+  if (!rc_value_same(sent[0], RcText("Ada L."))) { return 25; }
+  if (!rc_value_is_null(sent[1])) { return 26; }
+  if (!rc_value_same(sent[2], RcInt(42))) { return 27; }
+  if (e.state != RC_ST_CLEAN) { return 28; }
+  if (u.name != "Ada L.") { return 29; }
+  if (!rc_nulls_has(e.nulls, 3)) { return 30; }
+  if (u.age != 0) { return 31; }
+  if (rc_mem_call_count(a) != 2) { return 48; }   // the load and the update
 
   // Zero and NULL are never conflated. Against a baseline age of 30, a 0 is a
   // change and the cell binds RcInt(0).
@@ -575,7 +559,7 @@ fn check_changeset() -> int32 {
   if (!rc_changeset_has(&cs, 3)) { return 44; }
   if (!rc_value_is_null(cs.values[3])) { return 45; }
   if (rc_changeset_n_dirty(&cs) != 1) { return 46; }
-  if (rc_mem_call_count(a) != 1) { return 47; }
+  if (rc_mem_call_count(a) != 2) { return 47; }
   return 0;
 }
 
@@ -850,9 +834,8 @@ fn check_failure_matrix() -> int32 {
   if (rc_persist_insert(a, &de) != RC_ERR_UNSUPPORTED) { return 17; }
   if (rc_mem_call_count(a) != 0) { return 18; }
 
-  // 4. An empty change set. There is no UPDATE builder in this tree, so nothing
-  // refuses it: n_dirty == 0 means apply writes no field and the store is never
-  // seen — which is the "never a full-row rewrite" property, asserted directly.
+  // 4. An empty change set. Saving it writes no field and never reaches the
+  // store, which is the "never a full-row rewrite" property, asserted directly.
   var cs3: RcChangeset = rc_changeset_new(m);
   defer rc_changeset_free(&cs3);
   if (rc_changeset_n_dirty(&cs3) != 0) { return 19; }
@@ -862,7 +845,7 @@ fn check_failure_matrix() -> int32 {
   var ce: RcEntity = rc_entity_new(m, (rawptr)&clean);
   if (rc_entity_set(&ce, 0, RcInt(5)) != RC_OK) { return 21; }
   ce.state = RC_ST_CLEAN;
-  if (rc_changeset_apply(&cs3, &ce) != RC_OK) { return 22; }
+  if (rc_changeset_save(a, &cs3, &ce) != RC_OK) { return 22; }
   if (ce.state != RC_ST_CLEAN) { return 23; }     // CLEAN -> DIRTY needs a write
   if (clean.id != 5) { return 24; }
   if (rc_mem_call_count(a) != 0) { return 25; }

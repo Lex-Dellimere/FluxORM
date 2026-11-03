@@ -29,8 +29,9 @@
 // error stands, and rc_changeset_apply refuses an invalid changeset with
 // RC_ERR_USAGE before it writes anything.
 //
-// No SQL here. This phase produces the mask and the values; emitting
-// `UPDATE ... SET` belongs to a later directive.
+// The SQL itself is query/'s: rc_changeset_save hands the mask to
+// rc_query_update, so an UPDATE names exactly the dirty columns and nothing
+// else.
 
 import "std/mem";
 
@@ -38,6 +39,8 @@ import "../core/status";
 import "../core/value";
 import "../core/meta";
 import "../core/entity";
+import "../adapter/adapter";
+import "../query/builder";
 import "cast";
 
 export struct RcChangeset {
@@ -400,5 +403,70 @@ export fn rc_changeset_apply(cs: RcChangeset*, e: RcEntity*) -> int32 {
     }
     i = i + 1;
   }
+  return RC_OK;
+}
+
+// --- save --------------------------------------------------------------------
+
+// Writes the dirty fields to the store as one UPDATE keyed by the primary key:
+// `UPDATE "t" SET <dirty columns> = ? WHERE "pk" = ?`. The entity must already
+// be in the store (CLEAN or DIRTY, with a key); a NEW one is inserted instead,
+// so it is refused here.
+//
+// Order matters, and it is what keeps a refusal from leaving a half-written
+// model:
+//   1. the UPDATE is built from the mask first, so a mask query/ refuses (the
+//      primary key, a read-only field) is refused before the model changes;
+//   2. rc_changeset_apply writes the values through core/meta's range checks;
+//   3. the SET values are read back from the model, so the store gets exactly
+//      the narrowed values the model holds.
+//
+// An empty changeset writes nothing and does not call the adapter. An adapter
+// failure is returned unchanged and the entity stays DIRTY: the model holds
+// the new values, the store does not. Zero affected rows is RC_ERR_NOT_FOUND:
+// the row was deleted, or its key changed, since it was loaded. On success the
+// entity is CLEAN. The changeset is not reset; bind or reset it before the next
+// round of edits.
+export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> int32 {
+  if (a == 0 || cs == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (cs->values == 0) { return RC_ERR_USAGE; }
+  if (cs->err_code != RC_OK) { return RC_ERR_USAGE; }
+  if (e->state != RC_ST_CLEAN && e->state != RC_ST_DIRTY) {
+    return rc_changeset_note(cs, -1, RC_ERR_USAGE, "entity is not in the store");
+  }
+  if (e->meta.pk < 0 || !rc_entity_has_pk(e)) {
+    return rc_changeset_note(cs, -1, RC_ERR_USAGE, "entity has no primary key");
+  }
+  if (cs->changes == (uint64)0) { return RC_OK; }
+
+  var q: RcQuery = rc_query_update(cs->meta, cs->changes);
+  defer rc_query_free(&q);
+  if (q.err != RC_OK) {
+    return rc_changeset_note(cs, -1, q.err, "the update was refused");
+  }
+  var rc: int32 = rc_changeset_apply(cs, e);
+  if (rc != RC_OK) { return rc; }
+
+  var i: int32 = 0;
+  while (i < cs->meta.n_fields) {
+    if (rc_nulls_has(cs->changes, i)) {
+      var v: RcValue = RcNull;
+      rc = rc_entity_get(e, i, &v);
+      if (rc != RC_OK) { return rc; }
+      rc = rc_query_push_arg(&q, v);
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  rc = rc_query_where_eq(&q, e->meta.pk, rc_entity_pk(e));
+  if (rc != RC_OK) { return rc; }
+
+  var res: RcResult;
+  rc = rc_query_exec(&q, a, &res);
+  if (rc != RC_OK) { return rc; }
+  var affected: int32 = res.affected;
+  rc_result_free(&res);
+  if (affected == 0) { return RC_ERR_NOT_FOUND; }
+  e->state = RC_ST_CLEAN;
   return RC_OK;
 }
