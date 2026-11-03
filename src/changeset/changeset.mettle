@@ -421,12 +421,20 @@ export fn rc_changeset_apply(cs: RcChangeset*, e: RcEntity*) -> int32 {
 //   3. the SET values are read back from the model, so the store gets exactly
 //      the narrowed values the model holds.
 //
+// Stale writes. A table with an RC_F_VERSION field is saved as
+//   UPDATE "t" SET <dirty> = ?, "version" = ? WHERE "pk" = ? AND "version" = ?
+// binding old + 1 and old. If another writer saved the row since this model
+// was read, its version moved on, nothing matches and the answer is
+// RC_ERR_CONFLICT: the other write is kept, not overwritten. On success the
+// model's version becomes old + 1. A table without one is last-writer-wins.
+//
 // An empty changeset writes nothing and does not call the adapter. An adapter
 // failure is returned unchanged and the entity stays DIRTY: the model holds
-// the new values, the store does not. Zero affected rows is RC_ERR_NOT_FOUND:
-// the row was deleted, or its key changed, since it was loaded. On success the
-// entity is CLEAN. The changeset is not reset; bind or reset it before the next
-// round of edits.
+// the new values, the store does not. Zero affected rows is RC_ERR_CONFLICT
+// for a versioned table (stale, or deleted) and RC_ERR_NOT_FOUND otherwise
+// (deleted, or its key changed, since it was loaded). On success the entity is
+// CLEAN. The changeset is not reset; bind or reset it before the next round of
+// edits.
 export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> int32 {
   if (a == 0 || cs == 0 || e == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return RC_ERR_USAGE; }
@@ -444,7 +452,23 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
   if (q.err != RC_OK) {
     return rc_changeset_note(cs, -1, q.err, "the update was refused");
   }
-  var rc: int32 = rc_changeset_apply(cs, e);
+  // Read the version the model was loaded with before anything changes.
+  var vf: int32 = rc_meta_version(cs->meta);
+  var old_ver: int64 = 0;
+  var rc: int32 = RC_OK;
+  if (vf >= 0) {
+    var cur: RcValue = RcNull;
+    rc = rc_entity_get(e, vf, &cur);
+    if (rc != RC_OK) { return rc; }
+    rc = rc_value_as_i64(cur, &old_ver);
+    if (rc != RC_OK) {
+      return rc_changeset_note(cs, vf, RC_ERR_USAGE, "version is not set");
+    }
+    if (old_ver == (int64)9223372036854775807) {
+      return rc_changeset_note(cs, vf, RC_ERR_RANGE, "version is at its maximum");
+    }
+  }
+  rc = rc_changeset_apply(cs, e);
   if (rc != RC_OK) { return rc; }
 
   var i: int32 = 0;
@@ -458,15 +482,30 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
     }
     i = i + 1;
   }
+  if (vf >= 0) {
+    rc = rc_query_push_arg(&q, RcInt(old_ver + 1));
+    if (rc != RC_OK) { return rc; }
+  }
   rc = rc_query_where_eq(&q, e->meta.pk, rc_entity_pk(e));
   if (rc != RC_OK) { return rc; }
+  if (vf >= 0) {
+    rc = rc_query_where_eq(&q, vf, RcInt(old_ver));
+    if (rc != RC_OK) { return rc; }
+  }
 
   var res: RcResult;
   rc = rc_query_exec(&q, a, &res);
   if (rc != RC_OK) { return rc; }
   var affected: int32 = res.affected;
   rc_result_free(&res);
-  if (affected == 0) { return RC_ERR_NOT_FOUND; }
+  if (affected == 0) {
+    if (vf >= 0) { return RC_ERR_CONFLICT; }
+    return RC_ERR_NOT_FOUND;
+  }
+  if (vf >= 0) {
+    rc = rc_meta_set(e->meta, e->model, &e->nulls, vf, RcInt(old_ver + 1));
+    if (rc != RC_OK) { return rc; }
+  }
   e->state = RC_ST_CLEAN;
   return RC_OK;
 }

@@ -21,6 +21,11 @@ export const RC_F_NOT_NULL: int32 = 4;
 export const RC_F_UNIQUE: int32 = 8;
 export const RC_F_READ_ONLY: int32 = 16; // never written after insert
 export const RC_F_TIMESTAMP: int32 = 32; // wire type is RC_T_TIME
+// Optimistic-lock row version. The ORM owns it: insert writes 1, every save
+// writes old + 1 and only matches the row while it still holds old, so a write
+// based on a stale read changes nothing and answers RC_ERR_CONFLICT. At most
+// one per table, RC_T_I64 and NOT NULL, never the primary key.
+export const RC_F_VERSION: int32 = 64;
 
 export const RC_MAX_FIELDS: int32 = 64;  // one uint64 null bitmap
 
@@ -124,6 +129,16 @@ export fn rc_meta_find(m: RcMeta, name: string) -> int32 {
 
 export fn rc_meta_pk(m: RcMeta) -> int32 { return m.pk; }
 
+// Index of the RC_F_VERSION field, -1 when the table has none.
+export fn rc_meta_version(m: RcMeta) -> int32 {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if ((m.fields[i].flags & RC_F_VERSION) != 0) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
 export fn rc_meta_is_auto(m: RcMeta) -> bool {
   if (m.pk < 0 || m.pk >= m.n_fields) { return false; }
   if ((m.fields[m.pk].flags & RC_F_AUTO) != 0) { return true; }
@@ -188,6 +203,11 @@ export fn rc_meta_check(m: RcMeta, bad: int32*) -> int32 {
     if ((m.fields[i].flags & RC_F_AUTO) != 0 && (m.fields[i].flags & RC_F_PK) == 0) {
       return RC_ERR_USAGE;
     }
+    if ((m.fields[i].flags & RC_F_VERSION) != 0) {
+      if (m.fields[i].ty != RC_T_I64) { return RC_ERR_UNSUPPORTED; }
+      if ((m.fields[i].flags & RC_F_NOT_NULL) == 0) { return RC_ERR_USAGE; }
+      if ((m.fields[i].flags & RC_F_PK) != 0) { return RC_ERR_USAGE; }
+    }
     var j: int32 = i + 1;
     while (j < m.n_fields) {
       if (m.fields[i].column == m.fields[j].column) { return RC_ERR_USAGE; }
@@ -210,6 +230,18 @@ export fn rc_meta_check(m: RcMeta, bad: int32*) -> int32 {
     i = i + 1;
   }
   if (pk_count > 1) { return RC_ERR_USAGE; }
+  var n_version: int32 = 0;
+  i = 0;
+  while (i < m.n_fields) {
+    if ((m.fields[i].flags & RC_F_VERSION) != 0) {
+      n_version = n_version + 1;
+      if (n_version > 1) {
+        if (bad != 0) { *bad = i; }
+        return RC_ERR_USAGE;
+      }
+    }
+    i = i + 1;
+  }
   if (pk_count == 1 && m.pk != pk_at) { return RC_ERR_USAGE; }
   if (pk_count == 0 && m.pk != -1) { return RC_ERR_USAGE; }
   if (bad != 0) { *bad = -1; }

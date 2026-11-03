@@ -38,7 +38,8 @@ fn rc_persist_put_table(b: RcBuf*, m: RcMeta) -> int32 {
 
 // Inserts one entity. An auto primary key whose null bit is set is omitted
 // from the column list and read back from the result. `e.nulls` records
-// which other fields are NULL, and those bind as RcNull.
+// which other fields are NULL, and those bind as RcNull. A version field
+// always starts at 1.
 export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   if (a == 0 || e == 0) { return RC_ERR_USAGE; }
   if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
@@ -46,6 +47,11 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   var bad: int32 = -1;
   var rc: int32 = rc_meta_check(m, &bad);
   if (rc != RC_OK) { return rc; }
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_meta_set(m, e->model, &e->nulls, vf, RcInt(1));
+    if (rc != RC_OK) { return rc; }
+  }
 
   var buf: RcBuf = rc_buf_new(128);
   if (buf.data == 0) { return RC_ERR_NOMEM; }
@@ -219,12 +225,28 @@ export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
   rc = rc_buf_put(&buf, " = ?");
   if (rc != RC_OK) { return rc; }
 
-  var args: RcValue[1];
+  // A versioned row is only deleted while it still holds the version this
+  // model read; otherwise someone changed it first and it is kept.
+  var args: RcValue[2];
   args[0] = rc_entity_pk(e);
+  var n_args: int32 = 1;
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_buf_put(&buf, " AND ");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_ident(&buf, m.fields[vf].column);
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_put(&buf, " = ?");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_entity_get(e, vf, &args[1]);
+    if (rc != RC_OK) { return rc; }
+    n_args = 2;
+  }
   var res: RcResult;
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), &args[0], 1, &res);
+  rc = rc_adapter_exec(a, rc_buf_text(&buf), &args[0], n_args, &res);
   if (rc != RC_OK) { return rc; }
   defer rc_result_free(&res);
+  if (vf >= 0 && res.affected == 0) { return RC_ERR_CONFLICT; }
   e->state = RC_ST_DELETED;
   return RC_OK;
 }

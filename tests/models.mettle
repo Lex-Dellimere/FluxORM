@@ -154,6 +154,66 @@ export fn post_meta_status() -> int32 {
   return rc_meta_check(POST_META, 0);
 }
 
+// --- Note: a versioned table (RC_F_VERSION) -----------------------------------
+
+export struct Note {
+  id: int64;
+  text: string;
+  version: int64;
+}
+
+var NOTE_FIELDS: RcField[3];
+var NOTE_META: RcMeta;
+var NOTE_READY: bool = false;
+
+const NOTE_COLS: RcColumn[3] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
+  { index: 1, column: "text", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 2, column: "version", ty: RC_T_I64, flags: RC_F_VERSION | RC_F_NOT_NULL },
+];
+
+fn note_fields(out: RcField*) -> int32 {
+  var i: int32 = 0;
+  comptime for f in typeof(Note).fields {
+    out[i].name = f.name;
+    out[i].column = f.name;
+    out[i].kind = f.type.kind;
+    out[i].ty = rc_kind_type(f.type.kind);
+    out[i].offset = (int32)f.offset;
+    out[i].size = (int32)f.type.size;
+    out[i].flags = 0;
+    i = i + 1;
+  }
+  return i;
+}
+
+fn note_build() -> int32 {
+  var i: int32 = note_fields(&NOTE_FIELDS[0]);
+  NOTE_META.table = "notes";
+  NOTE_META.name = "Note";
+  NOTE_META.size = (int32)sizeof(Note);
+  NOTE_META.fields = &NOTE_FIELDS[0];
+  NOTE_META.n_fields = i;
+  NOTE_META.pk = -1;
+  return rc_meta_finalize(&NOTE_META, &NOTE_COLS[0], 3);
+}
+
+export fn note_meta() -> RcMeta {
+  if (!NOTE_READY) {
+    note_build();
+    NOTE_READY = true;
+  }
+  return NOTE_META;
+}
+
+export fn note_meta_status() -> int32 {
+  if (!NOTE_READY) {
+    note_build();
+    NOTE_READY = true;
+  }
+  return rc_meta_check(NOTE_META, 0);
+}
+
 // --- Doc: a field type the wire cannot carry --------------------------------
 // `uint8[]` is a slice, kind Slice. MeoSQL's record codec has a BLOB, but a
 // Mettle slice is a (ptr,len) view with no owner, so mapping it silently would

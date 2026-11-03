@@ -676,6 +676,12 @@ fn check_update() -> int32 {
 
   if (rc_query_where_eq(&q, 0, RcInt(42)) != RC_OK) { return 13; }
   var want: string = "UPDATE \"users\" SET \"name\" = ?, \"age\" = ? WHERE \"id\" = ?";
+  // A second WHERE term after the first is fine.
+  var q2: RcQuery = rc_query_update(m, rc_nulls_set((uint64)0, 2));
+  defer rc_query_free(&q2);
+  if (rc_query_push_arg(&q2, RcText("x")) != RC_OK) { return 27; }
+  if (rc_query_where_eq(&q2, 0, RcInt(1)) != RC_OK) { return 28; }
+  if (rc_query_where_eq(&q2, 7, RcInt(2)) != RC_OK) { return 29; }
   if (rc_query_sql(&q) != want) { return 14; }
   if (rc_query_n_args(&q) != 3) { return 15; }
   if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 16; }

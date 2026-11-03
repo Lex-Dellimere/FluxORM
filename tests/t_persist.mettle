@@ -244,6 +244,38 @@ fn check_insert_conflict_keeps_state() -> int32 {
   return 0;
 }
 
+fn check_versioned() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var m: RcMeta = note_meta();
+
+  // Insert writes version 1, whatever the model held.
+  var n: Note;
+  memset((rawptr)&n, 0, (int64)sizeof(Note));
+  n.version = 9;
+  var e: RcEntity = rc_entity_new(m, (rawptr)&n);
+  if (rc_entity_set(&e, 1, RcText("hi")) != RC_OK) { return 2; }
+  if (rc_mem_push_ok(a, 1, 5) != RC_OK) { return 3; }
+  if (rc_persist_insert(a, &e) != RC_OK) { return 4; }
+  if (rc_mem_last_sql(a) != "INSERT INTO \"notes\" (\"text\", \"version\") VALUES (?, ?)") { return 5; }
+  if (!rc_value_same(rc_mem_last_args(a)[1], RcInt(1))) { return 6; }
+  if (n.version != 1) { return 7; }
+
+  // Delete matches the version too; a moved-on row is kept.
+  var del: string = "DELETE FROM \"notes\" WHERE \"id\" = ? AND \"version\" = ?";
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 8; }
+  if (rc_persist_delete(a, &e) != RC_ERR_CONFLICT) { return 9; }
+  if (rc_mem_last_sql(a) != del) { return 10; }
+  if (!rc_value_same(rc_mem_last_args(a)[0], RcInt(5))) { return 11; }
+  if (!rc_value_same(rc_mem_last_args(a)[1], RcInt(1))) { return 12; }
+  if (e.state != RC_ST_CLEAN) { return 13; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 14; }
+  if (rc_persist_delete(a, &e) != RC_OK) { return 15; }
+  if (e.state != RC_ST_DELETED) { return 16; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("persist: insert builds args and takes the key", check_insert())) { failures = failures + 1; }
@@ -251,7 +283,8 @@ export fn main() -> int32 {
   if (!rc_report("persist: load sets fields and nulls", check_load())) { failures = failures + 1; }
   if (!rc_report("persist: delete binds the key once", check_delete())) { failures = failures + 1; }
   if (!rc_report("persist: conflict keeps entity state", check_insert_conflict_keeps_state())) { failures = failures + 1; }
-  return rc_summary(failures, 5);
+  if (!rc_report("persist: versioned insert and delete", check_versioned())) { failures = failures + 1; }
+  return rc_summary(failures, 6);
 }
 
 @test fn t_persist() -> int32 {
@@ -260,5 +293,6 @@ export fn main() -> int32 {
   if (check_load() != 0) { return 3; }
   if (check_delete() != 0) { return 4; }
   if (check_insert_conflict_keeps_state() != 0) { return 5; }
+  if (check_versioned() != 0) { return 6; }
   return 0;
 }

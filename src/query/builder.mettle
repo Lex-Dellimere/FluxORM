@@ -239,7 +239,7 @@ fn rc_query_ready_where(q: RcQuery*) -> int32 {
   if (q->err != RC_OK) { return q->err; }
   if (q->kind == Q_KIND_SELECT) { return RC_OK; }
   if (q->kind == Q_KIND_UPDATE) {
-    if (q->n_args != q->n_cols) { return RC_ERR_USAGE; }
+    if (q->n_args < q->n_cols) { return RC_ERR_USAGE; }
     return RC_OK;
   }
   return RC_ERR_USAGE;
@@ -411,8 +411,13 @@ export fn rc_query_insert_batch(m: RcMeta, n_rows: int32) -> RcQuery {
 // row in the table.
 //
 // Refused with RC_ERR_USAGE: an empty mask, a bit past n_fields, the primary
-// key (a row's identity is not an UPDATE column; the WHERE needs it), and an
-// RC_F_READ_ONLY field (never written after insert).
+// key (a row's identity is not an UPDATE column; the WHERE needs it), an
+// RC_F_READ_ONLY field (never written after insert), and the RC_F_VERSION
+// field (the ORM owns it).
+//
+// A table with an RC_F_VERSION field always gets that column as the last SET
+// column, so the caller pushes the dirty values and then the new version
+// (rc_changeset_save does this, and adds `AND "version" = ?` with the old one).
 export fn rc_query_update(m: RcMeta, mask: uint64) -> RcQuery {
   var q: RcQuery = rc_query_init(m, Q_KIND_UPDATE);
   if (q.err != RC_OK) { return q; }
@@ -439,6 +444,9 @@ export fn rc_query_update(m: RcMeta, mask: uint64) -> RcQuery {
       if ((m.fields[i].flags & RC_F_READ_ONLY) != 0) {
         return rc_query_fail(&q, RC_ERR_USAGE);
       }
+      if ((m.fields[i].flags & RC_F_VERSION) != 0) {
+        return rc_query_fail(&q, RC_ERR_USAGE);
+      }
       if (n_cols > 0) {
         rc = rc_query_put(&q, ", ");
         if (rc != RC_OK) { return rc_query_fail(&q, rc); }
@@ -450,6 +458,15 @@ export fn rc_query_update(m: RcMeta, mask: uint64) -> RcQuery {
       n_cols = n_cols + 1;
     }
     i = i + 1;
+  }
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_query_put(&q, ", ");
+    if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.fields[vf].column); }
+    if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
+    if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    n_cols = n_cols + 1;
   }
   q.n_rows = 1;
   q.n_cols = n_cols;
