@@ -1,4 +1,4 @@
-# flux_orm — an ORM for MeoSQL (dacor).
+# flux_orm — an ORM for MeoSQL.
 #
 # No [toolchain] pin on purpose: flux_orm needs the head compiler (compile-time
 # reflection, `Kind`, comptime for). Pin v0.17.0 and the build fails. Select

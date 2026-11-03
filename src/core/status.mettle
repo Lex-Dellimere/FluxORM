@@ -2,7 +2,7 @@
 //
 // Mettle has no exceptions: every call returns int32 and every failure is one
 // of these codes. Adapters map their own codes into this range; nothing above
-// the adapter ever sees a dacor status or an errno.
+// the adapter ever sees a MeoSQL status or an errno.
 
 export const RC_OK: int32 = 0;
 export const RC_ERR: int32 = -1;             // unspecified, always a bug

@@ -1,16 +1,16 @@
 # flux_orm
 
-An ORM for the MeoSQL storage engine (formerly dacor), written in Mettle.
+An ORM for the [MeoSQL](../meosql) database (formerly dacor), written in Mettle.
 
 Status: core+adapter, query, changeset, relation, migration, and the
 cross-phase acceptance test (`tests/t_integration.mettle`) are implemented and
 green in the interpreter, debug and release. The MeoSQL bridge
-(`src/adapter/dacor.mettle`) is a stub until MeoSQL exposes a statement/row
+(`src/adapter/meosql.mettle`) is a stub until MeoSQL exposes a statement/row
 API; tests run against the in-memory recording adapter.
 
 ```
   src/core/       value status meta entity buf persist   Phase 1
-  src/adapter/    adapter mem dacor                      Phase 1
+  src/adapter/    adapter mem meosql                     Phase 1
   src/query/      dialect builder                        Phase 2
   src/changeset/  cast changeset                         Phase 3
   src/relation/   relations + batch loaders              Phase 4

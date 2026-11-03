@@ -4,11 +4,11 @@
 // records the statement text and the bound arguments, and replays a scripted
 // result. That is enough to pin down argument order, type preservation, NULL
 // round-tripping, ownership, transaction states and error propagation without
-// a single byte of dacor existing yet — which matters, because dacor's SQL
-// surface (api/) is a later phase than this ORM's core.
+// a single byte of MeoSQL existing yet — which matters, because MeoSQL's SQL
+// surface is a later phase than this ORM's core.
 //
 // It is also the adapter the whole test suite runs against, so every ORM
-// behaviour is verified twice: once against the seam, once against real dacor
+// behaviour is verified twice: once against the seam, once against real MeoSQL
 // once that lands.
 
 import "std/mem";

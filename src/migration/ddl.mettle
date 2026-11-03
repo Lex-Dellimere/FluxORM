@@ -5,8 +5,8 @@
 // the key and the nullability all come from one source.
 //
 // Affinity is the SQLite family (INTEGER/REAL/TEXT/BLOB), which is also what
-// dacor stores. The *wire* type decides the column, never the Mettle type: a
-// `bool` is INTEGER because dacor has no BOOL, and an `int64` overridden to
+// MeoSQL stores. The *wire* type decides the column, never the Mettle type: a
+// `bool` is INTEGER because MeoSQL has no BOOL, and an `int64` overridden to
 // RC_T_TIME is INTEGER because micros are an integer.
 //
 // Nothing here interpolates a value. Identifiers go through rc_buf_ident, the

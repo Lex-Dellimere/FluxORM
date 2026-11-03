@@ -168,7 +168,7 @@ fn rc_cast_parse_f64(s: string, out: float64*, why: string*) -> int32 {
   return RC_OK;
 }
 
-// Exact match only. dacor has no BOOL and the wire form is 0/1, so the textual
+// Exact match only. MeoSQL has no BOOL and the wire form is 0/1, so the textual
 // forms a form post actually sends are accepted and nothing else.
 fn rc_cast_parse_bool(s: string, out: bool*, why: string*) -> int32 {
   *out = false;

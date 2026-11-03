@@ -14,7 +14,7 @@
 // failed one, because the next run would skip it.
 //
 // Up-only, deliberately. There is no `down` and no auto-diff against the store
-// until dacor's catalog can be queried: without a readable catalog, "what does
+// until MeoSQL's catalog can be queried: without a readable catalog, "what does
 // the schema look like" can only be guessed, and a guessed rollback is a data
 // loss bug. `rc_migration_down` therefore answers RC_ERR_UNSUPPORTED and says
 // why.
@@ -356,7 +356,7 @@ export fn rc_migration_run(a: RcAdapter*, s: RcMigrationSet*,
   return RC_OK;
 }
 
-// There is no down. A rollback needs the store's current schema, and dacor's
+// There is no down. A rollback needs the store's current schema, and MeoSQL's
 // catalog is not readable yet, so a `down` here could only guess — and a
 // guessed DROP is a data-loss bug that runs unattended. Up-only until the
 // catalog lands; the code is RC_ERR_UNSUPPORTED so a caller can branch on it

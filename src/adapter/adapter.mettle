@@ -1,16 +1,16 @@
 // flux_orm/adapter/adapter.mettle — the driver bridge contract.
 //
 // An adapter is a vtable of plain function pointers, not a trait and not an
-// import cycle. The ORM never imports dacor; it holds an RcAdapter and calls
+// import cycle. The ORM never imports MeoSQL; it holds an RcAdapter and calls
 // through it. That is also why there is exactly one place to add a second
 // store later.
 //
 // Two things in this file are load-bearing:
 //
-// 1. exec() materialises rows. It does not hand back a live cursor. dacor's
-//    cursors pin pager frames (dacor/PHASE1.md §2.4); a cursor that escapes
-//    into application code can exhaust the frame table and turn every later
-//    alloc into DK_ERR_BUSY. Materialising at the adapter boundary is the only
+// 1. exec() materialises rows. It does not hand back a live cursor. MeoSQL's
+//    cursors pin pager frames; a cursor that escapes into application code
+//    can exhaust the frame table and turn every later alloc into
+//    MEO_ERR_BUSY. Materialising at the adapter boundary is the only
 //    way the ORM can promise it never holds a pin across user code. Result
 //    sets are therefore owned, and freed with rc_result_free.
 //
@@ -27,7 +27,7 @@ import "../core/value";
 // writes results through out-parameters.
 export const RC_TX_DEFAULT: int32 = 0;
 export const RC_TX_DEFERRED: int32 = 1;
-export const RC_TX_IMMEDIATE: int32 = 2; // single-writer stores (dacor)
+export const RC_TX_IMMEDIATE: int32 = 2; // single-writer stores (MeoSQL)
 
 export struct RcRow { values: RcValue*; n: int32; }
 
