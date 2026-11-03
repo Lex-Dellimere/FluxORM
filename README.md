@@ -1,36 +1,87 @@
 # flux_orm
 
-An ORM for the [MeoSQL](../meosql) database (formerly dacor), written in Mettle.
+An ORM for the [MeoSQL](../meosql) database, written in Mettle.
 
-Status: core+adapter, query, changeset, relation, migration, and the
-cross-phase acceptance test (`tests/t_integration.mettle`) are implemented and
-green in the interpreter, debug and release. The MeoSQL bridge
-(`src/adapter/meosql.mettle`) is a stub until MeoSQL exposes a statement/row
-API; tests run against the in-memory recording adapter.
+Status: models, queries, inserts, loads, updates of changed fields, deletes,
+relations without N+1, up-only migrations, sessions with transactions and
+stale-write detection all work and are tested in the interpreter, debug and
+release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub until
+MeoSQL's SQL API is ready; the tests run against an in-memory adapter that
+records statements.
+
+## Layout
 
 ```
-  src/core/       value status meta entity buf persist   Phase 1
-                  session (connection + flat transaction)
-  src/adapter/    adapter mem meosql                     Phase 1
-  src/query/      dialect builder                        Phase 2
-  src/changeset/  cast changeset                         Phase 3
-  src/relation/   relations + batch loaders              Phase 4
-  src/migration/  ddl version                            Phase 5
-  tests/          models.mettle (the model template) + t_*.mettle per phase
+src/core/       values, status codes, model metadata, entities, sessions,
+                single-row insert/load/delete
+src/adapter/    the adapter interface, the in-memory test adapter, MeoSQL
+src/query/      SELECT/INSERT/UPDATE builder and SQL dialect
+src/changeset/  casting user input, dirty fields, save
+src/relation/   has-many / belongs-to / through, loaded in batches
+src/migration/  CREATE TABLE from metadata, versioned migrations
+tests/          models.mettle (the model template) and one t_*.mettle per area
 ```
 
-## The one design decision worth knowing
+## Models
 
-Mettle reflects at compile time only. `typeof(T).fields` gives each field's
-name, offset and type kind while compiling and leaves nothing behind, so model
-metadata is *generated* (`comptime for`) into a static table and field access
-is a typed load at the compiler-reported offset. No macros, no build step, no
-hand-maintained offset table, and no struct overlays.
+Mettle reflects at compile time only, so a model's metadata is generated with
+`comptime for` over `typeof(T).fields`: field names, offsets and types come
+from the compiler, with no hand-written offset table. An override table adds
+what a struct cannot say (column names, keys, NOT NULL, a version column).
+Copy the shape in `tests/models.mettle`.
 
-## Toolchain
+```mettle
+export struct Note {
+  id: int64;
+  text: string;
+  version: int64;
+}
 
-mbuild project. `mbuild.toml` has no `[toolchain]` pin on purpose: flux_orm
-needs the head compiler, selected with `METTLE` (or `mbuild --mettle`).
+const NOTE_COLS: RcColumn[3] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
+  { index: 1, column: "text", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 2, column: "version", ty: RC_T_I64, flags: RC_F_VERSION | RC_F_NOT_NULL },
+];
+```
+
+## Use
+
+```mettle
+var s: RcSession = rc_session_new(adapter);
+var a: RcAdapter* = rc_session_adapter(&s);
+
+// Insert: the store assigns the id, the version starts at 1.
+var n: Note;
+memset((rawptr)&n, 0, (int64)sizeof(Note));
+var e: RcEntity = rc_entity_new(note_meta(), (rawptr)&n);
+rc_entity_set(&e, 1, RcText("draft"));
+rc_persist_insert(a, &e);
+
+// Change one field and save it. Only "text" is sent, keyed by id and version.
+var cs: RcChangeset = rc_changeset_new(note_meta());
+rc_changeset_bind(&cs, (rawptr)&n, e.nulls);
+rc_changeset_put_text(&cs, 1, "final");
+var rc: int32 = rc_changeset_save(a, &cs, &e);
+// RC_ERR_CONFLICT: someone else changed the row first; nothing was written.
+rc_changeset_free(&cs);
+
+// Query.
+var q: RcQuery = rc_query_select(note_meta());
+rc_query_where_cmp(&q, 2, RC_CMP_GT, RcInt(1));
+rc_query_order_by(&q, 0, true);
+var res: RcResult;
+rc_query_exec(&q, a, &res);
+rc_result_free(&res);
+rc_query_free(&q);
+```
+
+Every call returns an `RC_*` code (`src/core/status.mettle`). Wrap related
+writes in `rc_session_begin`/`rc_session_commit`, or `rc_session_transaction`.
+
+## Build and test
+
+flux_orm needs the head Mettle compiler. `mbuild.toml` has no toolchain pin,
+so select it with `METTLE`.
 
 ```
 MB=/home/nox/Projects/mettle/mbuild/build/bootstrap/mbuild
@@ -41,9 +92,6 @@ $MB build && $MB build -r
 for t in build/linux/{debug,release}/t_*; do $t || echo "FAIL $t"; done
 ```
 
-Each `tests/t_*.mettle` is declared as a bin in `mbuild.toml`, so
-`$MB run t_query` builds and runs one. Run release as well as debug: head
-miscompiles have shown up in release only.
-
-Imports are file-relative (`import "../core/value";`), so the compiler can be
-run from anywhere.
+`$MB run t_query` builds and runs one test. Run release as well as debug:
+compiler bugs have shown up in release only. Imports are file-relative, so the
+compiler can be run from anywhere.
