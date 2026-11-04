@@ -135,7 +135,7 @@ export fn rc_buf_put_i64(b: RcBuf*, v: int64) -> int32 {
   return RC_OK;
 }
 
-// Appends an identifier in double quotes, doubling any embedded quote. MeoSQL
+// Appends an identifier in double quotes, doubling any embedded quote. MeoDB
 // has no reserved-word list yet; quoting everything is the only safe default.
 //   b   the buffer
 //   s   table or column name; borrowed. An empty name writes "".

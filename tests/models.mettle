@@ -161,7 +161,7 @@ export var TEST_NOW: int64 = 1700000000000000;
 export fn test_clock() -> int64 { return TEST_NOW; }
 
 // --- Doc: a field type the wire cannot carry --------------------------------
-// `uint8[]` is a slice, kind Slice. MeoSQL's record codec has a BLOB, but a
+// `uint8[]` is a slice, kind Slice. MeoDB's record codec has a BLOB, but a
 // Mettle slice is a (ptr,len) view with no owner, so mapping it silently would
 // be a lifetime bug. The metadata validator must refuse it at startup.
 

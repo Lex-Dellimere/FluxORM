@@ -31,7 +31,7 @@ import "ddl";
 export const RC_MIG_LEDGER: string = "_flux_orm_migrations";  // ledger table
 
 // One schema change. It is SQL text for text stores, or an `up` callback for
-// stores without SQL (MeoSQL, which has no `exec`): `up` runs inside the
+// stores without SQL (MeoDB, which has no `exec`): `up` runs inside the
 // migration's transaction, usually rc_migration_create for each table, and
 // returns RC_OK or a code that rolls the migration back. When `up` is set it
 // wins and `up_sql` may be empty. `down` / `down_sql` undo it the same way

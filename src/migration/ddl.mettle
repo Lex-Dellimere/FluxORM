@@ -5,8 +5,8 @@
 // the key and the nullability all come from one source.
 //
 // Affinity is the SQLite family (INTEGER/REAL/TEXT/BLOB), which is also what
-// MeoSQL stores. The *wire* type decides the column, never the Mettle type: a
-// `bool` is INTEGER because MeoSQL has no BOOL, and an `int64` overridden to
+// MeoDB stores. The *wire* type decides the column, never the Mettle type: a
+// `bool` is INTEGER because MeoDB has no BOOL, and an `int64` overridden to
 // RC_T_TIME is INTEGER because micros are an integer.
 //
 // Nothing here interpolates a value. Identifiers go through rc_buf_ident, the
@@ -112,7 +112,7 @@ export fn rc_migration_create_table(m: RcMeta, b: RcBuf*) -> int32 {
 }
 
 // Builds the same CREATE TABLE IF NOT EXISTS as an RcStmt, for adapters with
-// a `query` slot (MeoSQL). Lower level than rc_migration_create.
+// a `query` slot (MeoDB). Lower level than rc_migration_create.
 //   m    the model's meta; its names are borrowed by the statement
 //   out  receives the statement; overwritten, not freed
 // Returns RC_OK, or RC_ERR_USAGE (out is 0, or m malformed), RC_ERR_UNSUPPORTED

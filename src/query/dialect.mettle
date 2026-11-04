@@ -1,6 +1,6 @@
 // flux_orm/query/dialect.mettle — the SQL text flavour, as a value.
 //
-// One dialect ships: "meosql". It is a value rather than a pile of string
+// One dialect ships: "meodb". It is a value rather than a pile of string
 // literals so the text builder has exactly one place that knows what a quoted
 // identifier and a placeholder look like, and so a store's differences (does
 // it spell LIMIT that way?) live here and not in the builder.
@@ -21,25 +21,25 @@ import "../core/buf";
 // How a store spells identifiers, placeholders and LIMIT. Get one from
 // rc_dialect_default; the strings are borrowed (static literals there).
 export struct RcDialect {
-  name: string;        // "meosql"
+  name: string;        // "meodb"
   quote: string;       // "\""
   placeholder: string; // "?"
   has_limit: bool;     // true — the store understands literal LIMIT n
 }
 
-// The one shipped dialect, "meosql": double-quoted identifiers, `?`
+// The one shipped dialect, "meodb": double-quoted identifiers, `?`
 // placeholders, literal LIMIT. Every query starts with it.
 // Returns the dialect by value; it owns nothing and needs no free.
 export fn rc_dialect_default() -> RcDialect {
   var d: RcDialect;
-  d.name = "meosql";
+  d.name = "meodb";
   d.quote = "\"";
   d.placeholder = "?";
   d.has_limit = true;
   return d;
 }
 
-// The dialect's name, e.g. "meosql".
+// The dialect's name, e.g. "meodb".
 //   d   the dialect
 // Returns d.name, a borrowed view with d's lifetime.
 export fn rc_dialect_name(d: RcDialect) -> string { return d.name; }
@@ -83,7 +83,7 @@ export fn rc_dialect_ident(d: RcDialect, b: RcBuf*, name: string) -> int32 {
   return rc_buf_putc(b, q);
 }
 
-// Appends the dialect's placeholder (`?` for meosql) to b.
+// Appends the dialect's placeholder (`?` for meodb) to b.
 //   d   the dialect
 //   b   the buffer to append to; borrowed
 // Returns RC_OK. RC_ERR_USAGE when b is 0 or d.placeholder is empty.

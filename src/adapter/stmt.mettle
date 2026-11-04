@@ -1,7 +1,7 @@
 // flux_orm/adapter/stmt.mettle — a statement as data, for stores without SQL.
 //
 // The builder, persist and migrations fill an RcStmt next to the SQL text. An
-// adapter with a `query` slot (MeoSQL's typed API, and later its network
+// adapter with a `query` slot (MeoDB's typed API, and later its network
 // server) runs the RcStmt; a text adapter runs the SQL. Both see the same
 // argv: INSERT cells row-major, or SET values then the WHERE term arguments.
 //

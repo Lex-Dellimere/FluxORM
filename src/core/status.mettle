@@ -2,7 +2,7 @@
 //
 // Mettle has no exceptions: every call returns int32 and every failure is one
 // of these codes. Adapters map their own codes into this range; nothing above
-// the adapter ever sees a MeoSQL status or an errno.
+// the adapter ever sees a MeoDB status or an errno.
 
 // Status codes. RC_OK (0) is success and every failure is negative.
 // RC_ERR_NOT_FOUND: no row matched. RC_ERR_CLOSED: the connection or handle is

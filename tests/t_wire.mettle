@@ -1,4 +1,4 @@
-// tests/t_wire.mettle — the MeoSQL wire codec against docs/PROTOCOL.md.
+// tests/t_wire.mettle — the MeoDB wire codec against docs/PROTOCOL.md.
 //
 // Expected bytes are built with this file's own little-endian writer from the
 // spec's tables, not with the codec, so a codec mistake cannot hide by being

@@ -1,10 +1,10 @@
-// tests/live_meosql.mettle — flux_orm against a real MeoSQL server.
+// tests/live_meodb.mettle — flux_orm against a real MeoDB server.
 //
 // Not part of the normal test run, because it needs a server. Start one on
 // the default port with an empty database, then run this:
 //
 //   ../meosql/build/linux/release/meosql --db /tmp/flux_live.meo
-//   mbuild mettle -- --build tests/live_meosql.mettle -o /tmp/live && /tmp/live
+//   mbuild mettle -- --build tests/live_meodb.mettle -o /tmp/live && /tmp/live
 //
 // It migrates, inserts, loads, saves with a version check (and a stale save),
 // reports a duplicate key on its field, queries, preloads, counts, deletes in
@@ -14,7 +14,7 @@ import "std/io";
 import "std/mem";
 import "std/thread";
 import "../src/flux_orm";
-import "../src/adapter/meosql";
+import "../src/adapter/meodb";
 import "models";
 
 fn up_all(a: RcAdapter*) -> int32 {
@@ -37,7 +37,7 @@ fn step(name: string, rc: int32) -> bool {
 
 export fn main() -> int32 {
   rc_clock_set(&test_clock);
-  var a: RcAdapter* = rc_meosql_adapter("");
+  var a: RcAdapter* = rc_meodb_adapter("");
   var rc: int32 = RC_ERR_CLOSED;
   var tries: int32 = 0;
   while (rc != RC_OK && tries < 50) {
@@ -46,7 +46,7 @@ export fn main() -> int32 {
     tries = tries + 1;
   }
   if (!step("connect + hello", rc)) { return 1; }
-  println("  caps {rc_meosql_caps(a)}");
+  println("  caps {rc_meodb_caps(a)}");
 
   var set: RcMigrationSet = rc_migration_set(&MIGRATIONS[0], 1);
   var rep: RcMigrationReport;
@@ -221,7 +221,7 @@ export fn main() -> int32 {
   if (!step("delete note", rc_repo_delete(&s, &e1))) { return 13; }
   rc_session_free(&s);
   rc_adapter_close(a);
-  rc_meosql_adapter_free(a);
+  rc_meodb_adapter_free(a);
   println("done");
   return 0;
 }

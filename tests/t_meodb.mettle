@@ -1,4 +1,4 @@
-// tests/t_meosql.mettle — the MeoSQL adapter against a scripted fake server.
+// tests/t_meodb.mettle — the MeoDB adapter against a scripted fake server.
 //
 // The fake listens on loopback in a thread and answers with frames built here
 // from docs/PROTOCOL.md. It checks the request kinds and ids the adapter
@@ -11,7 +11,7 @@ import "std/net";
 import "std/thread";
 
 import "../src/flux_orm";
-import "../src/adapter/meosql";
+import "../src/adapter/meodb";
 import "../src/adapter/wire";
 import "models";
 import "harness";
@@ -226,9 +226,9 @@ fn srv_main(arg: cstring) -> uint32 {
 // --- offline: nothing reaches the network ---------------------------------------
 
 fn check_offline() -> int32 {
-  var a: RcAdapter* = rc_meosql_adapter("");
+  var a: RcAdapter* = rc_meodb_adapter("");
   if (a == 0) { return 1; }
-  defer rc_meosql_adapter_free(a);
+  defer rc_meodb_adapter_free(a);
   if (a.exec != 0 || a.query == 0) { return 2; }
   // Before open there is no connection, and no host to reconnect to.
   var res: RcResult;
@@ -256,10 +256,10 @@ fn check_server() -> int32 {
   while (InterlockedCompareExchange(&SRV_READY, 0, 0) == 0) { Sleep(1); }
   if (SRV_FAIL != 0) { return 2; }
 
-  var a: RcAdapter* = rc_meosql_adapter("tok");
-  defer rc_meosql_adapter_free(a);
+  var a: RcAdapter* = rc_meodb_adapter("tok");
+  defer rc_meodb_adapter_free(a);
   if (rc_adapter_open(a, "127.0.0.1:45490") != RC_OK) { return 3; }
-  if (rc_meosql_caps(a) != RC_WIRE_CAP_COUNT) { return 4; }
+  if (rc_meodb_caps(a) != RC_WIRE_CAP_COUNT) { return 4; }
   if (rc_adapter_ping(a) != RC_OK) { return 5; }
 
   // Rows come back as owned values.
@@ -303,8 +303,8 @@ fn check_server() -> int32 {
   // A fatal timeout closes it.
   if (rc_query_exec(&q, a, &res) != RC_ERR_CLOSED) { return 20; }
   // A reply that never comes: the timeout closes the connection.
-  if (rc_meosql_timeout(a, -1) != RC_ERR_USAGE) { return 24; }
-  if (rc_meosql_timeout(a, 200) != RC_OK) { return 25; }
+  if (rc_meodb_timeout(a, -1) != RC_ERR_USAGE) { return 24; }
+  if (rc_meodb_timeout(a, 200) != RC_OK) { return 25; }
   if (rc_query_exec(&q, a, &res) != RC_ERR_CLOSED) { return 26; }
 
   thread_join_infinite(th);
@@ -319,13 +319,13 @@ fn check_server() -> int32 {
 
 export fn main() -> int32 {
   var failures: int32 = 0;
-  if (!rc_report("meosql: offline refusals", check_offline())) { failures = failures + 1; }
-  if (!rc_report("meosql: a scripted server", check_server())) { failures = failures + 1; }
+  if (!rc_report("meodb: offline refusals", check_offline())) { failures = failures + 1; }
+  if (!rc_report("meodb: a scripted server", check_server())) { failures = failures + 1; }
   return rc_summary(failures, 2);
 }
 
 // The interpreter has no sockets or threads: offline checks only.
-@test fn t_meosql() -> int32 {
+@test fn t_meodb() -> int32 {
   if (check_offline() != 0) { return 1; }
   return 0;
 }

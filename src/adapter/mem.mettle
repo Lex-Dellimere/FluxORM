@@ -4,11 +4,11 @@
 // records the statement text and the bound arguments, and replays a scripted
 // result. That is enough to pin down argument order, type preservation, NULL
 // round-tripping, ownership, transaction states and error propagation without
-// a single byte of MeoSQL existing yet — which matters, because MeoSQL's SQL
+// a single byte of MeoDB existing yet — which matters, because MeoDB's SQL
 // surface is a later phase than this ORM's core.
 //
 // It is also the adapter the whole test suite runs against, so every ORM
-// behaviour is verified twice: once against the seam, once against real MeoSQL
+// behaviour is verified twice: once against the seam, once against real MeoDB
 // once that lands.
 
 import "std/mem";
@@ -147,7 +147,7 @@ fn rc_mem_begin(ud: rawptr, mode: int32) -> int32 {
   if (mode != RC_TX_DEFAULT && mode != RC_TX_DEFERRED && mode != RC_TX_IMMEDIATE) {
     return RC_ERR_USAGE;
   }
-  // No nesting, like MeoSQL: silent nesting hides a boundary bug in the caller.
+  // No nesting, like MeoDB: silent nesting hides a boundary bug in the caller.
   // core/session flattens nesting above this.
   if (m.tx_depth != 0) { return RC_ERR_TX; }
   m.tx_depth = 1;

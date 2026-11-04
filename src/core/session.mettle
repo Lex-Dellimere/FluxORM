@@ -2,7 +2,7 @@
 //
 // Make one session per connection and pass it around; it is not a global.
 //
-// Nesting is flattened here, because MeoSQL and adapter/mem both refuse a
+// Nesting is flattened here, because MeoDB and adapter/mem both refuse a
 // nested begin. Only the outermost begin/commit reaches the adapter; inner
 // levels only count depth. An inner rollback cannot undo part of a flat
 // transaction, so it dooms the whole one: the outer commit rolls back and
@@ -12,7 +12,7 @@
 // the adapter still holds. With a distributed store a failed commit can be
 // ambiguous (the write may have landed).
 //
-// One thread per session while a transaction is open: MeoSQL's lock belongs
+// One thread per session while a transaction is open: MeoDB's lock belongs
 // to the thread that called begin.
 //
 // Loaded rows: a model's text fields point into the result it was loaded
@@ -184,7 +184,7 @@ fn rc_session_end(s: RcSession*) {
 // Opens a transaction, or one more nested level of the open one.
 //   s      the session
 //   mode   RC_TX_DEFAULT, RC_TX_DEFERRED or RC_TX_IMMEDIATE (use IMMEDIATE
-//          for MeoSQL writes). Checked at every level but only the outermost
+//          for MeoDB writes). Checked at every level but only the outermost
 //          begin's mode reaches the adapter.
 // Returns RC_OK; RC_ERR_USAGE when `s` or its adapter is 0 or `mode` is not
 // an RC_TX_* value; RC_ERR_TX when the depth would overflow int32; for the

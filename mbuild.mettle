@@ -1,4 +1,4 @@
-// flux_orm, an ORM for MeoSQL, as a library: no mb_bin. `mbuild check` and
+// flux_orm, an ORM for MeoDB, as a library: no mb_bin. `mbuild check` and
 // `mbuild build` type-check src/flux_orm.mettle and everything it imports;
 // `mbuild test` runs the tests' @test entries. Apps add it with
 // mb_dep_path("flux_orm", "../flux_orm") and `import "flux_orm/flux_orm"`.

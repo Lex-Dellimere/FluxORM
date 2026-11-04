@@ -3,14 +3,14 @@
 //
 // Each one builds the SQL text and the same change as an RcStmt and runs it
 // through rc_adapter_run, so a migration callback works with text stores and
-// with MeoSQL alike. All of them are idempotent where SQL allows it
+// with MeoDB alike. All of them are idempotent where SQL allows it
 // (IF EXISTS / IF NOT EXISTS). Each `_field` form takes 0-based field indexes;
 // the plain form takes column (or field) names and resolves them with
 // rc_meta_find. Call them from a migration's `up` / `down` callback, which
 // runs inside that migration's transaction.
 //
 // Every one returns RC_OK, the codes listed on it, RC_ERR_NOMEM when a buffer
-// cannot grow, or whatever the adapter returns for the statement (MeoSQL v1
+// cannot grow, or whatever the adapter returns for the statement (MeoDB v1
 // answers RC_ERR_UNSUPPORTED to both index ops). Nothing is left to free.
 
 import "../core/status";
@@ -96,7 +96,7 @@ export fn rc_migration_add_column_field(a: RcAdapter*, m: RcMeta, field: int32) 
 // Returns RC_OK, or RC_ERR_USAGE when a or fields is 0, n <= 0, name is
 // empty, m is malformed or a field index is out of range (rc_meta_check's
 // RC_ERR_UNSUPPORTED also passes through); otherwise the adapter's code. On
-// MeoSQL: an existing name is an OK no-op; RC_ERR_CONFLICT when a UNIQUE index
+// MeoDB: an existing name is an OK no-op; RC_ERR_CONFLICT when a UNIQUE index
 // meets duplicate values; RC_ERR_UNSUPPORTED for n > 1; RC_ERR_USAGE when the
 // column already has an index (its UNIQUE or PK one included).
 export fn rc_migration_create_index_field(a: RcAdapter*, m: RcMeta, name: string,

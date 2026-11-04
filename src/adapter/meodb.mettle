@@ -1,11 +1,11 @@
-// flux_orm/adapter/meosql.mettle — the MeoSQL adapter, over the network.
+// flux_orm/adapter/meodb.mettle — the MeoDB adapter, over the network.
 //
-// flux_orm does not compile MeoSQL in; it talks to the `meosql` server with
+// flux_orm does not compile MeoDB in; it talks to the `meosql` server with
 // wire protocol v1 (meosql/docs/PROTOCOL.md, coded in wire.mettle). This file
-// is not in the import root, so only apps that use MeoSQL pull in std/net:
+// is not in the import root, so only apps that use MeoDB pull in std/net:
 //
-//   import "flux_orm/adapter/meosql";
-//   var a: RcAdapter* = rc_meosql_adapter("token");   // "" for none
+//   import "flux_orm/adapter/meodb";
+//   var a: RcAdapter* = rc_meodb_adapter("token");   // "" for none
 //   rc_adapter_open(a, "127.0.0.1:5490");             // IPv4 literal; no DNS
 //
 // Statements go through the `query` slot as RcStmt; there is no SQL text, so
@@ -27,7 +27,7 @@
 //   - outside one: that call answers RC_ERR_CLOSED (it may or may not have
 //     run), and the next call reconnects once before sending.
 // A fatal ERROR from the server, or CORRUPT / NOT_A_DB / VERSION, drops the
-// connection the same way. With rc_meosql_timeout set, a reply that takes
+// connection the same way. With rc_meodb_timeout set, a reply that takes
 // longer than that is a connection loss too; without it, only the server's own
 // timeouts (idle, tx_idle) end a stuck session.
 
@@ -40,11 +40,11 @@ import "adapter";
 import "stmt";
 import "wire";
 
-export const RC_MEOSQL_PORT: int32 = 5490;  // used when the dsn has no port
-const RC_MEOSQL_MAX_FRAME: int64 = 16777216;  // largest reply we accept
+export const RC_MEODB_PORT: int32 = 5490;  // used when the dsn has no port
+const RC_MEODB_MAX_FRAME: int64 = 16777216;  // largest reply we accept
 
 // The adapter's state behind RcAdapter.ud. Treat it as private.
-export struct RcMeosql {
+export struct RcMeodb {
   sock: int64;       // -1 when not connected
   host: string;      // owned copies
   port: int32;
@@ -61,7 +61,7 @@ export struct RcMeosql {
 }
 
 // Sets SO_RCVTIMEO and SO_SNDTIMEO (Linux numbers 20 and 21) on the socket.
-fn rc_meosql_apply_timeout(m: RcMeosql*) {
+fn rc_meodb_apply_timeout(m: RcMeodb*) {
   if (m->sock < 0) { return; }
   var tv: int64[2];                                // struct timeval
   tv[0] = (int64)(m->timeout_ms / 1000);
@@ -70,9 +70,9 @@ fn rc_meosql_apply_timeout(m: RcMeosql*) {
   setsockopt(m->sock, SOL_SOCKET(), 21, (cstring)&tv[0], 16);
 }
 
-fn rc_meosql_of(ud: rawptr) -> RcMeosql* { return (RcMeosql*)ud; }
+fn rc_meodb_of(ud: rawptr) -> RcMeodb* { return (RcMeodb*)ud; }
 
-fn rc_meosql_drop(m: RcMeosql*) {
+fn rc_meodb_drop(m: RcMeodb*) {
   if (m->sock >= 0) { closesocket(m->sock); }
   m->sock = -1;
   m->rid = 0;
@@ -80,8 +80,8 @@ fn rc_meosql_drop(m: RcMeosql*) {
 }
 
 // The connection is gone: what the call that saw it answers.
-fn rc_meosql_lost(m: RcMeosql*) -> int32 {
-  rc_meosql_drop(m);
+fn rc_meodb_lost(m: RcMeodb*) -> int32 {
+  rc_meodb_drop(m);
   if (m->in_tx) {
     m->lost_tx = true;
     return RC_ERR_TX;
@@ -89,7 +89,7 @@ fn rc_meosql_lost(m: RcMeosql*) -> int32 {
   return RC_ERR_CLOSED;
 }
 
-fn rc_meosql_cstr(s: string) -> cstring {
+fn rc_meodb_cstr(s: string) -> cstring {
   var p: uint8* = malloc((int64)s.length + 1);
   if (p == 0) { return (cstring)0; }
   if (s.length > (uint64)0) { memcpy((rawptr)p, (rawptr)s.chars, (int64)s.length); }
@@ -97,7 +97,7 @@ fn rc_meosql_cstr(s: string) -> cstring {
   return (cstring)p;
 }
 
-fn rc_meosql_send(m: RcMeosql*) -> bool {
+fn rc_meodb_send(m: RcMeodb*) -> bool {
   var r: Result<int32, int32> = send_all(m->sock, (cstring)m->out.data,
                                          (int32)m->out.len);
   match (r) {
@@ -107,7 +107,7 @@ fn rc_meosql_send(m: RcMeosql*) -> bool {
   return false;
 }
 
-fn rc_meosql_recv(m: RcMeosql*, p: uint8*, n: int64) -> bool {
+fn rc_meodb_recv(m: RcMeodb*, p: uint8*, n: int64) -> bool {
   var got: int64 = 0;
   while (got < n) {
     var r: int32 = recv(m->sock, (cstring)(p + got), (int32)(n - got), 0);
@@ -120,46 +120,46 @@ fn rc_meosql_recv(m: RcMeosql*, p: uint8*, n: int64) -> bool {
 // Sends the frame in m->out and reads the reply into m->buf. On success *kind
 // and *len describe it. Any failure has already dropped the connection and
 // returns the code the call should answer.
-fn rc_meosql_roundtrip(m: RcMeosql*, rid: uint32, kind: int32*, len: int64*) -> int32 {
+fn rc_meodb_roundtrip(m: RcMeodb*, rid: uint32, kind: int32*, len: int64*) -> int32 {
   if (m->out.err != RC_OK) { return m->out.err; }
   if (m->out.len - (int64)RC_WIRE_HEADER > m->max_frame) { return RC_ERR_UNSUPPORTED; }
-  if (!rc_meosql_send(m)) { return rc_meosql_lost(m); }
+  if (!rc_meodb_send(m)) { return rc_meodb_lost(m); }
   var head: uint8[12];
-  if (!rc_meosql_recv(m, &head[0], (int64)RC_WIRE_HEADER)) { return rc_meosql_lost(m); }
+  if (!rc_meodb_recv(m, &head[0], (int64)RC_WIRE_HEADER)) { return rc_meodb_lost(m); }
   var got: uint32 = 0;
-  if (rc_wire_header(&head[0], len, kind, &got) != RC_OK) { return rc_meosql_lost(m); }
-  if (*len > RC_MEOSQL_MAX_FRAME) { return rc_meosql_lost(m); }
+  if (rc_wire_header(&head[0], len, kind, &got) != RC_OK) { return rc_meodb_lost(m); }
+  if (*len > RC_MEODB_MAX_FRAME) { return rc_meodb_lost(m); }
   if (*len > m->cap) {
     var p: rawptr = realloc((rawptr)m->buf, *len);
     // The reply cannot be read, so the connection is out of step: lost.
-    if (p == 0) { return rc_meosql_lost(m); }
+    if (p == 0) { return rc_meodb_lost(m); }
     m->buf = (uint8*)p;
     m->cap = *len;
   }
-  if (*len > 0 && !rc_meosql_recv(m, m->buf, *len)) { return rc_meosql_lost(m); }
+  if (*len > 0 && !rc_meodb_recv(m, m->buf, *len)) { return rc_meodb_lost(m); }
   // rid 0 is the server's last word (an ERROR, then it closes), never a reply.
   if (got == (uint32)0 && *kind == RC_WIRE_ERROR) {
-    var code: int32 = rc_meosql_error(m, *len);
-    rc_meosql_drop(m);
+    var code: int32 = rc_meodb_error(m, *len);
+    rc_meodb_drop(m);
     if (m->in_tx) {
       m->lost_tx = true;
       return RC_ERR_TX;
     }
     return code;
   }
-  if (got != rid) { return rc_meosql_lost(m); }
+  if (got != rid) { return rc_meodb_lost(m); }
   return RC_OK;
 }
 
 // Reads an ERROR reply: updates the transaction state from it, drops the
 // connection when it is fatal or the store is unusable, and maps the code.
-fn rc_meosql_error(m: RcMeosql*, len: int64) -> int32 {
+fn rc_meodb_error(m: RcMeodb*, len: int64) -> int32 {
   var e: RcWireError;
-  if (rc_wire_error(m->buf, len, &e) != RC_OK) { return rc_meosql_lost(m); }
+  if (rc_wire_error(m->buf, len, &e) != RC_OK) { return rc_meodb_lost(m); }
   m->in_tx = e.tx != 0;
   var rc: int32 = rc_wire_status(e.code);
   if (e.fatal || e.code == 4 || e.code == 5 || e.code == 6) {
-    rc_meosql_drop(m);
+    rc_meodb_drop(m);
     if (m->in_tx) {
       m->lost_tx = true;
       return RC_ERR_TX;
@@ -169,8 +169,8 @@ fn rc_meosql_error(m: RcMeosql*, len: int64) -> int32 {
 }
 
 // connect + HELLO. On failure the connection is closed.
-fn rc_meosql_connect(m: RcMeosql*) -> int32 {
-  rc_meosql_drop(m);
+fn rc_meodb_connect(m: RcMeodb*) -> int32 {
+  rc_meodb_drop(m);
   var ok: Result<int32, int32> = net_init();
   match (ok) {
     case Ok(_v): {}
@@ -182,7 +182,7 @@ fn rc_meosql_connect(m: RcMeosql*) -> int32 {
     case Ok(s): { sock = s; }
     case Err(_e): { return RC_ERR_CLOSED; }
   }
-  var host: cstring = rc_meosql_cstr(m->host);
+  var host: cstring = rc_meodb_cstr(m->host);
   if (host == (cstring)0) {
     closesocket(sock);
     return RC_ERR_NOMEM;
@@ -206,29 +206,29 @@ fn rc_meosql_connect(m: RcMeosql*) -> int32 {
   var one: int32 = 1;
   setsockopt(sock, IPPROTO_TCP(), 1, (cstring)&one, 4);   // TCP_NODELAY
   m->sock = sock;
-  rc_meosql_apply_timeout(m);
+  rc_meodb_apply_timeout(m);
   m->rid = 1;
   m->max_frame = 65536;
 
   rc_wire_clear(&m->out);
-  var rc: int32 = rc_wire_hello(&m->out, m->rid, (uint32)RC_MEOSQL_MAX_FRAME,
+  var rc: int32 = rc_wire_hello(&m->out, m->rid, (uint32)RC_MEODB_MAX_FRAME,
                                 m->token, "flux_orm");
   if (rc != RC_OK) {
-    rc_meosql_drop(m);
+    rc_meodb_drop(m);
     return rc;
   }
   var kind: int32 = 0;
   var len: int64 = 0;
-  rc = rc_meosql_roundtrip(m, m->rid, &kind, &len);
+  rc = rc_meodb_roundtrip(m, m->rid, &kind, &len);
   if (rc != RC_OK) { return RC_ERR_CLOSED; }
   if (kind == RC_WIRE_ERROR) {
-    rc = rc_meosql_error(m, len);
-    rc_meosql_drop(m);
+    rc = rc_meodb_error(m, len);
+    rc_meodb_drop(m);
     return rc;
   }
   var h: RcWireHello;
   if (kind != RC_WIRE_HELLO_OK || rc_wire_hello_ok(m->buf, len, &h) != RC_OK) {
-    rc_meosql_drop(m);
+    rc_meodb_drop(m);
     return RC_ERR_ADAPTER;
   }
   m->caps = h.caps;
@@ -237,24 +237,24 @@ fn rc_meosql_connect(m: RcMeosql*) -> int32 {
 }
 
 // Before a request: the lost-transaction rule, then reconnect once if needed.
-fn rc_meosql_ready(m: RcMeosql*) -> int32 {
+fn rc_meodb_ready(m: RcMeodb*) -> int32 {
   if (m->lost_tx) { return RC_ERR_TX; }
   if (m->sock >= 0) { return RC_OK; }
   if (m->host.length == (uint64)0) { return RC_ERR_CLOSED; }
-  return rc_meosql_connect(m);
+  return rc_meodb_connect(m);
 }
 
-fn rc_meosql_next_rid(m: RcMeosql*) -> uint32 {
+fn rc_meodb_next_rid(m: RcMeodb*) -> uint32 {
   m->rid = m->rid + (uint32)1;
   if (m->rid == (uint32)0) { m->rid = 1; }
   return m->rid;
 }
 
 // A request whose success reply is OK: PING, BEGIN, COMMIT, ROLLBACK, BYE.
-fn rc_meosql_simple(m: RcMeosql*, kind: int32, mode: int32) -> int32 {
-  var rc: int32 = rc_meosql_ready(m);
+fn rc_meodb_simple(m: RcMeodb*, kind: int32, mode: int32) -> int32 {
+  var rc: int32 = rc_meodb_ready(m);
   if (rc != RC_OK) { return rc; }
-  var rid: uint32 = rc_meosql_next_rid(m);
+  var rid: uint32 = rc_meodb_next_rid(m);
   rc_wire_clear(&m->out);
   if (kind == RC_WIRE_BEGIN) {
     rc = rc_wire_begin(&m->out, rid, mode);
@@ -264,18 +264,18 @@ fn rc_meosql_simple(m: RcMeosql*, kind: int32, mode: int32) -> int32 {
   if (rc != RC_OK) { return rc; }
   var got: int32 = 0;
   var len: int64 = 0;
-  rc = rc_meosql_roundtrip(m, rid, &got, &len);
+  rc = rc_meodb_roundtrip(m, rid, &got, &len);
   if (rc != RC_OK) { return rc; }
-  if (got == RC_WIRE_ERROR) { return rc_meosql_error(m, len); }
-  if (got != RC_WIRE_OK || len != 0) { return rc_meosql_lost(m); }
+  if (got == RC_WIRE_ERROR) { return rc_meodb_error(m, len); }
+  if (got != RC_WIRE_OK || len != 0) { return rc_meodb_lost(m); }
   return RC_OK;
 }
 
 // --- the adapter slots -------------------------------------------------------
 
 // dsn: "host" or "host:port", the host an IPv4 literal.
-fn rc_meosql_open(ud: rawptr, dsn: string) -> int32 {
-  var m: RcMeosql* = rc_meosql_of(ud);
+fn rc_meodb_open(ud: rawptr, dsn: string) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
   if (m == 0 || dsn.length == (uint64)0) { return RC_ERR_USAGE; }
   var colon: int64 = -1;
   var i: uint64 = 0;
@@ -283,7 +283,7 @@ fn rc_meosql_open(ud: rawptr, dsn: string) -> int32 {
     if (dsn.chars[i] == (uint8)58) { colon = (int64)i; }   // ':'
     i = i + 1;
   }
-  var port: int32 = RC_MEOSQL_PORT;
+  var port: int32 = RC_MEODB_PORT;
   var host_len: int64 = (int64)dsn.length;
   if (colon >= 0) {
     host_len = colon;
@@ -305,14 +305,14 @@ fn rc_meosql_open(ud: rawptr, dsn: string) -> int32 {
   m->port = port;
   m->in_tx = false;
   m->lost_tx = false;
-  return rc_meosql_connect(m);
+  return rc_meodb_connect(m);
 }
 
-fn rc_meosql_close(ud: rawptr) -> int32 {
-  var m: RcMeosql* = rc_meosql_of(ud);
+fn rc_meodb_close(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
   if (m == 0) { return RC_ERR_USAGE; }
-  if (m->sock >= 0) { rc_meosql_simple(m, RC_WIRE_BYE, 0); }
-  rc_meosql_drop(m);
+  if (m->sock >= 0) { rc_meodb_simple(m, RC_WIRE_BYE, 0); }
+  rc_meodb_drop(m);
   m->in_tx = false;
   m->lost_tx = false;
   rc_text_free(m->host);
@@ -320,24 +320,24 @@ fn rc_meosql_close(ud: rawptr) -> int32 {
   return RC_OK;
 }
 
-fn rc_meosql_begin(ud: rawptr, mode: int32) -> int32 {
-  var m: RcMeosql* = rc_meosql_of(ud);
+fn rc_meodb_begin(ud: rawptr, mode: int32) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
   if (m == 0) { return RC_ERR_USAGE; }
-  var rc: int32 = rc_meosql_simple(m, RC_WIRE_BEGIN, mode);
+  var rc: int32 = rc_meodb_simple(m, RC_WIRE_BEGIN, mode);
   if (rc == RC_OK) { m->in_tx = true; }
   return rc;
 }
 
-fn rc_meosql_commit(ud: rawptr) -> int32 {
-  var m: RcMeosql* = rc_meosql_of(ud);
+fn rc_meodb_commit(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
   if (m == 0) { return RC_ERR_USAGE; }
-  var rc: int32 = rc_meosql_simple(m, RC_WIRE_COMMIT, 0);
+  var rc: int32 = rc_meodb_simple(m, RC_WIRE_COMMIT, 0);
   if (rc == RC_OK) { m->in_tx = false; }
   return rc;
 }
 
-fn rc_meosql_rollback(ud: rawptr) -> int32 {
-  var m: RcMeosql* = rc_meosql_of(ud);
+fn rc_meodb_rollback(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
   if (m == 0) { return RC_ERR_USAGE; }
   if (m->lost_tx) {
     // The server rolled back when the connection went.
@@ -345,55 +345,55 @@ fn rc_meosql_rollback(ud: rawptr) -> int32 {
     m->in_tx = false;
     return RC_OK;
   }
-  var rc: int32 = rc_meosql_simple(m, RC_WIRE_ROLLBACK, 0);
+  var rc: int32 = rc_meodb_simple(m, RC_WIRE_ROLLBACK, 0);
   if (rc == RC_OK) { m->in_tx = false; }
   return rc;
 }
 
-fn rc_meosql_ping(ud: rawptr) -> int32 {
-  var m: RcMeosql* = rc_meosql_of(ud);
+fn rc_meodb_ping(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
   if (m == 0) { return RC_ERR_USAGE; }
-  return rc_meosql_simple(m, RC_WIRE_PING, 0);
+  return rc_meodb_simple(m, RC_WIRE_PING, 0);
 }
 
-fn rc_meosql_query(ud: rawptr, st: RcStmt*, out: RcResult*) -> int32 {
-  var m: RcMeosql* = rc_meosql_of(ud);
+fn rc_meodb_query(ud: rawptr, st: RcStmt*, out: RcResult*) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
   if (m == 0 || st == 0 || out == 0) { return RC_ERR_USAGE; }
   rc_result_init(out);
   if (st->n_joins > 0) { return RC_ERR_UNSUPPORTED; }
-  var rc: int32 = rc_meosql_ready(m);
+  var rc: int32 = rc_meodb_ready(m);
   if (rc != RC_OK) { return rc; }
   if (st->op == RC_OP_COUNT && (m->caps & RC_WIRE_CAP_COUNT) == 0) {
     return RC_ERR_UNSUPPORTED;
   }
-  var rid: uint32 = rc_meosql_next_rid(m);
+  var rid: uint32 = rc_meodb_next_rid(m);
   rc_wire_clear(&m->out);
   rc = rc_wire_query(&m->out, rid, st);
   if (rc != RC_OK) { return rc; }
   var got: int32 = 0;
   var len: int64 = 0;
-  rc = rc_meosql_roundtrip(m, rid, &got, &len);
+  rc = rc_meodb_roundtrip(m, rid, &got, &len);
   if (rc != RC_OK) { return rc; }
-  if (got == RC_WIRE_ERROR) { return rc_meosql_error(m, len); }
-  if (got != RC_WIRE_RESULT) { return rc_meosql_lost(m); }
+  if (got == RC_WIRE_ERROR) { return rc_meodb_error(m, len); }
+  if (got != RC_WIRE_RESULT) { return rc_meodb_lost(m); }
   rc = rc_wire_result(m->buf, len, out);
-  if (rc == RC_ERR_ADAPTER) { return rc_meosql_lost(m); }
+  if (rc == RC_ERR_ADAPTER) { return rc_meodb_lost(m); }
   return rc;
 }
 
 // --- construction ------------------------------------------------------------
 
-// Makes a MeoSQL adapter that will authenticate with `token`. It does not
+// Makes a MeoDB adapter that will authenticate with `token`. It does not
 // connect; call rc_adapter_open(a, "host:port") next.
 //   token  the server's auth token, "" for none; copied
 // Returns the adapter, or 0 when out of memory. Free it with
-// rc_meosql_adapter_free (after rc_adapter_close for a clean BYE).
-export fn rc_meosql_adapter(token: string) -> RcAdapter* {
-  var m: RcMeosql* = malloc(sizeof(RcMeosql));
+// rc_meodb_adapter_free (after rc_adapter_close for a clean BYE).
+export fn rc_meodb_adapter(token: string) -> RcAdapter* {
+  var m: RcMeodb* = malloc(sizeof(RcMeodb));
   if (m == 0) { return 0; }
   m->sock = -1;
   m->host = "";
-  m->port = RC_MEOSQL_PORT;
+  m->port = RC_MEODB_PORT;
   m->token = rc_text_dup(token);
   if (token.length > (uint64)0 && m->token.chars == 0) {
     free((rawptr)m);
@@ -415,48 +415,48 @@ export fn rc_meosql_adapter(token: string) -> RcAdapter* {
     return 0;
   }
   *a = rc_adapter_empty();
-  a.name = "meosql";
+  a.name = "meodb";
   a.ud = (rawptr)m;
-  a.open = &rc_meosql_open;
-  a.close = &rc_meosql_close;
-  a.begin = &rc_meosql_begin;
-  a.commit = &rc_meosql_commit;
-  a.rollback = &rc_meosql_rollback;
-  a.ping = &rc_meosql_ping;
-  a.query = &rc_meosql_query;
+  a.open = &rc_meodb_open;
+  a.close = &rc_meodb_close;
+  a.begin = &rc_meodb_begin;
+  a.commit = &rc_meodb_commit;
+  a.rollback = &rc_meodb_rollback;
+  a.ping = &rc_meodb_ping;
+  a.query = &rc_meodb_query;
   return a;
 }
 
 // Returns the server's capability bits (RC_WIRE_CAP_*) from the last
 // HELLO_OK, or 0 before the first connection or when a is 0.
-//   a  an adapter from rc_meosql_adapter
-export fn rc_meosql_caps(a: RcAdapter*) -> int32 {
+//   a  an adapter from rc_meodb_adapter
+export fn rc_meodb_caps(a: RcAdapter*) -> int32 {
   if (a == 0 || a.ud == 0) { return 0; }
-  return rc_meosql_of(a.ud)->caps;
+  return rc_meodb_of(a.ud)->caps;
 }
 
 // Limits how long one send or reply may take. A call that runs past it gets
 // the connection-loss codes (RC_ERR_CLOSED, or RC_ERR_TX in a transaction) and
 // the socket is closed, since its reply may still arrive. Applies now and to
 // every later connection.
-//   a   an adapter from rc_meosql_adapter
+//   a   an adapter from rc_meodb_adapter
 //   ms  milliseconds; 0 waits forever (the default)
 // Returns RC_OK; RC_ERR_USAGE when a is 0 or ms < 0.
-export fn rc_meosql_timeout(a: RcAdapter*, ms: int32) -> int32 {
+export fn rc_meodb_timeout(a: RcAdapter*, ms: int32) -> int32 {
   if (a == 0 || a.ud == 0 || ms < 0) { return RC_ERR_USAGE; }
-  var m: RcMeosql* = rc_meosql_of(a.ud);
+  var m: RcMeodb* = rc_meodb_of(a.ud);
   m->timeout_ms = ms;
-  rc_meosql_apply_timeout(m);
+  rc_meodb_apply_timeout(m);
   return RC_OK;
 }
 
 // Closes the socket without BYE and frees the adapter and its state.
-//   a  an adapter from rc_meosql_adapter, or 0 (no-op); invalid afterwards
-export fn rc_meosql_adapter_free(a: RcAdapter*) {
+//   a  an adapter from rc_meodb_adapter, or 0 (no-op); invalid afterwards
+export fn rc_meodb_adapter_free(a: RcAdapter*) {
   if (a == 0) { return; }
-  var m: RcMeosql* = rc_meosql_of(a.ud);
+  var m: RcMeodb* = rc_meodb_of(a.ud);
   if (m != 0) {
-    rc_meosql_drop(m);
+    rc_meodb_drop(m);
     rc_text_free(m->host);
     rc_text_free(m->token);
     rc_wire_free(&m->out);

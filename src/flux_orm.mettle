@@ -4,7 +4,7 @@
 //
 // Not included, import them where you use them:
 //   core/clock_linux  the real clock for rc_clock_set (a syscall)
-//   adapter/meosql    the MeoSQL network adapter (pulls in std/net and
+//   adapter/meodb    the MeoDB network adapter (pulls in std/net and
 //                     adapter/wire)
 //   adapter/mem       the in-memory test adapter
 

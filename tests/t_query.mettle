@@ -78,7 +78,7 @@ fn check_select_text() -> int32 {
   if (sql != SELECT_BASE) { return 1; }
   if (rc_query_n_args(&q) != 0) { return 2; }
   if (rc_query_args(&q) == 0) { return 3; }   // pre-sized argv, zero used
-  if (rc_dialect_name(q.dial) != "meosql") { return 4; }
+  if (rc_dialect_name(q.dial) != "meodb") { return 4; }
 
   // persist's load statement: WHERE pk = ? LIMIT 1, from where_eq + limit.
   if (rc_query_where_field(&q, 0, RC_CMP_EQ, RcInt(42)) != RC_OK) { return 5; }
@@ -416,7 +416,7 @@ fn check_batch_insert() -> int32 {
 
 fn check_dialect_ident() -> int32 {
   var d: RcDialect = rc_dialect_default();
-  if (rc_dialect_name(d) != "meosql") { return 1; }
+  if (rc_dialect_name(d) != "meodb") { return 1; }
   if (!d.has_limit) { return 2; }
 
   var i: int32 = 0;

@@ -1,12 +1,12 @@
 # flux_orm
 
-An ORM for the [MeoSQL](../meosql) database, written in Mettle.
+An ORM for the [MeoDB](../meosql) database, written in Mettle.
 
 Status: models, queries, inserts, loads, updates of changed fields, deletes,
 update_all/delete_all/count, changeset validations, relations without N+1,
 migrations with up and down, sessions with transactions and stale-write
 detection and automatic timestamps and Multi all work and are tested in the
-interpreter, debug and release. The MeoSQL adapter talks to MeoSQL's server
+interpreter, debug and release. The MeoDB adapter talks to MeoDB's server
 over its wire protocol, and has been run end to end against the real server.
 The other tests run against an in-memory adapter that records statements.
 
@@ -17,7 +17,7 @@ src/flux_orm.mettle  the import root
 src/core/            values, status codes, model metadata, entities, sessions,
                      clock, single-row insert/load/delete
 src/adapter/         the adapter interface (SQL text, or statements as data),
-                     the in-memory test adapter, the MeoSQL wire codec and
+                     the in-memory test adapter, the MeoDB wire codec and
                      network adapter
 src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
 src/changeset/       casting user input, dirty fields, validations, save
@@ -77,13 +77,13 @@ mb_dep_path("flux_orm", "../flux_orm");
 ```mettle
 import "flux_orm/flux_orm";
 import "flux_orm/core/clock_linux";   // the real clock, if you use timestamps
-import "flux_orm/adapter/meosql";     // the MeoSQL adapter, if you use MeoSQL
+import "flux_orm/adapter/meodb";     // the MeoDB adapter, if you use MeoDB
 ```
 
-Connect to MeoSQL's server (IPv4 address; the token is "" when it has none):
+Connect to MeoDB's server (IPv4 address; the token is "" when it has none):
 
 ```mettle
-var adapter: RcAdapter* = rc_meosql_adapter("token");
+var adapter: RcAdapter* = rc_meodb_adapter("token");
 rc_adapter_open(adapter, "127.0.0.1:5490");
 ```
 
@@ -153,7 +153,7 @@ rc_multi_free(&m);
 
 Migrations are versioned and run once each, in order, inside their own
 transaction. Each step is SQL text or a callback; callbacks also work with
-stores that take no SQL, like MeoSQL:
+stores that take no SQL, like MeoDB:
 
 ```mettle
 fn up_notes(a: RcAdapter*) -> int32 { return rc_migration_create(a, note_meta()); }
@@ -229,7 +229,7 @@ Conventions:
 | Multi | `rc_multi_new`, `rc_multi_insert`, `rc_multi_update`, `rc_multi_delete`, `rc_multi_update_all`, `rc_multi_delete_all`, `rc_multi_run`, `rc_multi_failed_name`, `rc_multi_free` |
 | Relations | `rc_relation_has_many`, `rc_relation_belongs_to`, `rc_relation_has_many_through`, `rc_relation_load`, `rc_relation_group`, `rc_relation_count`, `rc_relation_hydrate`, `rc_relation_free` |
 | Migrations | `rc_migration_set`, `rc_migration_run`, `rc_migration_down`, `rc_migration_create`, `rc_migration_drop`, `rc_migration_add_column`, `rc_migration_create_index`, `rc_migration_drop_index` |
-| Adapters | `rc_meosql_adapter`, `rc_meosql_timeout`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
+| Adapters | `rc_meodb_adapter`, `rc_meodb_timeout`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
 | Clock | `rc_clock_set`, `rc_clock_realtime_us` |
 
 ## Build and test
@@ -256,7 +256,7 @@ for t in tests/t_*.mettle; do
 done
 ```
 
-`tests/live_meosql.mettle` runs flux_orm against a real MeoSQL server. Start one
+`tests/live_meodb.mettle` runs flux_orm against a real MeoDB server. Start one
 (`../meosql/build/linux/release/meosql --db /tmp/flux_live.meo`), then build and
 run that file the same way.
 

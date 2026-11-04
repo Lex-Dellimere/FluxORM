@@ -1,6 +1,6 @@
-// flux_orm/adapter/wire.mettle — MeoSQL wire protocol v1, encode and decode.
+// flux_orm/adapter/wire.mettle — MeoDB wire protocol v1, encode and decode.
 //
-// Written from meosql/docs/PROTOCOL.md alone; MeoSQL's code is not imported.
+// Written from meosql/docs/PROTOCOL.md alone; MeoDB's code is not imported.
 // No I/O here: frames are built into an RcWire byte buffer and replies are
 // decoded from bytes, so every rule is testable without a server.
 //
@@ -292,7 +292,7 @@ fn rc_wire_cflags(flags: int32) -> int64 {
 //   st   the statement; borrowed, read only. Column types and flags are sent
 //        only for CREATE and ADD_COLUMN
 // Returns RC_OK, or RC_ERR_USAGE (w or st is 0, or n_args > 0 with no args),
-// RC_ERR_UNSUPPORTED (st has joins: MeoSQL has none; nothing is written),
+// RC_ERR_UNSUPPORTED (st has joins: MeoDB has none; nothing is written),
 // RC_ERR_RANGE (a name over 65535 bytes, or an arg as in rc_wire_val), or
 // RC_ERR_NOMEM.
 export fn rc_wire_query(w: RcWire*, rid: uint32, st: RcStmt*) -> int32 {
@@ -503,7 +503,7 @@ export fn rc_wire_hello_ok(p: uint8*, n: int64, out: RcWireHello*) -> int32 {
 }
 
 export struct RcWireError {
-  code: int32;     // MeoSQL's positive status code
+  code: int32;     // MeoDB's positive status code
   fatal: bool;     // the server closes after this frame
   tx: int32;       // session state after it: 0 none, 1 open, 2 aborted
   message: string; // a view into the payload
@@ -576,7 +576,7 @@ export fn rc_wire_result(p: uint8*, n: int64, out: RcResult*) -> int32 {
   return RC_OK;
 }
 
-// Maps a MeoSQL status code (positive, from an ERROR frame) to an RC_* code:
+// Maps a MeoDB status code (positive, from an ERROR frame) to an RC_* code:
 //   2 NOMEM                    -> RC_ERR_NOMEM
 //   10 USAGE, 16 SCHEMA        -> RC_ERR_USAGE
 //   11 UNSUPPORTED, 17 TOOBIG  -> RC_ERR_UNSUPPORTED
