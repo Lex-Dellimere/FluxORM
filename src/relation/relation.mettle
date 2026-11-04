@@ -1,4 +1,4 @@
-// src/relation/relation.mettle — association metadata, checked at startup.
+// flux_orm/relation/relation.mettle — association metadata, checked at startup.
 //
 // A relation is *metadata*, not a column and not a method on a model. The
 // models stay exactly what they are (`User`, `Post`: an int64 field is the
@@ -85,8 +85,7 @@ fn rc_relation_kind_known(kind: int32) -> bool {
 // made, so this is safe to call from a loader and cheap enough to call on
 // every load (it is six comparisons and a string compare per check).
 //
-// Two rules the directive spells out but this file makes explicit because they
-// are the whole reason a batch loader can exist:
+// Two rules make a batch loader possible:
 //
 //   * the key fields on both sides are RC_T_I64 — an int64 field the model
 //     already has, never a new column;
@@ -94,9 +93,8 @@ fn rc_relation_kind_known(kind: int32) -> bool {
 //     so "find the target" is a primary-key lookup and never a scan by a
 //     non-unique column.
 //
-// One rule beyond the directive's list, from the task brief's "local side NOT
-// NULL where required": a HAS_MANY groups by the *owner's* local field, so that
-// field must be NOT NULL (a NULL grouping key is not a key). BELONGS_TO and
+// A HAS_MANY groups by the *owner's* local field, so that field must be
+// NOT NULL (a NULL grouping key is not a key). BELONGS_TO and
 // THROUGH allow a nullable local field on purpose: a NULL foreign key means "no
 // relation", and the loader skips NULL owner keys before it builds the IN list.
 //

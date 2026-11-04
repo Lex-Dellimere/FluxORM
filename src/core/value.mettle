@@ -1,14 +1,14 @@
-// reach/core/value.mettle — the only representation a value has at a seam.
+// flux_orm/core/value.mettle — the only representation a value has at a seam.
 //
 // Every model field, query argument and result cell is an RcValue. This is the
 // impedance-matching layer between Mettle's static types and the database's
 // serial types:
 //
-//   Mettle                 RcValue arm     wire type (dacor)
+//   Mettle                 RcValue arm     wire type (MeoSQL)
 //   int8..int64, enum      RcInt           INTEGER (signed 64)
 //   uint8..uint64          RcUint          INTEGER (unsigned, range-checked)
 //   float32, float64       RcFloat         REAL (ieee-754 binary64)
-//   bool                   RcBool          INTEGER 0/1 (dacor has no BOOL)
+//   bool                   RcBool          INTEGER 0/1 (MeoSQL has no BOOL)
 //   string                 RcText          TEXT (UTF-8 bytes, length-prefixed)
 //   uint8[] (blob)         RcBlob          BLOB
 //   declared Timestamp     RcTime          INTEGER unix micros, UTC

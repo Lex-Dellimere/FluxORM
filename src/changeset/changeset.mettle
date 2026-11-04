@@ -1,4 +1,4 @@
-// reach/changeset/changeset.mettle — what the caller wants to write, and which
+// flux_orm/changeset/changeset.mettle — what the caller wants to write, and which
 // columns that actually touches.
 //
 // RcEntity.state answers "does this row differ from the store". An UPDATE needs
@@ -23,14 +23,17 @@
 // value to outlive it must rc_value_clone into its own storage. The
 // "borrowed text is not copied" test asserts `.chars` pointer identity.
 //
-// Applied errors are sticky: the first refusal is recorded (code, field index,
-// static reason) and every later mutating call returns that code until
-// rc_changeset_reset or rc_changeset_bind. rc_changeset_valid is false while an
-// error stands, and rc_changeset_apply refuses an invalid changeset with
-// RC_ERR_USAGE before it writes anything.
+// Errors are collected, as in Ecto: a refused put records an error for its
+// field and leaves the field unchanged, and later puts on other fields still
+// work. Validations (validate.mettle) add more. rc_changeset_error_count and
+// rc_changeset_error_at list them; rc_changeset_error_field/code/reason give
+// the first. A changeset with any error is invalid, and apply and save refuse
+// it with RC_ERR_USAGE before they write anything. reset and bind clear the
+// errors.
 //
-// No SQL here. This phase produces the mask and the values; emitting
-// `UPDATE ... SET` belongs to a later directive.
+// The SQL itself is query/'s: rc_changeset_save hands the mask to
+// rc_query_update, so an UPDATE names exactly the dirty columns and nothing
+// else.
 
 import "std/mem";
 
@@ -38,7 +41,17 @@ import "../core/status";
 import "../core/value";
 import "../core/meta";
 import "../core/entity";
+import "../core/clock";
+import "../adapter/adapter";
+import "../query/builder";
 import "cast";
+
+// One recorded error. `reason` is a static string, never owned.
+export struct RcFieldError {
+  field: int32;   // -1 when the error is not about one field
+  code: int32;    // RC_ERR_*
+  reason: string;
+}
 
 export struct RcChangeset {
   meta: RcMeta;         // the table this changeset writes
@@ -50,6 +63,10 @@ export struct RcChangeset {
   err_field: int32;     // -1 when no error
   err_code: int32;      // RC_OK when no error
   err_reason: string;   // static string, never owned
+  errors: RcFieldError*; // every error, in the order recorded
+  n_errors: int32;
+  cap_errors: int32;
+  unique: uint64;       // fields a duplicate-key CONFLICT is reported on
 }
 
 // --- error bookkeeping -------------------------------------------------------
@@ -71,14 +88,89 @@ fn rc_changeset_reason(code: int32) -> string {
 fn rc_changeset_note(cs: RcChangeset*, field: int32, code: int32,
                      why: string) -> int32 {
   if (cs == 0) { return code; }
-  cs->err_field = field;
-  cs->err_code = code;
-  if (why.length > (uint64)0) {
-    cs->err_reason = why;
-  } else {
-    cs->err_reason = rc_changeset_reason(code);
+  var reason: string = why;
+  if (reason.length == (uint64)0) { reason = rc_changeset_reason(code); }
+  if (cs->err_code == RC_OK) {
+    cs->err_field = field;
+    cs->err_code = code;
+    cs->err_reason = reason;
   }
+  if (cs->n_errors == cs->cap_errors) {
+    var cap: int32 = cs->cap_errors * 2;
+    if (cap < 4) { cap = 4; }
+    var p: rawptr = realloc((rawptr)cs->errors, (int64)cap * (int64)sizeof(RcFieldError));
+    if (p == 0) { return code; }  // the first error is still recorded above
+    cs->errors = (RcFieldError*)p;
+    cs->cap_errors = cap;
+  }
+  cs->errors[cs->n_errors].field = field;
+  cs->errors[cs->n_errors].code = code;
+  cs->errors[cs->n_errors].reason = reason;
+  cs->n_errors = cs->n_errors + 1;
   return code;
+}
+
+// Records an error, as a validation does. Returns `code`.
+export fn rc_changeset_add_error(cs: RcChangeset*, field: int32, code: int32,
+                                 why: string) -> int32 {
+  if (cs == 0) { return RC_ERR_USAGE; }
+  if (cs->values == 0) { return cs->err_code; }
+  return rc_changeset_note(cs, field, code, why);
+}
+
+export fn rc_changeset_error_count(cs: RcChangeset*) -> int32 {
+  if (cs == 0) { return 0; }
+  return cs->n_errors;
+}
+
+// Error i, or {-1, RC_ERR_USAGE, ""} when there is none.
+export fn rc_changeset_error_at(cs: RcChangeset*, i: int32) -> RcFieldError {
+  var e: RcFieldError;
+  e.field = -1;
+  e.code = RC_ERR_USAGE;
+  e.reason = "";
+  if (cs == 0 || i < 0 || i >= cs->n_errors) { return e; }
+  return cs->errors[i];
+}
+
+// True when an error is recorded for `field`.
+export fn rc_changeset_field_has_error(cs: RcChangeset*, field: int32) -> bool {
+  if (cs == 0) { return false; }
+  var i: int32 = 0;
+  while (i < cs->n_errors) {
+    if (cs->errors[i].field == field) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Like Ecto's unique_constraint: when the store answers a write with
+// RC_ERR_CONFLICT (a duplicate key), the error is recorded on `field` instead
+// of on no field. With several unique fields registered the store does not say
+// which one clashed, so the error goes on field -1.
+export fn rc_changeset_unique(cs: RcChangeset*, field: int32) -> int32 {
+  if (cs == 0) { return RC_ERR_USAGE; }
+  if (cs->values == 0) { return cs->err_code; }
+  if (field < 0 || field >= cs->meta.n_fields) { return RC_ERR_USAGE; }
+  cs->unique = rc_nulls_set(cs->unique, field);
+  return RC_OK;
+}
+
+// Records the store's duplicate-key CONFLICT on the registered unique field.
+export fn rc_changeset_conflict(cs: RcChangeset*) {
+  if (cs == 0 || cs->values == 0) { return; }
+  var field: int32 = -1;
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < cs->meta.n_fields) {
+    if (rc_nulls_has(cs->unique, i)) {
+      field = i;
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  if (n != 1) { field = -1; }
+  rc_changeset_note(cs, field, RC_ERR_CONFLICT, "has already been taken");
 }
 
 // True when the changeset carries no storage at all: a meta that failed
@@ -107,6 +199,10 @@ export fn rc_changeset_new(m: RcMeta) -> RcChangeset {
   cs.err_field = -1;
   cs.err_code = RC_OK;
   cs.err_reason = "";
+  cs.errors = 0;
+  cs.n_errors = 0;
+  cs.cap_errors = 0;
+  cs.unique = (uint64)0;
 
   var bad: int32 = -1;
   var rc: int32 = rc_meta_check(m, &bad);
@@ -147,6 +243,12 @@ export fn rc_changeset_free(cs: RcChangeset*) {
     free((rawptr)cs->values);
     cs->values = 0;
   }
+  if (cs->errors != 0) {
+    free((rawptr)cs->errors);
+    cs->errors = 0;
+  }
+  cs->n_errors = 0;
+  cs->cap_errors = 0;
   cs->changes = 0;
   cs->n_values = 0;
   cs->base = 0;
@@ -154,7 +256,7 @@ export fn rc_changeset_free(cs: RcChangeset*) {
 }
 
 // Back to "nothing written": bits cleared, cells RcNull, baseline dropped,
-// recorded error cleared. The meta and the allocation are kept.
+// errors cleared. The meta, the allocation and the unique fields are kept.
 export fn rc_changeset_reset(cs: RcChangeset*) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -169,6 +271,7 @@ export fn rc_changeset_reset(cs: RcChangeset*) -> int32 {
   cs->err_field = -1;
   cs->err_code = RC_OK;
   cs->err_reason = "";
+  cs->n_errors = 0;
   return RC_OK;
 }
 
@@ -221,7 +324,6 @@ fn rc_changeset_bit(field: int32) -> uint64 {
 export fn rc_changeset_put(cs: RcChangeset*, field: int32, v: RcValue) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
-  if (cs->err_code != RC_OK) { return cs->err_code; }
   if (field < 0 || field >= cs->meta.n_fields) {
     return rc_changeset_note(cs, field, RC_ERR_USAGE, "field index out of range");
   }
@@ -255,7 +357,6 @@ export fn rc_changeset_put(cs: RcChangeset*, field: int32, v: RcValue) -> int32 
 export fn rc_changeset_put_name(cs: RcChangeset*, name: string, v: RcValue) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
-  if (cs->err_code != RC_OK) { return cs->err_code; }
   var field: int32 = rc_meta_find(cs->meta, name);
   if (field < 0) {
     return rc_changeset_note(cs, -1, RC_ERR_USAGE, "unknown field name");
@@ -270,7 +371,6 @@ export fn rc_changeset_put_name(cs: RcChangeset*, name: string, v: RcValue) -> i
 export fn rc_changeset_put_text(cs: RcChangeset*, field: int32, s: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
-  if (cs->err_code != RC_OK) { return cs->err_code; }
   if (field < 0 || field >= cs->meta.n_fields) {
     return rc_changeset_note(cs, field, RC_ERR_USAGE, "field index out of range");
   }
@@ -400,5 +500,137 @@ export fn rc_changeset_apply(cs: RcChangeset*, e: RcEntity*) -> int32 {
     }
     i = i + 1;
   }
+  return RC_OK;
+}
+
+// --- save --------------------------------------------------------------------
+
+// Writes the dirty fields to the store as one UPDATE keyed by the primary key:
+// `UPDATE "t" SET <dirty columns> = ? WHERE "pk" = ?`. The entity must already
+// be in the store (CLEAN or DIRTY, with a key); a NEW one is inserted instead,
+// so it is refused here.
+//
+// Order matters, and it is what keeps a refusal from leaving a half-written
+// model:
+//   1. the UPDATE is built from the mask first, so a mask query/ refuses (the
+//      primary key, a read-only field) is refused before the model changes;
+//   2. rc_changeset_apply writes the values through core/meta's range checks;
+//   3. the SET values are read back from the model, so the store gets exactly
+//      the narrowed values the model holds.
+//
+// Stale writes. A table with an RC_F_VERSION field is saved as
+//   UPDATE "t" SET <dirty> = ?, "version" = ? WHERE "pk" = ? AND "version" = ?
+// binding old + 1 and old. If another writer saved the row since this model
+// was read, its version moved on, nothing matches and the answer is
+// RC_ERR_CONFLICT: the other write is kept, not overwritten. On success the
+// model's version becomes old + 1. A table without one is last-writer-wins.
+//
+// RC_F_UPDATED fields are set to core/clock's time on every save that writes
+// something; without a clock such a save is refused before anything changes.
+//
+// An empty changeset writes nothing and does not call the adapter. An adapter
+// failure is returned unchanged and the entity stays DIRTY: the model holds
+// the new values, the store does not. Zero affected rows is RC_ERR_CONFLICT
+// for a versioned table (stale, or deleted) and RC_ERR_NOT_FOUND otherwise
+// (deleted, or its key changed, since it was loaded). On success the entity is
+// CLEAN. The changeset is not reset; bind or reset it before the next round of
+// edits.
+export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> int32 {
+  if (a == 0 || cs == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (cs->values == 0) { return RC_ERR_USAGE; }
+  if (cs->err_code != RC_OK) { return RC_ERR_USAGE; }
+  if (e->state != RC_ST_CLEAN && e->state != RC_ST_DIRTY) {
+    return rc_changeset_note(cs, -1, RC_ERR_USAGE, "entity is not in the store");
+  }
+  if (e->meta.pk < 0 || !rc_entity_has_pk(e)) {
+    return rc_changeset_note(cs, -1, RC_ERR_USAGE, "entity has no primary key");
+  }
+  if (cs->changes == (uint64)0) { return RC_OK; }
+
+  var q: RcQuery = rc_query_update(cs->meta, cs->changes);
+  defer rc_query_free(&q);
+  if (q.err != RC_OK) {
+    return rc_changeset_note(cs, -1, q.err, "the update was refused");
+  }
+  var now: int64 = 0;
+  var rc: int32 = RC_OK;
+  var stamped: bool = rc_meta_any(cs->meta, RC_F_UPDATED);
+  if (stamped) {
+    rc = rc_clock_now(&now);
+    if (rc != RC_OK) {
+      return rc_changeset_note(cs, -1, rc, "no clock for the updated timestamp");
+    }
+  }
+  // Read the version the model was loaded with before anything changes.
+  var vf: int32 = rc_meta_version(cs->meta);
+  var old_ver: int64 = 0;
+  if (vf >= 0) {
+    var cur: RcValue = RcNull;
+    rc = rc_entity_get(e, vf, &cur);
+    if (rc != RC_OK) { return rc; }
+    rc = rc_value_as_i64(cur, &old_ver);
+    if (rc != RC_OK) {
+      return rc_changeset_note(cs, vf, RC_ERR_USAGE, "version is not set");
+    }
+    if (old_ver == (int64)9223372036854775807) {
+      return rc_changeset_note(cs, vf, RC_ERR_RANGE, "version is at its maximum");
+    }
+  }
+  rc = rc_changeset_apply(cs, e);
+  if (rc != RC_OK) { return rc; }
+
+  var i: int32 = 0;
+  while (i < cs->meta.n_fields) {
+    if (rc_nulls_has(cs->changes, i)) {
+      var v: RcValue = RcNull;
+      rc = rc_entity_get(e, i, &v);
+      if (rc != RC_OK) { return rc; }
+      rc = rc_query_push_arg(&q, v);
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  i = 0;
+  while (stamped && i < cs->meta.n_fields) {
+    if ((cs->meta.fields[i].flags & RC_F_UPDATED) != 0) {
+      rc = rc_query_push_arg(&q, RcTime(now));
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  if (vf >= 0) {
+    rc = rc_query_push_arg(&q, RcInt(old_ver + 1));
+    if (rc != RC_OK) { return rc; }
+  }
+  rc = rc_query_where_eq(&q, e->meta.pk, rc_entity_pk(e));
+  if (rc != RC_OK) { return rc; }
+  if (vf >= 0) {
+    rc = rc_query_where_eq(&q, vf, RcInt(old_ver));
+    if (rc != RC_OK) { return rc; }
+  }
+
+  var res: RcResult;
+  rc = rc_query_exec(&q, a, &res);
+  if (rc == RC_ERR_CONFLICT) { rc_changeset_conflict(cs); }
+  if (rc != RC_OK) { return rc; }
+  var affected: int32 = res.affected;
+  rc_result_free(&res);
+  if (affected == 0) {
+    if (vf >= 0) { return RC_ERR_CONFLICT; }
+    return RC_ERR_NOT_FOUND;
+  }
+  if (vf >= 0) {
+    rc = rc_meta_set(e->meta, e->model, &e->nulls, vf, RcInt(old_ver + 1));
+    if (rc != RC_OK) { return rc; }
+  }
+  i = 0;
+  while (stamped && i < e->meta.n_fields) {
+    if ((e->meta.fields[i].flags & RC_F_UPDATED) != 0) {
+      rc = rc_meta_set(e->meta, e->model, &e->nulls, i, RcTime(now));
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  e->state = RC_ST_CLEAN;
   return RC_OK;
 }

@@ -1,0 +1,232 @@
+// tests/t_validate.mettle — validations collect every error per field, and a
+// duplicate key from the store is reported on the unique field.
+//
+// User fields: id 0, email 1, name 2, age 3, active 4, score 5, created_at 6,
+// role 7.
+
+import "std/mem";
+
+import "../src/flux_orm";
+import "../src/adapter/mem";
+import "models";
+import "harness";
+
+fn has_error(cs: RcChangeset*, field: int32, reason: string) -> bool {
+  var i: int32 = 0;
+  while (i < rc_changeset_error_count(cs)) {
+    var e: RcFieldError = rc_changeset_error_at(cs, i);
+    if (e.field == field && e.reason == reason) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// --- 1. required ----------------------------------------------------------------
+
+fn check_required() -> int32 {
+  var m: RcMeta = user_meta();
+  var req: int32[2];
+  req[0] = 1;
+  req[1] = 2;
+
+  // Nothing put, nothing bound: both are blank.
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_validate_required(&cs, &req[0], 2) != RC_ERR_CONSTRAINT) { return 1; }
+  if (rc_changeset_error_count(&cs) != 2) { return 2; }
+  if (!has_error(&cs, 1, "can't be blank") || !has_error(&cs, 2, "can't be blank")) { return 3; }
+  if (rc_changeset_valid(&cs)) { return 4; }
+
+  // Empty text is blank too (put_text already refuses "" for a NOT NULL field;
+  // a direct put does not); a value in the bound row counts as present.
+  var u: User;
+  memset((rawptr)&u, 0, (int64)sizeof(User));
+  u.email = "ada@example.com";
+  var cs2: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs2);
+  if (rc_changeset_bind(&cs2, (rawptr)&u, (uint64)0) != RC_OK) { return 5; }
+  if (rc_changeset_put(&cs2, 2, RcText("")) != RC_OK) { return 6; }
+  if (rc_validate_required(&cs2, &req[0], 2) != RC_ERR_CONSTRAINT) { return 7; }
+  if (rc_changeset_error_count(&cs2) != 1) { return 8; }
+  if (!has_error(&cs2, 2, "can't be blank")) { return 9; }
+
+  var cs3: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs3);
+  if (rc_changeset_put_text(&cs3, 1, "a@b.c") != RC_OK) { return 10; }
+  if (rc_changeset_put_text(&cs3, 2, "Ada") != RC_OK) { return 11; }
+  if (rc_validate_required(&cs3, &req[0], 2) != RC_OK) { return 12; }
+  if (!rc_changeset_valid(&cs3)) { return 13; }
+  return 0;
+}
+
+// --- 2. length, numbers, inclusion ---------------------------------------------
+
+fn check_ranges() -> int32 {
+  var m: RcMeta = user_meta();
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+
+  // "Zoë" is three characters, four bytes.
+  if (rc_changeset_put_text(&cs, 2, "Zoë") != RC_OK) { return 1; }
+  if (rc_validate_length(&cs, 2, 3, 3) != RC_OK) { return 2; }
+  if (rc_validate_length(&cs, 2, 4, -1) != RC_ERR_RANGE) { return 3; }
+  if (rc_validate_length(&cs, 2, -1, 2) != RC_ERR_RANGE) { return 4; }
+  if (!has_error(&cs, 2, "is too short") || !has_error(&cs, 2, "is too long")) { return 5; }
+
+  if (rc_changeset_put_text(&cs, 3, "17") != RC_OK) { return 6; }
+  if (rc_validate_int(&cs, 3, 18, 130) != RC_ERR_RANGE) { return 7; }
+  if (!has_error(&cs, 3, "is too small")) { return 8; }
+  if (rc_validate_int(&cs, 3, 0, 17) != RC_OK) { return 9; }
+
+  if (rc_changeset_put_text(&cs, 5, "10.5") != RC_OK) { return 10; }
+  if (rc_validate_float(&cs, 5, 0.0, 10.0) != RC_ERR_RANGE) { return 11; }
+  if (!has_error(&cs, 5, "is too large")) { return 12; }
+
+  var roles: RcValue[2];
+  roles[0] = RcInt(1);
+  roles[1] = RcInt(2);
+  if (rc_changeset_put(&cs, 7, RcInt(3)) != RC_OK) { return 13; }
+  if (rc_validate_inclusion(&cs, 7, &roles[0], 2) != RC_ERR_CONSTRAINT) { return 14; }
+  if (!has_error(&cs, 7, "is invalid")) { return 15; }
+
+  // Unchanged fields are skipped.
+  if (rc_validate_length(&cs, 1, 5, 10) != RC_OK) { return 16; }
+  if (rc_validate_int(&cs, 0, 1, 2) != RC_OK) { return 17; }
+
+  // Every error was kept, in order, and the first is the first recorded.
+  if (rc_changeset_error_count(&cs) != 5) { return 18; }
+  if (rc_changeset_error_field(&cs) != 2) { return 19; }
+  if (rc_changeset_error_at(&cs, 4).field != 7) { return 20; }
+  if (rc_changeset_error_at(&cs, 5).code != RC_ERR_USAGE) { return 21; }
+
+  // reset clears them.
+  if (rc_changeset_reset(&cs) != RC_OK) { return 22; }
+  if (rc_changeset_error_count(&cs) != 0 || !rc_changeset_valid(&cs)) { return 23; }
+  return 0;
+}
+
+// --- 3. a custom check -----------------------------------------------------------
+
+fn has_at(ctx: rawptr, v: RcValue) -> bool {
+  var s: string = "";
+  if (rc_value_as_text(v, &s) != RC_OK) { return false; }
+  var i: uint64 = 0;
+  while (i < s.length) {
+    if (s.chars[i] == (uint8)64) { return true; }  // '@'
+    i = i + 1;
+  }
+  return false;
+}
+
+fn check_custom() -> int32 {
+  var m: RcMeta = user_meta();
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_put_text(&cs, 1, "not-an-email") != RC_OK) { return 1; }
+  if (rc_validate_change(&cs, 1, &has_at, 0, "has invalid format") != RC_ERR_CONSTRAINT) { return 2; }
+  if (!has_error(&cs, 1, "has invalid format")) { return 3; }
+  var ok: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&ok);
+  if (rc_changeset_put_text(&ok, 1, "ada@example.com") != RC_OK) { return 4; }
+  if (rc_validate_change(&ok, 1, &has_at, 0, "has invalid format") != RC_OK) { return 5; }
+  return 0;
+}
+
+// --- 4. an invalid changeset writes nothing --------------------------------------
+
+fn new_session(a: RcAdapter**, s: RcSession*) -> int32 {
+  var ad: RcAdapter* = rc_mem_adapter();
+  if (ad == 0) { return RC_ERR_NOMEM; }
+  if (rc_adapter_open(ad, "mem://flux_orm") != RC_OK) {
+    rc_mem_free(ad);
+    return RC_ERR_ADAPTER;
+  }
+  *a = ad;
+  *s = rc_session_new(ad);
+  return RC_OK;
+}
+
+fn check_blocks_writes() -> int32 {
+  var a: RcAdapter* = 0;
+  var s: RcSession;
+  if (new_session(&a, &s) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = post_meta();
+  var p: Post;
+  memset((rawptr)&p, 0, (int64)sizeof(Post));
+  var e: RcEntity = rc_entity_new(m, (rawptr)&p);
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_put_text(&cs, 1, "7") != RC_OK) { return 2; }
+  if (rc_changeset_put_text(&cs, 2, "Hi") != RC_OK) { return 3; }
+  if (rc_validate_length(&cs, 2, 3, -1) != RC_ERR_RANGE) { return 4; }
+  if (rc_repo_insert(&s, &cs, &e) != RC_ERR_USAGE) { return 5; }
+  if (rc_mem_call_count(a) != 0) { return 6; }
+  if (p.title != "") { return 7; }
+  return 0;
+}
+
+// --- 5. a duplicate key lands on the unique field ------------------------------
+
+fn check_unique() -> int32 {
+  var a: RcAdapter* = 0;
+  var s: RcSession;
+  if (new_session(&a, &s) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = user_meta();
+
+  var u: User;
+  memset((rawptr)&u, 0, (int64)sizeof(User));
+  var e: RcEntity = rc_entity_new(m, (rawptr)&u);
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_unique(&cs, 1) != RC_OK) { return 2; }
+  if (rc_changeset_put_text(&cs, 1, "ada@example.com") != RC_OK) { return 3; }
+  if (rc_changeset_put_text(&cs, 2, "Ada") != RC_OK) { return 4; }
+  if (rc_changeset_put(&cs, 4, RcBool(true)) != RC_OK) { return 5; }
+  if (rc_changeset_put(&cs, 6, RcTime(1)) != RC_OK) { return 6; }
+  if (rc_changeset_put(&cs, 7, RcInt(2)) != RC_OK) { return 7; }
+  if (rc_mem_fail_next(a, RC_ERR_CONFLICT) != RC_OK) { return 8; }
+  if (rc_repo_insert(&s, &cs, &e) != RC_ERR_CONFLICT) { return 9; }
+  if (!has_error(&cs, 1, "has already been taken")) { return 10; }
+  if (rc_changeset_valid(&cs)) { return 11; }
+
+  // Two unique fields: the store does not say which, so no field is named.
+  var cs2: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs2);
+  rc_changeset_unique(&cs2, 1);
+  rc_changeset_unique(&cs2, 2);
+  var u2: User;
+  memset((rawptr)&u2, 0, (int64)sizeof(User));
+  if (rc_entity_set(&e, 0, RcInt(9)) != RC_OK) { return 12; }
+  var e2: RcEntity = rc_entity_loaded(m, (rawptr)&u2, (uint64)0);
+  if (rc_entity_set(&e2, 0, RcInt(9)) != RC_OK) { return 13; }
+  e2.state = RC_ST_CLEAN;
+  if (rc_changeset_bind(&cs2, (rawptr)&u2, e2.nulls) != RC_OK) { return 14; }
+  if (rc_changeset_put_text(&cs2, 2, "Taken") != RC_OK) { return 15; }
+  if (rc_mem_fail_next(a, RC_ERR_CONFLICT) != RC_OK) { return 16; }
+  if (rc_repo_update(&s, &cs2, &e2) != RC_ERR_CONFLICT) { return 17; }
+  if (!has_error(&cs2, -1, "has already been taken")) { return 18; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("validate: required", check_required())) { failures = failures + 1; }
+  if (!rc_report("validate: length, numbers and inclusion", check_ranges())) { failures = failures + 1; }
+  if (!rc_report("validate: a custom check", check_custom())) { failures = failures + 1; }
+  if (!rc_report("validate: an invalid changeset writes nothing", check_blocks_writes())) { failures = failures + 1; }
+  if (!rc_report("validate: a duplicate key lands on the unique field", check_unique())) { failures = failures + 1; }
+  return rc_summary(failures, 5);
+}
+
+@test fn t_validate() -> int32 {
+  if (check_required() != 0) { return 1; }
+  if (check_ranges() != 0) { return 2; }
+  if (check_custom() != 0) { return 3; }
+  if (check_blocks_writes() != 0) { return 4; }
+  if (check_unique() != 0) { return 5; }
+  return 0;
+}

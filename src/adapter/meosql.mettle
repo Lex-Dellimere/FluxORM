@@ -1,0 +1,118 @@
+// flux_orm/adapter/meosql.mettle — the bridge to MeoSQL.
+//
+// Status: gated. flux_orm does not compile MeoSQL in; apps depend on flux_orm,
+// not the other way round. This adapter will talk to MeoSQL's network server
+// (MeoSQL roadmap M7) once it exists. Until then every entry point returns
+// RC_ERR_UNSUPPORTED and rc_meosql_supported() is false.
+//
+// MeoSQL has no SQL language. It takes statements as data, which is what the
+// `query` slot carries (adapter/stmt.mettle); the server's request frame is
+// the same RcStmt. So this adapter sets `query` and leaves `exec` empty.
+//
+// Values, RcValue -> MeoValue: RcNull -> NULL; RcInt, RcTime -> INT; RcBool ->
+// INT 0/1; RcUint -> INT, or RC_ERR_RANGE above INT64_MAX; RcFloat -> REAL;
+// RcText -> TEXT; RcBlob -> BLOB. Results come back as cells and are copied
+// into RcResult, so nothing MeoSQL owns outlives a call.
+//
+// Status. MeoSQL returns -MEO_ERR_* (negative) on failure and >= 0 on success
+// (MEO_ROW 100 and MEO_DONE 101 included). The codes collapse into RC_* here
+// and only here:
+//   CONFLICT 13 (duplicate PK/UNIQUE)  -> RC_ERR_CONFLICT
+//   CONSTRAINT 14 (NOT NULL)           -> RC_ERR_CONSTRAINT
+//   TX 15                              -> RC_ERR_TX
+//   SCHEMA 16 (unknown table, column)  -> RC_ERR_USAGE
+//   TOOBIG 17                          -> RC_ERR_UNSUPPORTED
+//   MISMATCH 18                        -> RC_ERR_CAST
+//   NOMEM 2                            -> RC_ERR_NOMEM
+//   USAGE 10                           -> RC_ERR_USAGE
+//   UNSUPPORTED 11                     -> RC_ERR_UNSUPPORTED
+//   BUSY 7 (lock timeout)              -> RC_ERR_ADAPTER, retryable
+//   CORRUPT 4, NOT_A_DB 5, VERSION 6   -> RC_ERR_ADAPTER, and the connection
+//                                         is discarded, not reused
+//   IO, NOSPC, FULL, RANGE, READONLY   -> RC_ERR_ADAPTER
+//
+// Not supported by MeoSQL yet: joins (RcStmt.n_joins > 0 -> RC_ERR_UNSUPPORTED)
+// and nested transactions (core/session flattens nesting first).
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "adapter";
+
+// Same values as MeoSQL's MEO_OPEN_READ/WRITE/CREATE.
+export const RC_MEOSQL_READ: int32 = 1;
+export const RC_MEOSQL_WRITE: int32 = 2;
+export const RC_MEOSQL_CREATE: int32 = 4;
+export const RC_MEOSQL_N_FRAMES: int32 = 256; // 1 MiB of page cache per connection
+
+// The affinity vocabulary the ORM will ask MeoSQL's type layer for.
+// Provisional: MeoSQL has no column types yet, and this table is the contract
+// the ORM needs from it. A mismatch is a build-time conversation, not a runtime
+// coercion.
+export fn rc_meosql_affinity(ty: int32) -> string {
+  if (ty == RC_T_I64 || ty == RC_T_U64) { return "INTEGER"; }
+  if (ty == RC_T_BOOL) { return "INTEGER"; } // stored 0/1, decoded as bool
+  if (ty == RC_T_TIME) { return "INTEGER"; } // unix micros, UTC, never text
+  if (ty == RC_T_F64) { return "REAL"; }
+  if (ty == RC_T_TEXT) { return "TEXT"; }
+  if (ty == RC_T_BLOB) { return "BLOB"; }
+  return "";
+}
+
+// A declared timestamp is a plain int64 in Mettle. The model marks the column
+// with RC_F_TIMESTAMP; this is the conversion both directions use.
+export fn rc_meosql_time_from_micros(us: int64) -> RcValue { return RcTime(us); }
+
+export struct RcMeosql {
+  pager: rawptr; // MeoPager*, once the statement API exists
+  path: string;
+  flags: int32;
+  depth: int32;
+}
+
+fn rc_meosql_open(ud: rawptr, dsn: string) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_close(ud: rawptr) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_exec(ud: rawptr, sql: string, args: RcValue*, n_args: int32,
+                  out: RcResult*) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_begin(ud: rawptr, mode: int32) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_commit(ud: rawptr) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_rollback(ud: rawptr) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_ping(ud: rawptr) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_query(ud: rawptr, st: RcStmt*, out: RcResult*) -> int32 {
+  return RC_ERR_UNSUPPORTED;
+}
+
+export fn rc_meosql_supported() -> bool { return false; }
+
+export fn rc_meosql_adapter(path: string, flags: int32) -> RcAdapter* {
+  var d: RcMeosql* = malloc(sizeof(RcMeosql));
+  if (d == 0) { return 0; }
+  d.pager = 0;
+  d.path = path;
+  d.flags = flags;
+  d.depth = 0;
+  var a: RcAdapter* = malloc(sizeof(RcAdapter));
+  if (a == 0) {
+    free(d);
+    return 0;
+  }
+  a.name = "meosql";
+  a.ud = (rawptr)d;
+  a.open = &rc_meosql_open;
+  a.close = &rc_meosql_close;
+  a.exec = &rc_meosql_exec;
+  a.begin = &rc_meosql_begin;
+  a.commit = &rc_meosql_commit;
+  a.rollback = &rc_meosql_rollback;
+  a.ping = &rc_meosql_ping;
+  a.query = &rc_meosql_query;
+  return a;
+}
+
+export fn rc_meosql_adapter_free(a: RcAdapter*) {
+  if (a == 0) { return; }
+  var d: RcMeosql* = (RcMeosql*)a.ud;
+  if (d != 0) { free(d); }
+  free(a);
+}

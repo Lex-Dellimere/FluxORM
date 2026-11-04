@@ -1,13 +1,9 @@
-// reach/query/dialect.mettle — the SQL text flavour, as a value.
+// flux_orm/query/dialect.mettle — the SQL text flavour, as a value.
 //
-// One dialect ships: "dacor". It is a value rather than a pile of string
+// One dialect ships: "meosql". It is a value rather than a pile of string
 // literals so the text builder has exactly one place that knows what a quoted
-// identifier and a placeholder look like, and so a later phase can ask "does
-// this store spell LIMIT that way?" without editing the builder.
-//
-// Ownership note (resolves the docs/02-seams.md vs. adapter/ overlap): this
-// file owns `RcDialect` for the whole tree. `adapter/` is not written in this
-// wave, so there is exactly one definition and no duplicate export.
+// identifier and a placeholder look like, and so a store's differences (does
+// it spell LIMIT that way?) live here and not in the builder.
 //
 // Byte-equality contract: `rc_dialect_ident(rc_dialect_default(), b, s)` must
 // produce exactly the same bytes as `rc_buf_ident(b, s)`. Routing every
@@ -23,7 +19,7 @@ import "../core/status";
 import "../core/buf";
 
 export struct RcDialect {
-  name: string;        // "dacor"
+  name: string;        // "meosql"
   quote: string;       // "\""
   placeholder: string; // "?"
   has_limit: bool;     // true — the store understands literal LIMIT n
@@ -31,7 +27,7 @@ export struct RcDialect {
 
 export fn rc_dialect_default() -> RcDialect {
   var d: RcDialect;
-  d.name = "dacor";
+  d.name = "meosql";
   d.quote = "\"";
   d.placeholder = "?";
   d.has_limit = true;

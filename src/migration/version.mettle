@@ -1,9 +1,9 @@
-// reach/migration/version.mettle — up-only migrations, one transaction each.
+// flux_orm/migration/version.mettle — up-only migrations, one transaction each.
 //
 // The ledger is the truth about what has run, and it lives in the same store
 // as the schema it describes, so the two cannot be committed separately:
 //
-//   _reach_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+//   _flux_orm_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL,
 //                      applied_at INTEGER NOT NULL)
 //
 // A run is: create the ledger if absent, read the applied versions, refuse if
@@ -13,25 +13,34 @@
 // per-migration transaction: a partially applied migration is worse than a
 // failed one, because the next run would skip it.
 //
-// Up-only, deliberately. There is no `down` and no auto-diff against the store
-// until dacor's catalog can be queried: without a readable catalog, "what does
-// the schema look like" can only be guessed, and a guessed rollback is a data
-// loss bug. `rc_migration_down` therefore answers RC_ERR_UNSUPPORTED and says
-// why.
+// Rolling back is explicit, as in Ecto: a migration may carry a down step
+// (`down_sql` or `down`), and rc_migration_down undoes every applied version
+// above a target, newest first, one transaction each. There is no auto-diff
+// against the store: a rollback guessed from the schema is a data-loss bug.
 
 import "std/mem";
 
 import "../core/status";
 import "../core/value";
+import "../core/meta";
 import "../core/buf";
 import "../adapter/adapter";
+import "../adapter/stmt";
+import "ddl";
 
-export const RC_MIG_LEDGER: string = "_reach_migrations";
+export const RC_MIG_LEDGER: string = "_flux_orm_migrations";
 
+// A migration is SQL text for text stores, or an `up` callback for stores
+// without SQL (MeoSQL): `up` runs inside the migration's transaction, usually
+// rc_migration_create for each table. When `up` is set, `up_sql` may be empty.
+// `down_sql` / `down` undo it; a migration with neither cannot be rolled back.
 export struct RcMigration {
   version: int64;
   name: string;
   up_sql: string;
+  up: fn(RcAdapter*) -> int32;
+  down_sql: string;
+  down: fn(RcAdapter*) -> int32;
 }
 
 export struct RcMigrationSet {
@@ -97,7 +106,7 @@ export fn rc_migration_check(s: RcMigrationSet) -> int32 {
     var m: RcMigration = s.items[i];
     if (m.version <= 0) { return RC_ERR_USAGE; }
     if (m.name.length == (uint64)0) { return RC_ERR_USAGE; }
-    if (m.up_sql.length == (uint64)0) { return RC_ERR_USAGE; }
+    if (m.up_sql.length == (uint64)0 && m.up == 0) { return RC_ERR_USAGE; }
     if (i > 0) {
       if (m.version <= s.items[i - 1].version) { return RC_ERR_USAGE; }
     }
@@ -170,6 +179,72 @@ export fn rc_migration_ledger_insert(b: RcBuf*) -> int32 {
   return rc_buf_put(b, ") VALUES (?, ?, ?)");
 }
 
+// The ledger statements as data, for adapters with `query`. `*out` is
+// replaced; free it with rc_stmt_free.
+export fn rc_migration_ledger_ddl_stmt(out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_CREATE, RC_MIG_LEDGER);
+  out->if_not_exists = true;
+  var rc: int32 = rc_stmt_col(out, "version", RC_T_I64, RC_F_PK | RC_F_NOT_NULL);
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "name", RC_T_TEXT, RC_F_NOT_NULL); }
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "applied_at", RC_T_TIME, RC_F_NOT_NULL); }
+  return rc;
+}
+
+export fn rc_migration_ledger_select_stmt(out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_SELECT, RC_MIG_LEDGER);
+  var rc: int32 = rc_stmt_col(out, "version", RC_T_I64, 0);
+  if (rc == RC_OK) { rc = rc_stmt_order(out, "version", false); }
+  return rc;
+}
+
+export fn rc_migration_ledger_insert_stmt(out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_INSERT, RC_MIG_LEDGER);
+  out->n_rows = 1;
+  var rc: int32 = rc_stmt_col(out, "version", RC_T_I64, 0);
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "name", RC_T_TEXT, 0); }
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "applied_at", RC_T_TIME, 0); }
+  return rc;
+}
+
+export fn rc_migration_ledger_delete(b: RcBuf*) -> int32 {
+  if (b == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_buf_put(b, "DELETE FROM ");
+  if (rc == RC_OK) { rc = rc_buf_ident(b, RC_MIG_LEDGER); }
+  if (rc == RC_OK) { rc = rc_buf_put(b, " WHERE "); }
+  if (rc == RC_OK) { rc = rc_buf_ident(b, "version"); }
+  if (rc == RC_OK) { rc = rc_buf_put(b, " = ?"); }
+  return rc;
+}
+
+export fn rc_migration_ledger_delete_stmt(out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_DELETE, RC_MIG_LEDGER);
+  return rc_stmt_term(out, "version", RC_W_EQ, 0, 1);
+}
+
+// Creates m's table if it does not exist, through whichever path the adapter
+// takes. This is what an `up` callback calls.
+export fn rc_migration_create(a: RcAdapter*, m: RcMeta) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  var buf: RcBuf = rc_buf_new(256);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+  var rc: int32 = rc_migration_create_table(m, &buf);
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt;
+  rc = rc_migration_create_stmt(m, &st);
+  defer rc_stmt_free(&st);
+  if (rc != RC_OK) { return rc; }
+  var res: RcResult;
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, (RcValue*)0, 0, &res);
+  if (rc != RC_OK) { return rc; }
+  rc_result_free(&res);
+  return RC_OK;
+}
+
 // --- internals ---------------------------------------------------------------
 
 fn rc_mig_index_of(s: RcMigrationSet, version: int64) -> int32 {
@@ -198,7 +273,12 @@ fn rc_mig_apply(a: RcAdapter*, m: RcMigration, at: int64, buf: RcBuf*) -> int32 
   if (rc != RC_OK) { return rc; }
 
   var res: RcResult;
-  rc = rc_adapter_exec(a, m.up_sql, (RcValue*)0, 0, &res);
+  if (m.up != 0) {
+    rc_result_init(&res);
+    rc = m.up(a);
+  } else {
+    rc = rc_adapter_exec(a, m.up_sql, (RcValue*)0, 0, &res);
+  }
   if (rc != RC_OK) {
     rc_result_free(&res);
     rc_adapter_rollback(a);
@@ -216,7 +296,14 @@ fn rc_mig_apply(a: RcAdapter*, m: RcMigration, at: int64, buf: RcBuf*) -> int32 
   args[0] = RcInt(m.version);
   args[1] = RcText(m.name);
   args[2] = RcTime(at);
-  rc = rc_adapter_exec(a, rc_buf_text(buf), &args[0], 3, &res);
+  var st: RcStmt;
+  rc = rc_migration_ledger_insert_stmt(&st);
+  defer rc_stmt_free(&st);
+  if (rc != RC_OK) {
+    rc_adapter_rollback(a);
+    return rc;
+  }
+  rc = rc_adapter_run(a, rc_buf_text(buf), &st, &args[0], 3, &res);
   if (rc != RC_OK) {
     rc_result_free(&res);
     rc_adapter_rollback(a);
@@ -229,6 +316,71 @@ fn rc_mig_apply(a: RcAdapter*, m: RcMigration, at: int64, buf: RcBuf*) -> int32 
     rc_adapter_rollback(a);
     return rc;
   }
+  return RC_OK;
+}
+
+// Creates the ledger if it is absent, then reads the applied versions into a
+// malloc'd array (*applied, free it) of *n entries with the highest in *max.
+// The ledger DDL runs outside a transaction: creating a table is not a unit of
+// work, and an adapter that refuses nesting (mem does) would reject the begin
+// that follows.
+fn rc_mig_read_ledger(a: RcAdapter*, buf: RcBuf*, cap_hint: int32, applied: int64**,
+                      n: int32*, max: int64*) -> int32 {
+  *applied = 0;
+  *n = 0;
+  *max = 0;
+  var res: RcResult;
+  rc_buf_clear(buf);
+  var rc: int32 = rc_migration_ledger_ddl(buf);
+  if (rc != RC_OK) { return rc; }
+  var dst: RcStmt;
+  rc = rc_migration_ledger_ddl_stmt(&dst);
+  defer rc_stmt_free(&dst);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_adapter_run(a, rc_buf_text(buf), &dst, (RcValue*)0, 0, &res);
+  if (rc != RC_OK) { return rc; }
+  rc_result_free(&res);
+
+  // What the store already has. Zero rows is the normal first run.
+  rc_buf_clear(buf);
+  rc = rc_migration_ledger_select(buf);
+  if (rc != RC_OK) { return rc; }
+  var sst: RcStmt;
+  rc = rc_migration_ledger_select_stmt(&sst);
+  defer rc_stmt_free(&sst);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_adapter_run(a, rc_buf_text(buf), &sst, (RcValue*)0, 0, &res);
+  if (rc != RC_OK) { return rc; }
+  // A SELECT with no rows reports no columns; only a non-empty result has to
+  // be exactly the one column this reader knows how to read.
+  if (res.n_rows > 0 && res.n_cols != 1) {
+    rc_result_free(&res);
+    return RC_ERR_ADAPTER;
+  }
+  var cap: int32 = cap_hint;
+  if (res.n_rows > cap) { cap = res.n_rows; }
+  if (cap < 1) { cap = 1; }
+  var arr: int64* = malloc((int64)cap * (int64)sizeof(int64));
+  if (arr == 0) {
+    rc_result_free(&res);
+    return RC_ERR_NOMEM;
+  }
+  var i: int32 = 0;
+  while (i < res.n_rows) {
+    var v: int64 = 0;
+    rc = rc_result_i64(&res, i, 0, &v);
+    if (rc != RC_OK) {
+      rc_result_free(&res);
+      free(arr);
+      return RC_ERR_ADAPTER;
+    }
+    arr[i] = v;
+    if (v > *max) { *max = v; }
+    i = i + 1;
+  }
+  *n = res.n_rows;
+  rc_result_free(&res);
+  *applied = arr;
   return RC_OK;
 }
 
@@ -266,65 +418,18 @@ export fn rc_migration_run(a: RcAdapter*, s: RcMigrationSet*,
     return RC_ERR_NOMEM;
   }
   defer rc_buf_free(&buf);
-  var res: RcResult;
-
-  // 1. The ledger table, idempotently and outside a transaction: creating a
-  //    table is not a unit of work, and an adapter that refuses nesting (mem
-  //    does) would reject the begin that follows.
-  rc = rc_migration_ledger_ddl(&buf);
-  if (rc != RC_OK) { out->code = rc; return rc; }
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), (RcValue*)0, 0, &res);
-  if (rc != RC_OK) { out->code = rc; return rc; }
-  rc_result_free(&res);
-
-  // 2. What the store already has. Zero rows is the normal first run.
-  rc_buf_clear(&buf);
-  rc = rc_migration_ledger_select(&buf);
-  if (rc != RC_OK) { out->code = rc; return rc; }
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), (RcValue*)0, 0, &res);
-  if (rc != RC_OK) { out->code = rc; return rc; }
-  // A SELECT with no rows reports no columns; only a non-empty result has to
-  // be exactly the one column this reader knows how to read.
-  if (res.n_rows > 0 && res.n_cols != 1) {
-    rc_result_free(&res);
-    out->code = RC_ERR_ADAPTER;
-    return RC_ERR_ADAPTER;
-  }
-
-  var cap: int32 = s->n;
-  if (res.n_rows > cap) { cap = res.n_rows; }
-  if (cap < 1) { cap = 1; }
-  var applied: int64* = malloc((int64)cap * (int64)sizeof(int64));
-  if (applied == 0) {
-    rc_result_free(&res);
-    out->code = RC_ERR_NOMEM;
-    return RC_ERR_NOMEM;
-  }
-  defer free(applied);
-
+  var applied: int64* = 0;
   var n_applied: int32 = 0;
   var ledger_max: int64 = 0;
-  var i: int32 = 0;
-  while (i < res.n_rows) {
-    var v: int64 = 0;
-    rc = rc_result_i64(&res, i, 0, &v);
-    if (rc != RC_OK) {
-      rc_result_free(&res);
-      out->code = RC_ERR_ADAPTER;
-      return RC_ERR_ADAPTER;
-    }
-    applied[n_applied] = v;
-    n_applied = n_applied + 1;
-    if (v > ledger_max) { ledger_max = v; }
-    i = i + 1;
-  }
-  rc_result_free(&res);
+  rc = rc_mig_read_ledger(a, &buf, s->n, &applied, &n_applied, &ledger_max);
+  if (rc != RC_OK) { out->code = rc; return rc; }
+  defer free(applied);
   out->up_to = ledger_max;
+  var i: int32 = 0;
 
-  // 3. A version in the ledger that the code does not know about means the
-  //    store is ahead of the binary. Running older DDL over a newer schema
-  //    corrupts it silently, so this is a refusal, not a warning.
-  i = 0;
+  // A version in the ledger that the code does not know about means the
+  // store is ahead of the binary. Running older DDL over a newer schema
+  // corrupts it silently, so this is a refusal, not a warning.
   while (i < n_applied) {
     if (rc_mig_index_of(*s, applied[i]) < 0) {
       out->code = RC_ERR_CONFLICT;
@@ -334,7 +439,7 @@ export fn rc_migration_run(a: RcAdapter*, s: RcMigrationSet*,
     i = i + 1;
   }
 
-  // 4. Apply what is missing, ascending, one transaction each.
+  // Apply what is missing, ascending, one transaction each.
   i = 0;
   while (i < s->n) {
     var m: RcMigration = s->items[i];
@@ -356,13 +461,124 @@ export fn rc_migration_run(a: RcAdapter*, s: RcMigrationSet*,
   return RC_OK;
 }
 
-// There is no down. A rollback needs the store's current schema, and dacor's
-// catalog is not readable yet, so a `down` here could only guess — and a
-// guessed DROP is a data-loss bug that runs unattended. Up-only until the
-// catalog lands; the code is RC_ERR_UNSUPPORTED so a caller can branch on it
-// instead of parsing a message.
-export fn rc_migration_down(a: RcAdapter*, s: RcMigrationSet*,
-                            version: int64) -> int32 {
-  if (a == 0 || s == 0) { return RC_ERR_USAGE; }
-  return RC_ERR_UNSUPPORTED;
+fn rc_mig_has_down(m: RcMigration) -> bool {
+  if (m.down != 0) { return true; }
+  if (m.down_sql.length > (uint64)0) { return true; }
+  return false;
+}
+
+// One rollback, one transaction: begin, the down step, delete the ledger row,
+// commit. Any failure rolls back and returns the code.
+fn rc_mig_revert(a: RcAdapter*, m: RcMigration, buf: RcBuf*) -> int32 {
+  var rc: int32 = rc_adapter_begin(a, RC_TX_IMMEDIATE);
+  if (rc != RC_OK) { return rc; }
+  var res: RcResult;
+  if (m.down != 0) {
+    rc_result_init(&res);
+    rc = m.down(a);
+  } else {
+    rc = rc_adapter_exec(a, m.down_sql, (RcValue*)0, 0, &res);
+  }
+  rc_result_free(&res);
+  if (rc != RC_OK) {
+    rc_adapter_rollback(a);
+    return rc;
+  }
+  rc_buf_clear(buf);
+  rc = rc_migration_ledger_delete(buf);
+  var st: RcStmt;
+  if (rc == RC_OK) { rc = rc_migration_ledger_delete_stmt(&st); }
+  defer rc_stmt_free(&st);
+  if (rc != RC_OK) {
+    rc_adapter_rollback(a);
+    return rc;
+  }
+  var args: RcValue[1];
+  args[0] = RcInt(m.version);
+  rc = rc_adapter_run(a, rc_buf_text(buf), &st, &args[0], 1, &res);
+  if (rc != RC_OK) {
+    rc_adapter_rollback(a);
+    return rc;
+  }
+  rc_result_free(&res);
+  rc = rc_adapter_commit(a);
+  if (rc != RC_OK) { rc_adapter_rollback(a); }
+  return rc;
+}
+
+// Rolls back every applied version above `to`, newest first, each in its own
+// transaction (like `mix ecto.rollback --to`). `to` = 0 rolls back everything.
+// Before anything runs, a version to undo that the code does not know is
+// RC_ERR_CONFLICT and one without a down step is RC_ERR_UNSUPPORTED, both with
+// failed_version set. The report's `applied` counts rolled-back versions and
+// `up_to` is the highest version still applied.
+export fn rc_migration_down(a: RcAdapter*, s: RcMigrationSet*, to: int64,
+                            out: RcMigrationReport*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  out->applied = 0;
+  out->up_to = 0;
+  out->failed_version = 0;
+  out->code = RC_OK;
+  if (a == 0 || s == 0 || to < 0) {
+    out->code = RC_ERR_USAGE;
+    return RC_ERR_USAGE;
+  }
+  var rc: int32 = rc_migration_check(*s);
+  if (rc != RC_OK) {
+    out->code = rc;
+    return rc;
+  }
+  var buf: RcBuf = rc_buf_new(256);
+  if (buf.data == 0) {
+    out->code = RC_ERR_NOMEM;
+    return RC_ERR_NOMEM;
+  }
+  defer rc_buf_free(&buf);
+  var applied: int64* = 0;
+  var n_applied: int32 = 0;
+  var ledger_max: int64 = 0;
+  rc = rc_mig_read_ledger(a, &buf, s->n, &applied, &n_applied, &ledger_max);
+  if (rc != RC_OK) { out->code = rc; return rc; }
+  defer free(applied);
+  out->up_to = ledger_max;
+
+  // Checked newest first, the order the rollback would run in.
+  var i: int32 = n_applied - 1;
+  while (i >= 0) {
+    if (applied[i] > to) {
+      var at: int32 = rc_mig_index_of(*s, applied[i]);
+      if (at < 0) { rc = RC_ERR_CONFLICT; }
+      if (at >= 0 && !rc_mig_has_down(s->items[at])) { rc = RC_ERR_UNSUPPORTED; }
+      if (rc != RC_OK) {
+        out->code = rc;
+        out->failed_version = applied[i];
+        return rc;
+      }
+    }
+    i = i - 1;
+  }
+
+  // The set is ascending, so walking it backwards undoes newest first.
+  i = s->n - 1;
+  while (i >= 0) {
+    var m: RcMigration = s->items[i];
+    if (m.version > to && rc_mig_has(applied, n_applied, m.version)) {
+      rc = rc_mig_revert(a, m, &buf);
+      if (rc != RC_OK) {
+        out->code = rc;
+        out->failed_version = m.version;
+        return rc;
+      }
+      out->applied = out->applied + 1;
+    }
+    i = i - 1;
+  }
+  var highest: int64 = 0;
+  i = 0;
+  while (i < n_applied) {
+    if (applied[i] <= to && applied[i] > highest) { highest = applied[i]; }
+    i = i + 1;
+  }
+  out->up_to = highest;
+  return RC_OK;
 }

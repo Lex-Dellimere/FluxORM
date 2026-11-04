@@ -1,12 +1,12 @@
-// reach/migration/ddl.mettle — CREATE TABLE from metadata.
+// flux_orm/migration/ddl.mettle — CREATE TABLE from metadata.
 //
 // The DDL is generated from the same RcMeta the write path uses, so a table
 // cannot drift from the model it was declared for: the column list, the order,
 // the key and the nullability all come from one source.
 //
 // Affinity is the SQLite family (INTEGER/REAL/TEXT/BLOB), which is also what
-// dacor stores. The *wire* type decides the column, never the Mettle type: a
-// `bool` is INTEGER because dacor has no BOOL, and an `int64` overridden to
+// MeoSQL stores. The *wire* type decides the column, never the Mettle type: a
+// `bool` is INTEGER because MeoSQL has no BOOL, and an `int64` overridden to
 // RC_T_TIME is INTEGER because micros are an integer.
 //
 // Nothing here interpolates a value. Identifiers go through rc_buf_ident, the
@@ -17,12 +17,13 @@ import "../core/status";
 import "../core/value";
 import "../core/meta";
 import "../core/buf";
+import "../adapter/stmt";
 
 // Wire type -> column affinity. RC_T_UNSUPPORTED, and any wire type a later
 // phase adds without teaching this table about it, returns the empty string;
 // the caller treats that as a refusal rather than emitting a column with no
 // type.
-fn rc_migration_affinity(ty: int32) -> string {
+export fn rc_migration_affinity(ty: int32) -> string {
   if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) {
     return "INTEGER";
   }
@@ -90,9 +91,7 @@ export fn rc_migration_create_table(m: RcMeta, b: RcBuf*) -> int32 {
       rc = rc_buf_put(b, " PRIMARY KEY");
       if (rc != RC_OK) { return rc; }
     }
-    // Keyword order note: the directive's verbatim expected text is
-    // `"email" TEXT NOT NULL UNIQUE`, so NOT NULL precedes UNIQUE. Its prose
-    // lists UNIQUE first; the asserted strings are what this emits.
+    // NOT NULL comes before UNIQUE: `"email" TEXT NOT NULL UNIQUE`.
     if ((f.flags & RC_F_NOT_NULL) != 0 && !is_pk) {
       rc = rc_buf_put(b, " NOT NULL");
       if (rc != RC_OK) { return rc; }
@@ -104,4 +103,23 @@ export fn rc_migration_create_table(m: RcMeta, b: RcBuf*) -> int32 {
     i = i + 1;
   }
   return rc_buf_put(b, ")");
+}
+
+// The same CREATE TABLE IF NOT EXISTS as data, for adapters with `query`.
+// `*out` is replaced; free it with rc_stmt_free.
+export fn rc_migration_create_stmt(m: RcMeta, out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_CREATE, m.table);
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+  out->if_not_exists = true;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var f: RcField = m.fields[i];
+    if (rc_migration_affinity(f.ty).length == (uint64)0) { return RC_ERR_UNSUPPORTED; }
+    rc = rc_stmt_col(out, f.column, f.ty, f.flags & (RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE));
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
 }

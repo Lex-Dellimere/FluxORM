@@ -1,63 +1,33 @@
-// tests/t_integration.mettle — Phase 6: every phase in one binary.
+// tests/t_integration.mettle — every layer in one binary.
 //
-// `tools/check.sh` runs each phase file alone, and a phase that passes alone can
-// still fail at the seam. This file is the seam: one model set, one adapter, the
-// scenario of docs/04-integration.md driven through migration/, core/persist,
-// query/, changeset/ and relation/ together, in one process, against real
-// metadata and real adapters.
+// Each t_*.mettle tests one layer; this one drives migration/, core/persist,
+// query/, changeset/ and relation/ together against one model set and one
+// adapter, because a layer that passes alone can still fail at the seam.
 //
-// Where docs/04-integration.md and the code disagree, the code wins and the
-// divergence is stated at the assertion that shows it:
+// Notes on what is asserted where:
 //
-//   * rc_migration_create_table takes (RcMeta, RcBuf*) and returns a code; the
-//     emitted text starts with `CREATE TABLE IF NOT EXISTS`.
-//   * the ledger SELECT reads one column, `"version"`, `ORDER BY "version" ASC`.
-//   * the builder has no `where_gt`; the age predicate is an IN list.
-//   * adapter/mem replays scripted rows; it does not evaluate SQL, so "the NULL
-//     row is excluded" is asserted where the logic lives — the builder's
-//     three-valued `IS NULL` and the entity's null bitmap — not in a result set.
-//   * no phase emits UPDATE. This file therefore asserts the *mask* (and the
-//     column list it implies) instead of an `UPDATE ... SET` string.
-//   * there is no session and no cache, so a repeated preload is a second
-//     statement by design, not a cache hit.
-//   * a mismatched relation key type is RC_ERR_CAST in rc_relation_check.
-//   * an unknown changeset field name is RC_ERR_USAGE with error_field() == -1
-//     and the static reason "unknown field name".
-//   * there is no UPDATE builder, so an empty change set is refused by nothing:
-//     n_dirty == 0 means apply writes no field and nothing reaches the store.
+//   * adapter/mem replays scripted rows and does not evaluate SQL, so "the NULL
+//     row is excluded" is asserted where the logic lives (the builder's
+//     `IS NULL` and the entity's null bitmap), not in a result set.
+//   * there is no cache, so a repeated preload is a second statement.
+//   * an empty change set is not an error: rc_changeset_save writes nothing.
 //
-// Every statement is compared with `==` against a literal, never by substring.
-// The only substring helper below is a *negative* one: it proves the byte string
-// `= NULL` never appears, which is an absence no `==` can state.
+// Every statement is compared with `==` against a literal. The one substring
+// helper only proves that `= NULL` never appears.
 //
-// The mem adapter replays a FIFO, so the rows pushed for a statement are pushed
-// at that statement's index in call order and the text is asserted immediately
-// after the call that consumed them. A statement reordered by the code under
-// test would misalign the script, and the call count at the end is what catches
-// it.
+// mem replays a FIFO, so rows are pushed in call order and each statement is
+// asserted right after the call that consumed them; the final call count
+// catches a reordered statement.
 //
-// The @test entry walks the same table of function pointers main() walks (see
-// the runner): a direct call chain from a @test makes the head compiler's
-// interpreter segfault while lowering IR. That workaround is reported, not
-// silent.
+// The @test entry calls main(): a direct call chain of the checks from a
+// @test makes the head compiler's interpreter segfault while lowering IR.
 
 import "std/io";
 import "std/mem";
 
-import "../src/core/status";
-import "../src/core/value";
-import "../src/core/meta";
-import "../src/core/entity";
-import "../src/core/buf";
-import "../src/core/persist";
-import "../src/adapter/adapter";
+// Through the import root, as an app would.
+import "../src/flux_orm";
 import "../src/adapter/mem";
-import "../src/query/builder";
-import "../src/changeset/changeset";
-import "../src/migration/ddl";
-import "../src/migration/version";
-import "../src/relation/relation";
-import "../src/relation/load";
 import "models";
 import "harness";
 
@@ -66,9 +36,9 @@ import "harness";
 // active 4, score 5, created_at 6, role 7. Post = id 0, user_id 1, title 2,
 // body 3, published_at 4.
 
-export const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_reach_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
-export const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_reach_migrations\" ORDER BY \"version\" ASC";
-export const LEDGER_INSERT: string = "INSERT INTO \"_reach_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
+export const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_flux_orm_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
+export const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_flux_orm_migrations\" ORDER BY \"version\" ASC";
+export const LEDGER_INSERT: string = "INSERT INTO \"_flux_orm_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
 
 export const USER_DDL: string = "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" INTEGER PRIMARY KEY, \"email\" TEXT NOT NULL UNIQUE, \"name\" TEXT NOT NULL, \"age\" INTEGER, \"active\" INTEGER NOT NULL, \"score\" REAL, \"created_at\" INTEGER NOT NULL, \"role\" INTEGER NOT NULL)";
 export const POST_DDL: string = "CREATE TABLE IF NOT EXISTS \"posts\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"title\" TEXT NOT NULL, \"body\" TEXT, \"published_at\" INTEGER)";
@@ -84,10 +54,8 @@ export const POSTS_BY_USER_SQL3: string = "SELECT \"id\", \"user_id\", \"title\"
 export const POSTS_BY_USER_SQL4: string = "SELECT \"id\", \"user_id\", \"title\", \"body\", \"published_at\" FROM \"posts\" WHERE \"user_id\" IN (?, ?, ?, ?)";
 export const USERS_BY_KEY_SQL3: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" WHERE \"id\" IN (?, ?, ?)";
 
-// The column list an UPDATE would name for the two-field change in check 4,
-// quoted by core/buf's identifier rule so the projection below is the real
-// quoting and not a re-spelling of it.
-export const UPDATE_COLUMNS: string = "\"name\", \"age\"";
+// The UPDATE rc_changeset_save sends for the two-field change in check 4.
+export const UPDATE_SQL: string = "UPDATE \"users\" SET \"name\" = ?, \"age\" = ? WHERE \"id\" = ?";
 
 export const CLOCK: int64 = 1700000000000123;
 
@@ -122,7 +90,7 @@ export fn has_text(hay: string, needle: string) -> bool {
 export fn new_adapter(out: RcAdapter**) -> int32 {
   var a: RcAdapter* = rc_mem_adapter();
   if (a == 0) { return RC_ERR_NOMEM; }
-  if (rc_adapter_open(a, "mem://reach") != RC_OK) {
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
     rc_mem_free(a);
     return RC_ERR_ADAPTER;
   }
@@ -374,8 +342,7 @@ fn check_query() -> int32 {
   if (rc_meta_find(m, "age") != 3) { return 2; }
   if (rc_meta_find(m, "name") != 2) { return 3; }
 
-  // docs/04 §3 names rc_query_where_gt; the builder has eq / null / not_null /
-  // in. The age predicate is therefore an IN list, built from field indexes.
+  // The age predicate is an IN list, built from field indexes.
   var ages: RcValue[2];
   ages[0] = RcInt(31);
   ages[1] = RcInt(32);
@@ -526,34 +493,21 @@ fn check_changeset() -> int32 {
   if (rc_changeset_has(&cs, 1)) { return 19; }
   if (rc_changeset_n_dirty(&cs) != 2) { return 20; }
 
-  // No phase emits UPDATE (changeset/ owns the mask and the values), so the
-  // statement text cannot be asserted. What can: the column list the mask
-  // implies, quoted with core/buf's identifier rule — two columns, field order.
-  var b: RcBuf = rc_buf_new(64);
-  if (b.data == 0) { return 21; }
-  defer rc_buf_free(&b);
-  var first: bool = true;
-  i = 0;
-  while (i < m.n_fields) {
-    if (rc_changeset_has(&cs, i)) {
-      if (!first) {
-        if (rc_buf_put(&b, ", ") != RC_OK) { return 22; }
-      }
-      if (rc_buf_ident(&b, m.fields[i].column) != RC_OK) { return 23; }
-      first = false;
-    }
-    i = i + 1;
-  }
-  if (rc_buf_text(&b) != UPDATE_COLUMNS) { return 24; }
-  if (first) { return 25; }
-
-  // apply writes exactly those two fields and touches no store.
-  if (rc_changeset_apply(&cs, &e) != RC_OK) { return 26; }
-  if (e.state != RC_ST_DIRTY) { return 27; }
-  if (u.name != "Ada L.") { return 28; }
-  if (!rc_nulls_has(e.nulls, 3)) { return 29; }
-  if (u.age != 0) { return 30; }
-  if (rc_mem_call_count(a) != 1) { return 31; }   // only the load executed
+  // save writes exactly those two fields: one UPDATE, the dirty columns in
+  // field order, the key last.
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 21; }
+  if (rc_changeset_save(a, &cs, &e) != RC_OK) { return 22; }
+  if (rc_mem_last_sql(a) != UPDATE_SQL) { return 23; }
+  if (rc_mem_arg_count(a) != 3) { return 24; }
+  var sent: RcValue* = rc_mem_last_args(a);
+  if (!rc_value_same(sent[0], RcText("Ada L."))) { return 25; }
+  if (!rc_value_is_null(sent[1])) { return 26; }
+  if (!rc_value_same(sent[2], RcInt(42))) { return 27; }
+  if (e.state != RC_ST_CLEAN) { return 28; }
+  if (u.name != "Ada L.") { return 29; }
+  if (!rc_nulls_has(e.nulls, 3)) { return 30; }
+  if (u.age != 0) { return 31; }
+  if (rc_mem_call_count(a) != 2) { return 48; }   // the load and the update
 
   // Zero and NULL are never conflated. Against a baseline age of 30, a 0 is a
   // change and the cell binds RcInt(0).
@@ -575,7 +529,7 @@ fn check_changeset() -> int32 {
   if (!rc_changeset_has(&cs, 3)) { return 44; }
   if (!rc_value_is_null(cs.values[3])) { return 45; }
   if (rc_changeset_n_dirty(&cs) != 1) { return 46; }
-  if (rc_mem_call_count(a) != 1) { return 47; }
+  if (rc_mem_call_count(a) != 2) { return 47; }
   return 0;
 }
 
@@ -639,8 +593,8 @@ fn check_relations() -> int32 {
   if (p.title != "third") { return 28; }
   if (rc_nulls_has(pn, 3)) { return 29; }   // this post has a body
 
-  // docs/04 §5 also wants an owner with zero posts. One of the three pinned
-  // placeholders cannot also carry a fourth owner, so this is a second load:
+  // An owner with zero posts. Three placeholders cannot carry a fourth owner,
+  // so this is a second load:
   // four keys, still one exec, and group 3 is an empty slice inside a non-null
   // index array — not a null pointer.
   var keys4: RcValue[4];
@@ -850,9 +804,8 @@ fn check_failure_matrix() -> int32 {
   if (rc_persist_insert(a, &de) != RC_ERR_UNSUPPORTED) { return 17; }
   if (rc_mem_call_count(a) != 0) { return 18; }
 
-  // 4. An empty change set. There is no UPDATE builder in this tree, so nothing
-  // refuses it: n_dirty == 0 means apply writes no field and the store is never
-  // seen — which is the "never a full-row rewrite" property, asserted directly.
+  // 4. An empty change set. Saving it writes no field and never reaches the
+  // store, which is the "never a full-row rewrite" property, asserted directly.
   var cs3: RcChangeset = rc_changeset_new(m);
   defer rc_changeset_free(&cs3);
   if (rc_changeset_n_dirty(&cs3) != 0) { return 19; }
@@ -862,7 +815,7 @@ fn check_failure_matrix() -> int32 {
   var ce: RcEntity = rc_entity_new(m, (rawptr)&clean);
   if (rc_entity_set(&ce, 0, RcInt(5)) != RC_OK) { return 21; }
   ce.state = RC_ST_CLEAN;
-  if (rc_changeset_apply(&cs3, &ce) != RC_OK) { return 22; }
+  if (rc_changeset_save(a, &cs3, &ce) != RC_OK) { return 22; }
   if (ce.state != RC_ST_CLEAN) { return 23; }     // CLEAN -> DIRTY needs a write
   if (clean.id != 5) { return 24; }
   if (rc_mem_call_count(a) != 0) { return 25; }
@@ -903,16 +856,84 @@ fn check_failure_matrix() -> int32 {
   return 0;
 }
 
+// --- 8. query results become models that can be saved ------------------------
+
+fn check_query_models() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var m: RcMeta = user_meta();
+
+  var rows: RcValue[16];
+  rows[0] = RcInt(1);
+  rows[1] = RcText("ada@example.com");
+  rows[2] = RcText("Ada");
+  rows[3] = RcInt(36);
+  rows[4] = RcBool(true);
+  rows[5] = RcFloat(9.5);
+  rows[6] = RcTime(1700000000000000);
+  rows[7] = RcInt(1);
+  rows[8] = RcInt(2);
+  rows[9] = RcText("grace@example.com");
+  rows[10] = RcText("Grace");
+  rows[11] = RcNull;
+  rows[12] = RcBool(false);
+  rows[13] = RcNull;
+  rows[14] = RcTime(1700000000000001);
+  rows[15] = RcInt(2);
+  if (rc_mem_push_rows(a, &rows[0], 2, 8) != RC_OK) { return 2; }
+
+  var q: RcQuery = rc_query_select(m);
+  defer rc_query_free(&q);
+  if (rc_query_where_cmp(&q, 4, RC_CMP_EQ, RcBool(true)) != RC_OK) { return 3; }
+  var res: RcResult;
+  if (rc_query_exec(&q, a, &res) != RC_OK) { return 4; }
+  defer rc_result_free(&res);
+  if (res.n_rows != 2) { return 5; }
+
+  var users: User[2];
+  var nulls: uint64[2];
+  var i: int32 = 0;
+  while (i < 2) {
+    memset((rawptr)&users[i], 0, (int64)sizeof(User));
+    if (rc_persist_hydrate(m, &res, i, (rawptr)&users[i], &nulls[i]) != RC_OK) { return 6; }
+    i = i + 1;
+  }
+  if (users[0].name != "Ada" || users[0].age != 36) { return 7; }
+  if (users[1].name != "Grace" || users[1].role != Role.Member) { return 8; }
+  if (!rc_nulls_has(nulls[1], 3) || !rc_nulls_has(nulls[1], 5)) { return 9; }
+  if (rc_nulls_has(nulls[0], 3)) { return 10; }
+
+  // A row from the query is a loaded entity: edit and save it.
+  var e: RcEntity = rc_entity_loaded(m, (rawptr)&users[1], nulls[1]);
+  if (e.state != RC_ST_CLEAN) { return 11; }
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_bind(&cs, (rawptr)&users[1], nulls[1]) != RC_OK) { return 12; }
+  if (rc_changeset_put_text(&cs, 3, "40") != RC_OK) { return 13; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 14; }
+  if (rc_changeset_save(a, &cs, &e) != RC_OK) { return 15; }
+  if (rc_mem_last_sql(a) != "UPDATE \"users\" SET \"age\" = ? WHERE \"id\" = ?") { return 16; }
+  if (users[1].age != 40) { return 17; }
+
+  // Out of range rows are refused.
+  var spare: User;
+  var sn: uint64 = 0;
+  if (rc_persist_hydrate(m, &res, 2, (rawptr)&spare, &sn) != RC_ERR_USAGE) { return 18; }
+  if (rc_persist_hydrate(m, &res, -1, (rawptr)&spare, &sn) != RC_ERR_USAGE) { return 19; }
+  return 0;
+}
+
 // --- runner -----------------------------------------------------------------
 //
 // One table of checks, walked by main(). The @test entry goes through the same
 // table: on head 8f14c612 the compile-time interpreter segfaults in "IR
-// lowering" when a @test *calls* these seven functions directly — the callees
+// lowering" when a @test *calls* these functions directly — the callees
 // are merged into one IR unit and the lowering crashes. A function-pointer cell
 // is the barrier that keeps each check its own unit; the checks, their order and
 // their report lines are unchanged. Reported, not papered over.
 
-const RC_CHECK_NAMES: string[7] = [
+const RC_CHECK_NAMES: string[8] = [
   "integration: migration creates the ledger and the schema",
   "integration: insert binds args and adopts the key",
   "integration: query builds the statement and binds in order",
@@ -920,9 +941,10 @@ const RC_CHECK_NAMES: string[7] = [
   "integration: relation preloads in one exec for three owners",
   "integration: delete and a conflict leave no state",
   "integration: the failure matrix never reaches the store",
+  "integration: query results become models that can be saved",
 ];
 
-var RC_CHECKS: (fn() -> int32)[7];
+var RC_CHECKS: (fn() -> int32)[8];
 
 export fn rc_checks_load() {
   RC_CHECKS[0] = &check_migration;
@@ -932,18 +954,19 @@ export fn rc_checks_load() {
   RC_CHECKS[4] = &check_relations;
   RC_CHECKS[5] = &check_delete_and_conflict;
   RC_CHECKS[6] = &check_failure_matrix;
+  RC_CHECKS[7] = &check_query_models;
 }
 
 export fn main() -> int32 {
   rc_checks_load();
   var failures: int32 = 0;
   var i: int32 = 0;
-  while (i < 7) {
+  while (i < 8) {
     var run: fn() -> int32 = RC_CHECKS[i];
     if (!rc_report(RC_CHECK_NAMES[i], run())) { failures = failures + 1; }
     i = i + 1;
   }
-  return rc_summary(failures, 7);
+  return rc_summary(failures, 8);
 }
 
 @test fn t_integration() -> int32 {

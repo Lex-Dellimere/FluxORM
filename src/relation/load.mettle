@@ -1,10 +1,8 @@
-// src/relation/load.mettle — the batch loader: one statement per relation.
+// flux_orm/relation/load.mettle — the batch loader: one statement per relation.
 //
-// This file is the whole point of Phase 4, and the whole point fits in one
-// sentence: **N owners cost one statement, not N**. It never loops over owners
-// issuing statements. It collects the distinct owner keys, binds them into one
-// `WHERE fk IN (?, ?, ...)`, runs it once, then groups the returned rows in
-// memory by the foreign key.
+// N owners cost one statement, not N. The loader collects the distinct owner
+// keys, binds them into one `WHERE fk IN (?, ?, ...)`, runs it once, then
+// groups the returned rows in memory by the foreign key.
 //
 //   HAS_MANY           1 exec   SELECT ... FROM "posts" WHERE "user_id" IN (?,...)
 //   BELONGS_TO         1 exec   SELECT ... FROM "users" WHERE "id" IN (?,...)
@@ -40,6 +38,7 @@ import "std/mem";
 import "../core/status";
 import "../core/value";
 import "../core/meta";
+import "../core/persist";
 import "../adapter/adapter";
 import "../query/builder";
 import "relation";
@@ -54,8 +53,7 @@ export struct RcRelationResult {
   n_execs: int32;      // 1 for HAS_MANY/BELONGS_TO, 2 for THROUGH, 0 for empty keys
   through: RcResult;   // THROUGH only: the mapping rows
   // Target metadata, carried so `rc_relation_hydrate` can write a model
-  // without a meta argument (its signature is fixed by the directive and has
-  // none). Nothing else is stored here: this is metadata, not a session.
+  // without a meta argument.
   meta: RcMeta;
 }
 
@@ -544,17 +542,5 @@ export fn rc_relation_hydrate(out: RcRelationResult*, group: int32, i: int32,
   var base: int32 = out->off[group];
   var n: int32 = out->off[group + 1] - base;
   if (i < 0 || i >= n) { return RC_ERR_USAGE; }
-  var row: int32 = out->idx[base + i];
-  if (row < 0 || row >= out->res.n_rows) { return RC_ERR_USAGE; }
-  if (out->res.n_cols != out->meta.n_fields) { return RC_ERR_ADAPTER; }
-
-  *nulls = 0;
-  var f: int32 = 0;
-  while (f < out->meta.n_fields) {
-    var v: RcValue = rc_result_borrow(&out->res, row, f);
-    var rc: int32 = rc_meta_set(out->meta, model, nulls, f, v);
-    if (rc != RC_OK) { return rc; }
-    f = f + 1;
-  }
-  return RC_OK;
+  return rc_persist_hydrate(out->meta, &out->res, out->idx[base + i], model, nulls);
 }

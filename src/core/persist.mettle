@@ -1,11 +1,8 @@
-// reach/core/persist.mettle — the Phase-1 write path (the straw man).
+// flux_orm/core/persist.mettle — insert, load by key, delete by key.
 //
-// This module exists so core + adapter can be tested as one thing. It builds
-// the three statements every ORM needs (insert/select-by-key/delete-by-key)
-// straight from RcMeta and binds RcValue arguments. Query/ replaces the text
-// generation in Phase 2; changeset/ replaces the "which columns changed" part
-// in Phase 3. What must *not* change is the shape: values in, rows out, no
-// cursor, no string interpolation of user data.
+// Builds the three single-row statements straight from RcMeta and binds
+// RcValue arguments: values in, rows out, no cursor, no user data in the
+// statement text. Queries are query/'s; updates are changeset/'s.
 
 import "std/mem";
 
@@ -14,7 +11,9 @@ import "value";
 import "meta";
 import "entity";
 import "buf";
+import "clock";
 import "../adapter/adapter";
+import "../adapter/stmt";
 
 fn rc_persist_put_columns(b: RcBuf*, m: RcMeta) -> int32 {
   var i: int32 = 0;
@@ -38,7 +37,8 @@ fn rc_persist_put_table(b: RcBuf*, m: RcMeta) -> int32 {
 
 // Inserts one entity. An auto primary key whose null bit is set is omitted
 // from the column list and read back from the result. `e.nulls` records
-// which other fields are NULL, and those bind as RcNull.
+// which other fields are NULL, and those bind as RcNull. A version field
+// always starts at 1, and created/updated timestamps are set from core/clock.
 export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   if (a == 0 || e == 0) { return RC_ERR_USAGE; }
   if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
@@ -46,6 +46,24 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   var bad: int32 = -1;
   var rc: int32 = rc_meta_check(m, &bad);
   if (rc != RC_OK) { return rc; }
+  if (rc_meta_any(m, RC_F_CREATED | RC_F_UPDATED)) {
+    var now: int64 = 0;
+    rc = rc_clock_now(&now);
+    if (rc != RC_OK) { return rc; }
+    var t: int32 = 0;
+    while (t < m.n_fields) {
+      if ((m.fields[t].flags & (RC_F_CREATED | RC_F_UPDATED)) != 0) {
+        rc = rc_meta_set(m, e->model, &e->nulls, t, RcTime(now));
+        if (rc != RC_OK) { return rc; }
+      }
+      t = t + 1;
+    }
+  }
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_meta_set(m, e->model, &e->nulls, vf, RcInt(1));
+    if (rc != RC_OK) { return rc; }
+  }
 
   var buf: RcBuf = rc_buf_new(128);
   if (buf.data == 0) { return RC_ERR_NOMEM; }
@@ -58,6 +76,9 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   rc = rc_buf_put(&buf, " (");
   if (rc != RC_OK) { return rc; }
 
+  var st: RcStmt = rc_stmt_new(RC_OP_INSERT, m.table);
+  defer rc_stmt_free(&st);
+  st.n_rows = 1;
   var first: bool = true;
   var n_args: int32 = 0;
   var i: int32 = 0;
@@ -72,6 +93,7 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
         if (rc != RC_OK) { return rc; }
       }
       rc = rc_buf_ident(&buf, m.fields[i].column);
+      if (rc == RC_OK) { rc = rc_stmt_col(&st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
       if (rc != RC_OK) { return rc; }
       first = false;
       n_args = n_args + 1;
@@ -120,7 +142,7 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   }
 
   var res: RcResult;
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), args, n_args, &res);
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, args, n_args, &res);
   if (rc != RC_OK) { return rc; }
   defer rc_result_free(&res);
 
@@ -134,6 +156,25 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   return RC_OK;
 }
 
+// Fills `model` from row `row` of a result whose columns are in RcMeta order,
+// which is what rc_query_select produces. Text fields borrow from `res`, so
+// `res` must outlive the model (the same rule as rc_persist_load).
+export fn rc_persist_hydrate(m: RcMeta, res: RcResult*, row: int32, model: rawptr,
+                             nulls: uint64*) -> int32 {
+  if (res == 0 || model == 0 || nulls == 0) { return RC_ERR_USAGE; }
+  if (row < 0 || row >= res->n_rows) { return RC_ERR_USAGE; }
+  if (res->n_cols != m.n_fields) { return RC_ERR_ADAPTER; }
+  *nulls = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var v: RcValue = rc_result_borrow(res, row, i);
+    var rc: int32 = rc_meta_set(m, model, nulls, i, v);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
 // Loads one row by primary key into `model`, which must already be zeroed.
 //
 // Lifetime, and it is the one thing to get right here: a model's string fields
@@ -141,7 +182,7 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
 // instead of copying them, and hands the result back through `owner`.
 // `*owner` must outlive every use of the model, then be freed with
 // rc_result_free. A copy per field would need an owner list inside the plain
-// Mettle struct, which is exactly what Phase 2's session arena replaces.
+// Mettle struct; a session arena is the planned owner.
 export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
                           nulls: uint64*, owner: RcResult*) -> int32 {
   if (a == 0 || model == 0 || nulls == 0 || owner == 0) { return RC_ERR_USAGE; }
@@ -168,30 +209,31 @@ export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
   rc = rc_buf_put(&buf, " = ? LIMIT 1");
   if (rc != RC_OK) { return rc; }
 
+  var st: RcStmt = rc_stmt_new(RC_OP_SELECT, m.table);
+  defer rc_stmt_free(&st);
+  var c: int32 = 0;
+  while (c < m.n_fields) {
+    rc = rc_stmt_col(&st, m.fields[c].column, m.fields[c].ty, m.fields[c].flags);
+    if (rc != RC_OK) { return rc; }
+    c = c + 1;
+  }
+  rc = rc_stmt_term(&st, m.fields[m.pk].column, RC_W_EQ, 0, 1);
+  if (rc != RC_OK) { return rc; }
+  st.limit = 1;
+
   var args: RcValue[1];
   args[0] = pk;
   var res: RcResult;
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), &args[0], 1, &res);
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, &args[0], 1, &res);
   if (rc != RC_OK) { return rc; }
   if (res.n_rows == 0) {
     rc_result_free(&res);
     return RC_ERR_NOT_FOUND;
   }
-  if (res.n_cols != m.n_fields) {
+  rc = rc_persist_hydrate(m, &res, 0, model, nulls);
+  if (rc != RC_OK) {
     rc_result_free(&res);
-    return RC_ERR_ADAPTER;
-  }
-
-  *nulls = 0;
-  var i: int32 = 0;
-  while (i < m.n_fields) {
-    var v: RcValue = rc_result_borrow(&res, 0, i);
-    rc = rc_meta_set(m, model, nulls, i, v);
-    if (rc != RC_OK) {
-      rc_result_free(&res);
-      return rc;
-    }
-    i = i + 1;
+    return rc;
   }
   *owner = res;
   return RC_OK;
@@ -219,12 +261,33 @@ export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
   rc = rc_buf_put(&buf, " = ?");
   if (rc != RC_OK) { return rc; }
 
-  var args: RcValue[1];
+  // A versioned row is only deleted while it still holds the version this
+  // model read; otherwise someone changed it first and it is kept.
+  var st: RcStmt = rc_stmt_new(RC_OP_DELETE, m.table);
+  defer rc_stmt_free(&st);
+  rc = rc_stmt_term(&st, m.fields[m.pk].column, RC_W_EQ, 0, 1);
+  if (rc != RC_OK) { return rc; }
+  var args: RcValue[2];
   args[0] = rc_entity_pk(e);
+  var n_args: int32 = 1;
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_buf_put(&buf, " AND ");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_ident(&buf, m.fields[vf].column);
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_put(&buf, " = ?");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_entity_get(e, vf, &args[1]);
+    if (rc == RC_OK) { rc = rc_stmt_term(&st, m.fields[vf].column, RC_W_EQ, 1, 1); }
+    if (rc != RC_OK) { return rc; }
+    n_args = 2;
+  }
   var res: RcResult;
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), &args[0], 1, &res);
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, &args[0], n_args, &res);
   if (rc != RC_OK) { return rc; }
   defer rc_result_free(&res);
+  if (vf >= 0 && res.affected == 0) { return RC_ERR_CONFLICT; }
   e->state = RC_ST_DELETED;
   return RC_OK;
 }

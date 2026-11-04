@@ -1,0 +1,118 @@
+// flux_orm/migration/schema.mettle — schema changes for up and down steps,
+// after Ecto's drop table, alter table add, create index and drop index.
+//
+// Each one builds the SQL text and the same change as an RcStmt and runs it
+// through rc_adapter_run, so a migration callback works with text stores and
+// with MeoSQL alike. All of them are idempotent where SQL allows it
+// (IF EXISTS / IF NOT EXISTS).
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/buf";
+import "../adapter/adapter";
+import "../adapter/stmt";
+import "ddl";
+
+fn rc_schema_run(a: RcAdapter*, b: RcBuf*, st: RcStmt*) -> int32 {
+  var res: RcResult;
+  var rc: int32 = rc_adapter_run(a, rc_buf_text(b), st, (RcValue*)0, 0, &res);
+  if (rc != RC_OK) { return rc; }
+  rc_result_free(&res);
+  return RC_OK;
+}
+
+// DROP TABLE IF EXISTS "table".
+export fn rc_migration_drop(a: RcAdapter*, m: RcMeta) -> int32 {
+  if (a == 0 || m.table.length == (uint64)0) { return RC_ERR_USAGE; }
+  var b: RcBuf = rc_buf_new(64);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  var rc: int32 = rc_buf_put(&b, "DROP TABLE IF EXISTS ");
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, m.table); }
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt = rc_stmt_new(RC_OP_DROP, m.table);
+  defer rc_stmt_free(&st);
+  st.if_not_exists = true;
+  return rc_schema_run(a, &b, &st);
+}
+
+// ALTER TABLE "table" ADD COLUMN for one field of m. A key, NOT NULL or
+// UNIQUE column is refused (RC_ERR_UNSUPPORTED): existing rows have no value
+// for it, and flux_orm has no column defaults yet.
+export fn rc_migration_add_column(a: RcAdapter*, m: RcMeta, field: int32) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= m.n_fields) { return RC_ERR_USAGE; }
+  var f: RcField = m.fields[field];
+  if ((f.flags & (RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE)) != 0) { return RC_ERR_UNSUPPORTED; }
+  var ty: string = rc_migration_affinity(f.ty);
+  if (ty.length == (uint64)0) { return RC_ERR_UNSUPPORTED; }
+  var b: RcBuf = rc_buf_new(96);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  rc = rc_buf_put(&b, "ALTER TABLE ");
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, m.table); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " ADD COLUMN "); }
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, f.column); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " "); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, ty); }
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt = rc_stmt_new(RC_OP_ADD_COLUMN, m.table);
+  defer rc_stmt_free(&st);
+  rc = rc_stmt_col(&st, f.column, f.ty, 0);
+  if (rc != RC_OK) { return rc; }
+  return rc_schema_run(a, &b, &st);
+}
+
+// CREATE [UNIQUE] INDEX IF NOT EXISTS "name" ON "table" ("a", "b", ...).
+export fn rc_migration_create_index(a: RcAdapter*, m: RcMeta, name: string,
+                                    fields: int32*, n: int32, unique: bool) -> int32 {
+  if (a == 0 || fields == 0 || n <= 0 || name.length == (uint64)0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+  var b: RcBuf = rc_buf_new(128);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  var st: RcStmt = rc_stmt_new(RC_OP_CREATE_INDEX, m.table);
+  defer rc_stmt_free(&st);
+  st.name = name;
+  st.unique = unique;
+  st.if_not_exists = true;
+  rc = rc_buf_put(&b, "CREATE ");
+  if (rc == RC_OK && unique) { rc = rc_buf_put(&b, "UNIQUE "); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, "INDEX IF NOT EXISTS "); }
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, name); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " ON "); }
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, m.table); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " ("); }
+  var i: int32 = 0;
+  while (rc == RC_OK && i < n) {
+    var f: int32 = fields[i];
+    if (f < 0 || f >= m.n_fields) { return RC_ERR_USAGE; }
+    if (i > 0) { rc = rc_buf_put(&b, ", "); }
+    if (rc == RC_OK) { rc = rc_buf_ident(&b, m.fields[f].column); }
+    if (rc == RC_OK) { rc = rc_stmt_col(&st, m.fields[f].column, m.fields[f].ty, 0); }
+    i = i + 1;
+  }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, ")"); }
+  if (rc != RC_OK) { return rc; }
+  return rc_schema_run(a, &b, &st);
+}
+
+// DROP INDEX IF EXISTS "name". `m` names the table the index belongs to.
+export fn rc_migration_drop_index(a: RcAdapter*, m: RcMeta, name: string) -> int32 {
+  if (a == 0 || name.length == (uint64)0) { return RC_ERR_USAGE; }
+  var b: RcBuf = rc_buf_new(64);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  var rc: int32 = rc_buf_put(&b, "DROP INDEX IF EXISTS ");
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, name); }
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt = rc_stmt_new(RC_OP_DROP_INDEX, m.table);
+  defer rc_stmt_free(&st);
+  st.name = name;
+  st.if_not_exists = true;
+  return rc_schema_run(a, &b, &st);
+}

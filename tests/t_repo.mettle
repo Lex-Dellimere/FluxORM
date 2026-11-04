@@ -1,0 +1,304 @@
+// tests/t_repo.mettle — the repo: insert, get, one, all, update, delete
+// through a session, and the session keeping loaded rows alive.
+
+import "std/mem";
+
+import "../src/flux_orm";
+import "../src/adapter/mem";
+import "models";
+import "harness";
+
+const USERS_SQL: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\"";
+
+fn new_adapter(out: RcAdapter**) -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return RC_ERR_NOMEM; }
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
+    rc_mem_free(a);
+    return RC_ERR_ADAPTER;
+  }
+  *out = a;
+  return RC_OK;
+}
+
+// Two user rows as the store returns them; text is cloned by the adapter.
+fn push_users(a: RcAdapter*) -> int32 {
+  var rows: RcValue[16];
+  rows[0] = RcInt(1);
+  rows[1] = RcText("ada@example.com");
+  rows[2] = RcText("Ada");
+  rows[3] = RcInt(36);
+  rows[4] = RcBool(true);
+  rows[5] = RcFloat(9.5);
+  rows[6] = RcTime(1700000000000000);
+  rows[7] = RcInt(1);
+  rows[8] = RcInt(2);
+  rows[9] = RcText("grace@example.com");
+  rows[10] = RcText("Grace");
+  rows[11] = RcNull;
+  rows[12] = RcBool(true);
+  rows[13] = RcNull;
+  rows[14] = RcTime(1700000000000001);
+  rows[15] = RcInt(2);
+  return rc_mem_push_rows(a, &rows[0], 2, 8);
+}
+
+// --- 1. insert, with and without a changeset ---------------------------------
+
+fn check_insert() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = post_meta();
+
+  var p: Post;
+  memset((rawptr)&p, 0, (int64)sizeof(Post));
+  var e: RcEntity = rc_entity_new(m, (rawptr)&p);
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_put_text(&cs, 1, "7") != RC_OK) { return 2; }
+  if (rc_changeset_put_text(&cs, 2, "Hello") != RC_OK) { return 3; }
+  if (rc_mem_push_ok(a, 1, 31) != RC_OK) { return 4; }
+  if (rc_repo_insert(&s, &cs, &e) != RC_OK) { return 5; }
+  if (p.id != 31 || p.user_id != 7 || p.title != "Hello") { return 6; }
+  if (e.state != RC_ST_CLEAN) { return 7; }
+
+  // Inserting again is refused: the entity is in the store now.
+  if (rc_repo_insert(&s, &cs, &e) != RC_ERR_USAGE) { return 8; }
+
+  // A changeset missing a NOT NULL field is refused before anything is sent.
+  var p2: Post;
+  memset((rawptr)&p2, 0, (int64)sizeof(Post));
+  var e2: RcEntity = rc_entity_new(m, (rawptr)&p2);
+  var bad: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&bad);
+  if (rc_changeset_put_null(&bad, 2) != RC_ERR_CONSTRAINT) { return 9; }
+  var calls: int32 = rc_mem_call_count(a);
+  if (rc_repo_insert(&s, &bad, &e2) != RC_ERR_USAGE) { return 10; }
+  if (rc_mem_call_count(a) != calls) { return 11; }
+
+  // No changeset: the entity is inserted as it is.
+  if (rc_entity_set(&e2, 1, RcInt(7)) != RC_OK) { return 12; }
+  if (rc_entity_set(&e2, 2, RcText("Bye")) != RC_OK) { return 13; }
+  if (rc_mem_push_ok(a, 1, 32) != RC_OK) { return 14; }
+  var none: RcChangeset* = 0;
+  if (rc_repo_insert(&s, none, &e2) != RC_OK) { return 15; }
+  if (p2.id != 32) { return 16; }
+  return 0;
+}
+
+// --- 2. get, then update and delete what was loaded --------------------------
+
+fn check_get_update_delete() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = user_meta();
+
+  if (push_users(a) != RC_OK) { return 2; }
+  var u: User;
+  var e: RcEntity;
+  if (rc_repo_get(&s, m, RcInt(1), (rawptr)&u, &e) != RC_OK) { return 3; }
+  if (rc_mem_last_sql(a) != USERS_SQL + " WHERE \"id\" = ? LIMIT 1") { return 4; }
+  if (u.name != "Ada" || e.state != RC_ST_CLEAN) { return 5; }
+  if (rc_session_kept(&s) != 1) { return 6; }
+
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_bind(&cs, (rawptr)&u, e.nulls) != RC_OK) { return 7; }
+  if (rc_changeset_put_text(&cs, 2, "Ada L.") != RC_OK) { return 8; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 9; }
+  if (rc_repo_update(&s, &cs, &e) != RC_OK) { return 10; }
+  if (rc_mem_last_sql(a) != "UPDATE \"users\" SET \"name\" = ? WHERE \"id\" = ?") { return 11; }
+
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 12; }
+  if (rc_repo_delete(&s, &e) != RC_OK) { return 13; }
+  if (e.state != RC_ST_DELETED) { return 14; }
+
+  // No such row.
+  var miss: User;
+  var me: RcEntity;
+  if (rc_repo_get(&s, m, RcInt(99), (rawptr)&miss, &me) != RC_ERR_NOT_FOUND) { return 15; }
+  if (rc_session_kept(&s) != 1) { return 16; }
+  return 0;
+}
+
+// --- 3. all and one -------------------------------------------------------------
+
+fn check_all_one() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = user_meta();
+
+  if (push_users(a) != RC_OK) { return 2; }
+  var q: RcQuery = rc_query_select(m);
+  defer rc_query_free(&q);
+  if (rc_query_where_cmp(&q, 4, RC_CMP_EQ, RcBool(true)) != RC_OK) { return 3; }
+  var rows: RcRows;
+  if (rc_repo_all(&s, &q, &rows) != RC_OK) { return 4; }
+  if (rows.n != 2) { return 5; }
+  var users: User[2];
+  var es: RcEntity[2];
+  var i: int32 = 0;
+  while (i < rows.n) {
+    if (rc_rows_get(&rows, i, (rawptr)&users[i], &es[i]) != RC_OK) { return 6; }
+    i = i + 1;
+  }
+  if (users[0].name != "Ada" || users[1].name != "Grace") { return 7; }
+  if (!rc_nulls_has(es[1].nulls, 3)) { return 8; }
+  if (es[1].state != RC_ST_CLEAN) { return 9; }
+  if (rc_rows_get(&rows, 2, (rawptr)&users[0], &es[0]) != RC_ERR_USAGE) { return 10; }
+
+  // one: exactly one row, or a code that says why not.
+  var u: User;
+  var e: RcEntity;
+  if (push_users(a) != RC_OK) { return 11; }
+  if (rc_repo_one(&s, &q, (rawptr)&u, &e) != RC_ERR_USAGE) { return 12; }
+  if (rc_repo_one(&s, &q, (rawptr)&u, &e) != RC_ERR_NOT_FOUND) { return 13; }
+  var one: RcValue[8];
+  one[0] = RcInt(3);
+  one[1] = RcText("lin@example.com");
+  one[2] = RcText("Lin");
+  one[3] = RcInt(29);
+  one[4] = RcBool(true);
+  one[5] = RcNull;
+  one[6] = RcTime(1700000000000002);
+  one[7] = RcInt(2);
+  if (rc_mem_push_rows(a, &one[0], 1, 8) != RC_OK) { return 14; }
+  if (rc_repo_one(&s, &q, (rawptr)&u, &e) != RC_OK) { return 15; }
+  if (u.name != "Lin" || u.id != 3) { return 16; }
+  return 0;
+}
+
+// --- 4. the session keeps loaded text alive --------------------------------------
+
+fn check_kept_rows() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = user_meta();
+
+  if (push_users(a) != RC_OK) { return 2; }
+  var u: User;
+  var e: RcEntity;
+  if (rc_repo_get(&s, m, RcInt(1), (rawptr)&u, &e) != RC_OK) { return 3; }
+  // Other statements run and allocate; the model's text still reads back.
+  var q: RcQuery = rc_query_select(m);
+  defer rc_query_free(&q);
+  var i: int32 = 0;
+  while (i < 20) {
+    if (push_users(a) != RC_OK) { return 4; }
+    var rows: RcRows;
+    if (rc_repo_all(&s, &q, &rows) != RC_OK) { return 5; }
+    i = i + 1;
+  }
+  if (rc_session_kept(&s) != 21) { return 6; }
+  if (u.email != "ada@example.com" || u.name != "Ada") { return 7; }
+  rc_session_clear(&s);
+  if (rc_session_kept(&s) != 0) { return 8; }
+  return 0;
+}
+
+// --- 5. update_all, delete_all, count ---------------------------------------------
+
+fn check_bulk() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = user_meta();
+
+  // Deactivate every user created before a cutoff.
+  var vals: RcValue[8];
+  vals[4] = RcBool(false);
+  var up: RcQuery = rc_query_update_all(m, rc_nulls_set((uint64)0, 4), &vals[0]);
+  defer rc_query_free(&up);
+  if (up.err != RC_OK) { return 2; }
+  var n: int32 = 0;
+  if (rc_repo_update_all(&s, &up, &n) != RC_ERR_USAGE) { return 3; }  // no WHERE yet
+  if (rc_mem_call_count(a) != 0) { return 4; }
+  if (rc_query_where_cmp(&up, 6, RC_CMP_LT, RcTime(1700000000000000)) != RC_OK) { return 5; }
+  if (rc_mem_push_ok(a, 3, 0) != RC_OK) { return 6; }
+  if (rc_repo_update_all(&s, &up, &n) != RC_OK) { return 7; }
+  if (n != 3) { return 8; }
+  if (rc_mem_last_sql(a) != "UPDATE \"users\" SET \"active\" = ? WHERE \"created_at\" < ?") { return 9; }
+  if (!rc_value_same(rc_mem_last_args(a)[0], RcBool(false))) { return 10; }
+  if (!rc_value_same(rc_mem_last_args(a)[1], RcTime(1700000000000000))) { return 11; }
+
+  // A versioned table cannot bump each row's version with one value.
+  var nv: RcValue[3];
+  nv[1] = RcText("x");
+  var vq: RcQuery = rc_query_update_all(note_meta(), rc_nulls_set((uint64)0, 1), &nv[0]);
+  defer rc_query_free(&vq);
+  if (vq.err != RC_ERR_UNSUPPORTED) { return 12; }
+
+  // updated_at is set from the clock, and needs one.
+  var tv: RcValue[4];
+  tv[1] = RcText("done");
+  var tmask: uint64 = rc_nulls_set((uint64)0, 1);
+  rc_clock_clear();
+  var nq: RcQuery = rc_query_update_all(task_meta(), tmask, &tv[0]);
+  defer rc_query_free(&nq);
+  if (nq.err != RC_ERR_USAGE) { return 13; }
+  rc_clock_set(&test_clock);
+  defer rc_clock_clear();
+  var tq: RcQuery = rc_query_update_all(task_meta(), tmask, &tv[0]);
+  defer rc_query_free(&tq);
+  var ids: RcValue[2];
+  ids[0] = RcInt(1);
+  ids[1] = RcInt(2);
+  if (rc_query_where_in(&tq, 0, &ids[0], 2) != RC_OK) { return 14; }
+  if (rc_query_sql(&tq) != "UPDATE \"tasks\" SET \"title\" = ?, \"updated_at\" = ? WHERE \"id\" IN (?, ?)") { return 15; }
+  if (!rc_value_same(rc_query_args(&tq)[1], RcTime(TEST_NOW))) { return 16; }
+
+  // delete_all needs a WHERE too.
+  var dq: RcQuery = rc_query_delete(m);
+  defer rc_query_free(&dq);
+  if (rc_repo_delete_all(&s, &dq, &n) != RC_ERR_USAGE) { return 17; }
+  if (rc_query_where_eq(&dq, 4, RcBool(false)) != RC_OK) { return 18; }
+  if (rc_mem_push_ok(a, 2, 0) != RC_OK) { return 19; }
+  if (rc_repo_delete_all(&s, &dq, &n) != RC_OK || n != 2) { return 20; }
+  if (rc_mem_last_sql(a) != "DELETE FROM \"users\" WHERE \"active\" = ?") { return 21; }
+
+  // count: one integer cell; SELECT-only clauses are refused.
+  var cq: RcQuery = rc_query_count(m);
+  defer rc_query_free(&cq);
+  if (rc_query_where_cmp(&cq, 3, RC_CMP_GE, RcInt(18)) != RC_OK) { return 22; }
+  if (rc_query_order_by(&cq, 0, true) != RC_ERR_USAGE) { return 23; }
+  if (rc_query_sql(&cq) != "SELECT COUNT(*) FROM \"users\" WHERE \"age\" >= ?") { return 24; }
+  var cell: RcValue[1];
+  cell[0] = RcInt(5);
+  if (rc_mem_push_rows(a, &cell[0], 1, 1) != RC_OK) { return 25; }
+  var count: int64 = 0;
+  if (rc_repo_count(&s, &cq, &count) != RC_OK || count != 5) { return 26; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("repo: insert with and without a changeset", check_insert())) { failures = failures + 1; }
+  if (!rc_report("repo: get, update and delete", check_get_update_delete())) { failures = failures + 1; }
+  if (!rc_report("repo: all and one", check_all_one())) { failures = failures + 1; }
+  if (!rc_report("repo: the session keeps loaded rows", check_kept_rows())) { failures = failures + 1; }
+  if (!rc_report("repo: update_all, delete_all and count", check_bulk())) { failures = failures + 1; }
+  return rc_summary(failures, 5);
+}
+
+@test fn t_repo() -> int32 {
+  if (check_insert() != 0) { return 1; }
+  if (check_get_update_delete() != 0) { return 2; }
+  if (check_all_one() != 0) { return 3; }
+  if (check_kept_rows() != 0) { return 4; }
+  if (check_bulk() != 0) { return 5; }
+  return 0;
+}

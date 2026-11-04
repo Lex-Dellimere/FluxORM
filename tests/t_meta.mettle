@@ -1,7 +1,7 @@
 // tests/t_meta.mettle — model metadata.
 //
-// Check 3 (the generated registry is complete and self-consistent) and check 4
-// (typed access, NULL bitmap, range rejection). If these pass, the ORM knows a
+// The generated registry is complete and self-consistent, and typed access,
+// the NULL bitmap and range rejection work. If these pass, the ORM knows a
 // struct's shape without a single hand-written offset and can refuse a bad
 // table before it ever reaches the store.
 
@@ -241,6 +241,40 @@ fn check_validation() -> int32 {
   f[2].ty = RC_T_UNSUPPORTED;
   if (rc_meta_check(m, &bad) != RC_ERR_UNSUPPORTED) { return 10; }
   if (bad != 2) { return 11; }
+
+  // Version: one integer NOT NULL field, never the primary key.
+  valid_fields(&f[0]);
+  f[1].flags = RC_F_VERSION | RC_F_NOT_NULL;
+  if (rc_meta_check(m, (int32*)0) != RC_OK) { return 12; }
+  if (rc_meta_version(m) != 1) { return 13; }
+  f[1].flags = RC_F_VERSION;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 14; }
+  f[1].flags = RC_F_VERSION | RC_F_NOT_NULL;
+  f[1].ty = RC_T_TEXT;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_UNSUPPORTED) { return 15; }
+  valid_fields(&f[0]);
+  f[1].flags = RC_F_VERSION | RC_F_NOT_NULL;
+  f[2].flags = RC_F_VERSION | RC_F_NOT_NULL;
+  if (rc_meta_check(m, &bad) != RC_ERR_USAGE) { return 16; }
+  if (bad != 2) { return 17; }
+  valid_fields(&f[0]);
+  f[0].flags = RC_F_PK | RC_F_VERSION | RC_F_NOT_NULL;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 18; }
+  if (note_meta_status() != RC_OK) { return 19; }
+
+  // Timestamps: RC_T_TIME only, not both flags on one field, never the key.
+  valid_fields(&f[0]);
+  f[1].ty = RC_T_TIME;
+  f[1].flags = RC_F_CREATED;
+  f[2].ty = RC_T_TIME;
+  f[2].flags = RC_F_UPDATED;
+  if (rc_meta_check(m, (int32*)0) != RC_OK) { return 22; }
+  f[1].ty = RC_T_I64;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_UNSUPPORTED) { return 23; }
+  f[1].ty = RC_T_TIME;
+  f[1].flags = RC_F_CREATED | RC_F_UPDATED;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 24; }
+  if (task_meta_status() != RC_OK) { return 25; }
 
   // A slice (uint8[]) has no owned representation and is refused at startup.
   if (doc_field_count() != 2) { return 20; }

@@ -154,8 +154,134 @@ export fn post_meta_status() -> int32 {
   return rc_meta_check(POST_META, 0);
 }
 
+// --- Note: a versioned table (RC_F_VERSION) -----------------------------------
+
+export struct Note {
+  id: int64;
+  text: string;
+  version: int64;
+}
+
+var NOTE_FIELDS: RcField[3];
+var NOTE_META: RcMeta;
+var NOTE_READY: bool = false;
+
+const NOTE_COLS: RcColumn[3] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
+  { index: 1, column: "text", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 2, column: "version", ty: RC_T_I64, flags: RC_F_VERSION | RC_F_NOT_NULL },
+];
+
+fn note_fields(out: RcField*) -> int32 {
+  var i: int32 = 0;
+  comptime for f in typeof(Note).fields {
+    out[i].name = f.name;
+    out[i].column = f.name;
+    out[i].kind = f.type.kind;
+    out[i].ty = rc_kind_type(f.type.kind);
+    out[i].offset = (int32)f.offset;
+    out[i].size = (int32)f.type.size;
+    out[i].flags = 0;
+    i = i + 1;
+  }
+  return i;
+}
+
+fn note_build() -> int32 {
+  var i: int32 = note_fields(&NOTE_FIELDS[0]);
+  NOTE_META.table = "notes";
+  NOTE_META.name = "Note";
+  NOTE_META.size = (int32)sizeof(Note);
+  NOTE_META.fields = &NOTE_FIELDS[0];
+  NOTE_META.n_fields = i;
+  NOTE_META.pk = -1;
+  return rc_meta_finalize(&NOTE_META, &NOTE_COLS[0], 3);
+}
+
+export fn note_meta() -> RcMeta {
+  if (!NOTE_READY) {
+    note_build();
+    NOTE_READY = true;
+  }
+  return NOTE_META;
+}
+
+export fn note_meta_status() -> int32 {
+  if (!NOTE_READY) {
+    note_build();
+    NOTE_READY = true;
+  }
+  return rc_meta_check(NOTE_META, 0);
+}
+
+// --- Task: created/updated timestamps --------------------------------------
+
+export struct Task {
+  id: int64;
+  title: string;
+  created_at: int64;
+  updated_at: int64;
+}
+
+var TASK_FIELDS: RcField[4];
+var TASK_META: RcMeta;
+var TASK_READY: bool = false;
+
+const TASK_COLS: RcColumn[4] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
+  { index: 1, column: "title", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 2, column: "created_at", ty: RC_T_TIME, flags: RC_F_CREATED | RC_F_NOT_NULL },
+  { index: 3, column: "updated_at", ty: RC_T_TIME, flags: RC_F_UPDATED | RC_F_NOT_NULL },
+];
+
+fn task_fields(out: RcField*) -> int32 {
+  var i: int32 = 0;
+  comptime for f in typeof(Task).fields {
+    out[i].name = f.name;
+    out[i].column = f.name;
+    out[i].kind = f.type.kind;
+    out[i].ty = rc_kind_type(f.type.kind);
+    out[i].offset = (int32)f.offset;
+    out[i].size = (int32)f.type.size;
+    out[i].flags = 0;
+    i = i + 1;
+  }
+  return i;
+}
+
+fn task_build() -> int32 {
+  var i: int32 = task_fields(&TASK_FIELDS[0]);
+  TASK_META.table = "tasks";
+  TASK_META.name = "Task";
+  TASK_META.size = (int32)sizeof(Task);
+  TASK_META.fields = &TASK_FIELDS[0];
+  TASK_META.n_fields = i;
+  TASK_META.pk = -1;
+  return rc_meta_finalize(&TASK_META, &TASK_COLS[0], 4);
+}
+
+export fn task_meta() -> RcMeta {
+  if (!TASK_READY) {
+    task_build();
+    TASK_READY = true;
+  }
+  return TASK_META;
+}
+
+export fn task_meta_status() -> int32 {
+  if (!TASK_READY) {
+    task_build();
+    TASK_READY = true;
+  }
+  return rc_meta_check(TASK_META, 0);
+}
+
+// A fixed clock for the timestamp tests.
+export var TEST_NOW: int64 = 1700000000000000;
+export fn test_clock() -> int64 { return TEST_NOW; }
+
 // --- Doc: a field type the wire cannot carry --------------------------------
-// `uint8[]` is a slice, kind Slice. dacor's record codec has a BLOB, but a
+// `uint8[]` is a slice, kind Slice. MeoSQL's record codec has a BLOB, but a
 // Mettle slice is a (ptr,len) view with no owner, so mapping it silently would
 // be a lifetime bug. The metadata validator must refuse it at startup.
 

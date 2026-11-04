@@ -1,4 +1,4 @@
-// tests/t_migration.mettle — Phase 5: up-only migrations against the seam.
+// tests/t_migration.mettle — up-only migrations through the adapter.
 //
 // Every statement is asserted verbatim. "Close enough SQL" is how an ORM ends
 // up quoting an identifier with user data in it, and a ledger whose text drifts
@@ -19,12 +19,13 @@ import "../src/adapter/adapter";
 import "../src/adapter/mem";
 import "../src/migration/ddl";
 import "../src/migration/version";
+import "../src/migration/schema";
 import "models";
 import "harness";
 
-const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_reach_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
-const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_reach_migrations\" ORDER BY \"version\" ASC";
-const LEDGER_INSERT: string = "INSERT INTO \"_reach_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
+const LEDGER_DDL: string = "CREATE TABLE IF NOT EXISTS \"_flux_orm_migrations\" (\"version\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"applied_at\" INTEGER NOT NULL)";
+const LEDGER_SELECT: string = "SELECT \"version\" FROM \"_flux_orm_migrations\" ORDER BY \"version\" ASC";
+const LEDGER_INSERT: string = "INSERT INTO \"_flux_orm_migrations\" (\"version\", \"name\", \"applied_at\") VALUES (?, ?, ?)";
 
 const USER_DDL: string = "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" INTEGER PRIMARY KEY, \"email\" TEXT NOT NULL UNIQUE, \"name\" TEXT NOT NULL, \"age\" INTEGER, \"active\" INTEGER NOT NULL, \"score\" REAL, \"created_at\" INTEGER NOT NULL, \"role\" INTEGER NOT NULL)";
 const POST_DDL: string = "CREATE TABLE IF NOT EXISTS \"posts\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"title\" TEXT NOT NULL, \"body\" TEXT, \"published_at\" INTEGER)";
@@ -41,7 +42,7 @@ const TWO: RcMigration[2] = [
 fn new_adapter(out: RcAdapter**) -> int32 {
   var a: RcAdapter* = rc_mem_adapter();
   if (a == 0) { return RC_ERR_NOMEM; }
-  if (rc_adapter_open(a, "mem://reach") != RC_OK) {
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
     rc_mem_free(a);
     return RC_ERR_ADAPTER;
   }
@@ -83,7 +84,7 @@ fn rc_mig_flaky(inner: RcAdapter*, fail_at: int32) -> RcAdapter {
 // --- 1. ledger statements ----------------------------------------------------
 
 fn check_ledger_statements() -> int32 {
-  if (RC_MIG_LEDGER != "_reach_migrations") { return 1; }
+  if (RC_MIG_LEDGER != "_flux_orm_migrations") { return 1; }
 
   var b: RcBuf = rc_buf_new(256);
   if (b.data == 0) { return 2; }
@@ -398,17 +399,119 @@ fn check_invalid_sets() -> int32 {
 
 // --- 8. down is unsupported -------------------------------------------------
 
-fn check_down_unsupported() -> int32 {
+const THREE: RcMigration[3] = [
+  { version: 1, name: "users", up_sql: "CREATE TABLE a (x INTEGER)", down_sql: "DROP TABLE a" },
+  { version: 2, name: "posts", up_sql: "CREATE TABLE b (x INTEGER)", down_sql: "DROP TABLE b" },
+  { version: 3, name: "tags", up_sql: "CREATE TABLE c (x INTEGER)", down_sql: "DROP TABLE c" },
+];
+
+const LEDGER_DELETE: string = "DELETE FROM \"_flux_orm_migrations\" WHERE \"version\" = ?";
+
+// The ledger as the store reports it: DDL, then the applied versions.
+fn push_ledger(a: RcAdapter*, versions: RcValue*, n: int32) -> int32 {
+  if (rc_mem_push_ok(a, 0, 0) != RC_OK) { return 1; }
+  if (n == 0) { return rc_mem_push_ok(a, 0, 0); }
+  return rc_mem_push_rows(a, versions, n, 1);
+}
+
+fn check_down() -> int32 {
   var a: RcAdapter* = 0;
   if (new_adapter(&a) != RC_OK) { return 1; }
   defer rc_mem_free(a);
+  var s: RcMigrationSet = rc_migration_set(&THREE[0], 3);
+  var all: RcValue[3];
+  all[0] = RcInt(1);
+  all[1] = RcInt(2);
+  all[2] = RcInt(3);
 
-  var s: RcMigrationSet = rc_migration_set(&TWO[0], 2);
-  if (rc_migration_down(a, &s, 2) != RC_ERR_UNSUPPORTED) { return 2; }
-  if (rc_migration_down(a, &s, 1) != RC_ERR_UNSUPPORTED) { return 3; }
-  // Up-only means down never reaches the store.
-  if (rc_mem_call_count(a) != 0) { return 4; }
-  if (rc_mem_tx_depth(a) != 0) { return 5; }
+  // Roll back to 1: version 3, then 2, each with its own transaction.
+  if (push_ledger(a, &all[0], 3) != 0) { return 2; }
+  var rep: RcMigrationReport;
+  if (rc_migration_down(a, &s, 1, &rep) != RC_OK) { return 3; }
+  if (rep.applied != 2 || rep.up_to != 1) { return 4; }
+  if (rc_mem_commits(a) != 2) { return 5; }
+  // ledger DDL, SELECT, then (down, DELETE) x2.
+  if (rc_mem_call_count(a) != 6) { return 6; }
+  if (rc_mem_last_sql(a) != LEDGER_DELETE) { return 7; }
+  if (!rc_value_same(rc_mem_last_args(a)[0], RcInt(2))) { return 8; }
+  return 0;
+}
+
+fn check_down_refusals() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var rep: RcMigrationReport;
+
+  // No down step: refused before any transaction.
+  var two: RcMigrationSet = rc_migration_set(&TWO[0], 2);
+  var v2: RcValue[2];
+  v2[0] = RcInt(1);
+  v2[1] = RcInt(2);
+  if (push_ledger(a, &v2[0], 2) != 0) { return 2; }
+  if (rc_migration_down(a, &two, 0, &rep) != RC_ERR_UNSUPPORTED) { return 3; }
+  if (rep.failed_version != 2) { return 4; }
+  if (rc_mem_tx_depth(a) != 0 || rc_mem_commits(a) != 0) { return 5; }
+
+  // A version the code does not know: refused too.
+  var three: RcMigrationSet = rc_migration_set(&THREE[0], 3);
+  var v9: RcValue[2];
+  v9[0] = RcInt(1);
+  v9[1] = RcInt(9);
+  if (push_ledger(a, &v9[0], 2) != 0) { return 6; }
+  if (rc_migration_down(a, &three, 0, &rep) != RC_ERR_CONFLICT) { return 7; }
+  if (rep.failed_version != 9) { return 8; }
+
+  // A failing down step rolls back and stops there.
+  var v12: RcValue[2];
+  v12[0] = RcInt(1);
+  v12[1] = RcInt(2);
+  if (push_ledger(a, &v12[0], 2) != 0) { return 9; }
+  var calls: int32 = rc_mem_call_count(a);
+  var f: RcAdapter = rc_mig_flaky(a, 3);   // the third exec: version 2's down
+  if (rc_migration_down(&f, &three, 0, &rep) != RC_ERR_ADAPTER) { return 10; }
+  if (rep.failed_version != 2 || rep.applied != 0) { return 11; }
+  if (rc_mem_rollbacks(a) != 1) { return 12; }
+  if (rc_mem_call_count(a) != calls + 2) { return 13; }
+
+  // Nothing above the target: nothing to do.
+  if (push_ledger(a, &v12[0], 1) != 0) { return 14; }
+  if (rc_migration_down(a, &three, 1, &rep) != RC_OK || rep.applied != 0) { return 15; }
+  if (rc_migration_down(a, &three, -1, &rep) != RC_ERR_USAGE) { return 16; }
+  return 0;
+}
+
+fn check_schema_changes() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var m: RcMeta = user_meta();
+
+  if (rc_migration_drop(a, m) != RC_OK) { return 2; }
+  if (rc_mem_last_sql(a) != "DROP TABLE IF EXISTS \"users\"") { return 3; }
+
+  if (rc_migration_add_column(a, m, 3) != RC_OK) { return 4; }
+  if (rc_mem_last_sql(a) != "ALTER TABLE \"users\" ADD COLUMN \"age\" INTEGER") { return 5; }
+  // Existing rows have no value for a NOT NULL column: refused, nothing sent.
+  var calls: int32 = rc_mem_call_count(a);
+  if (rc_migration_add_column(a, m, 2) != RC_ERR_UNSUPPORTED) { return 6; }
+  if (rc_migration_add_column(a, m, 0) != RC_ERR_UNSUPPORTED) { return 7; }
+  if (rc_migration_add_column(a, m, 8) != RC_ERR_USAGE) { return 8; }
+  if (rc_mem_call_count(a) != calls) { return 9; }
+
+  var email: int32[1];
+  email[0] = 1;
+  if (rc_migration_create_index(a, m, "users_email", &email[0], 1, true) != RC_OK) { return 10; }
+  if (rc_mem_last_sql(a) != "CREATE UNIQUE INDEX IF NOT EXISTS \"users_email\" ON \"users\" (\"email\")") { return 11; }
+  var two: int32[2];
+  two[0] = 2;
+  two[1] = 3;
+  if (rc_migration_create_index(a, m, "users_name_age", &two[0], 2, false) != RC_OK) { return 12; }
+  if (rc_mem_last_sql(a) != "CREATE INDEX IF NOT EXISTS \"users_name_age\" ON \"users\" (\"name\", \"age\")") { return 13; }
+  if (rc_migration_create_index(a, m, "", &two[0], 2, false) != RC_ERR_USAGE) { return 14; }
+
+  if (rc_migration_drop_index(a, m, "users_email") != RC_OK) { return 15; }
+  if (rc_mem_last_sql(a) != "DROP INDEX IF EXISTS \"users_email\"") { return 16; }
   return 0;
 }
 
@@ -423,8 +526,10 @@ export fn main() -> int32 {
   if (!rc_report("migration: failure rolls back and reports the version", check_failure_rolls_back())) { failures = failures + 1; }
   if (!rc_report("migration: store ahead of code is refused", check_store_ahead())) { failures = failures + 1; }
   if (!rc_report("migration: invalid sets are refused", check_invalid_sets())) { failures = failures + 1; }
-  if (!rc_report("migration: down is unsupported", check_down_unsupported())) { failures = failures + 1; }
-  return rc_summary(failures, 8);
+  if (!rc_report("migration: down rolls back newest first", check_down())) { failures = failures + 1; }
+  if (!rc_report("migration: down refusals", check_down_refusals())) { failures = failures + 1; }
+  if (!rc_report("migration: schema changes", check_schema_changes())) { failures = failures + 1; }
+  return rc_summary(failures, 10);
 }
 
 @test fn t_migration() -> int32 {
@@ -435,6 +540,8 @@ export fn main() -> int32 {
   if (check_failure_rolls_back() != 0) { return 5; }
   if (check_store_ahead() != 0) { return 6; }
   if (check_invalid_sets() != 0) { return 7; }
-  if (check_down_unsupported() != 0) { return 8; }
+  if (check_down() != 0) { return 8; }
+  if (check_down_refusals() != 0) { return 9; }
+  if (check_schema_changes() != 0) { return 10; }
   return 0;
 }

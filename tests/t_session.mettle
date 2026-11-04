@@ -1,0 +1,242 @@
+// tests/t_session.mettle — the session: one connection, one flat transaction.
+//
+// What this file pins:
+//   1. only the outermost begin/commit reaches the adapter;
+//   2. an inner rollback dooms the transaction: the outer commit rolls back
+//      and answers RC_ERR_TX;
+//   3. commit/rollback with nothing open is RC_ERR_TX and calls nothing;
+//   4. a failed adapter begin leaves no transaction, and a failed commit
+//      leaves none open either;
+//   5. rc_session_transaction commits on RC_OK and otherwise rolls back and
+//      returns the body's code.
+
+import "std/mem";
+
+import "../src/core/status";
+import "../src/core/value";
+import "../src/core/session";
+import "../src/adapter/adapter";
+import "../src/adapter/mem";
+import "harness";
+
+fn new_adapter(out: RcAdapter**) -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return RC_ERR_NOMEM; }
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
+    rc_mem_free(a);
+    return RC_ERR_ADAPTER;
+  }
+  *out = a;
+  return RC_OK;
+}
+
+// --- 1. flat begin/commit -----------------------------------------------------
+
+fn check_flat() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  if (rc_session_adapter(&s) != a) { return 2; }
+  if (rc_session_in_tx(&s)) { return 3; }
+
+  if (rc_session_begin(&s, RC_TX_IMMEDIATE) != RC_OK) { return 4; }
+  if (!rc_session_in_tx(&s)) { return 5; }
+  if (rc_mem_tx_depth(a) != 1) { return 6; }
+  if (rc_session_commit(&s) != RC_OK) { return 7; }
+  if (rc_session_in_tx(&s)) { return 8; }
+  if (rc_mem_tx_depth(a) != 0) { return 9; }
+  if (rc_mem_commits(a) != 1) { return 10; }
+
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 11; }
+  if (rc_session_rollback(&s) != RC_OK) { return 12; }
+  if (rc_mem_rollbacks(a) != 1) { return 13; }
+  if (rc_session_depth(&s) != 0) { return 14; }
+
+  // An unknown mode is refused before the adapter sees it.
+  if (rc_session_begin(&s, 7) != RC_ERR_USAGE) { return 15; }
+  if (rc_mem_tx_depth(a) != 0) { return 16; }
+  return 0;
+}
+
+// --- 2. nesting is flattened ----------------------------------------------------
+
+fn check_nested() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 2; }
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 3; }
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 4; }
+  if (rc_session_depth(&s) != 3) { return 5; }
+  if (rc_mem_tx_depth(a) != 1) { return 6; }      // the adapter never nests
+  if (rc_session_commit(&s) != RC_OK) { return 7; }
+  if (rc_session_commit(&s) != RC_OK) { return 8; }
+  if (rc_mem_commits(a) != 0) { return 9; }       // inner commits are counts
+  if (rc_session_commit(&s) != RC_OK) { return 10; }
+  if (rc_mem_commits(a) != 1) { return 11; }
+  if (rc_session_in_tx(&s)) { return 12; }
+  return 0;
+}
+
+// --- 3. an inner rollback dooms the transaction ---------------------------------
+
+fn check_doomed() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 2; }
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 3; }
+  if (rc_session_rollback(&s) != RC_OK) { return 4; }
+  if (!rc_session_doomed(&s)) { return 5; }
+  if (rc_mem_rollbacks(a) != 0) { return 6; }     // still one open transaction
+  if (!rc_session_in_tx(&s)) { return 7; }
+
+  // The outer commit cannot write half a transaction: it rolls back.
+  if (rc_session_commit(&s) != RC_ERR_TX) { return 8; }
+  if (rc_mem_commits(a) != 0) { return 9; }
+  if (rc_mem_rollbacks(a) != 1) { return 10; }
+  if (rc_session_in_tx(&s)) { return 11; }
+  if (rc_session_doomed(&s)) { return 12; }
+
+  // The next transaction starts clean.
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 13; }
+  if (rc_session_commit(&s) != RC_OK) { return 14; }
+  if (rc_mem_commits(a) != 1) { return 15; }
+  return 0;
+}
+
+// --- 4. misuse and adapter failures -------------------------------------------
+
+var FAKE_BEGINS: int32 = 0;
+var FAKE_ROLLBACKS: int32 = 0;
+
+fn fake_begin(ud: rawptr, mode: int32) -> int32 {
+  FAKE_BEGINS = FAKE_BEGINS + 1;
+  return RC_OK;
+}
+
+fn fake_commit_fails(ud: rawptr) -> int32 { return RC_ERR_ADAPTER; }
+
+fn fake_rollback(ud: rawptr) -> int32 {
+  FAKE_ROLLBACKS = FAKE_ROLLBACKS + 1;
+  return RC_OK;
+}
+
+fn check_failures() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+
+  // Nothing open: refused, and the adapter is not called.
+  if (rc_session_commit(&s) != RC_ERR_TX) { return 2; }
+  if (rc_session_rollback(&s) != RC_ERR_TX) { return 3; }
+  if (rc_mem_commits(a) != 0 || rc_mem_rollbacks(a) != 0) { return 4; }
+  var none: RcSession = rc_session_new(0);
+  if (rc_session_begin(&none, RC_TX_DEFAULT) != RC_ERR_USAGE) { return 5; }
+
+  // A closed connection refuses begin, and the session stays out of a tx.
+  if (rc_adapter_close(a) != RC_OK) { return 6; }
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_ERR_CLOSED) { return 7; }
+  if (rc_session_in_tx(&s)) { return 8; }
+
+  // A store whose commit fails: the code comes back, the session rolls back
+  // what the store still holds, and no transaction is left open.
+  var f: RcAdapter = rc_adapter_empty();
+  f.name = "commit-fails";
+  f.begin = &fake_begin;
+  f.commit = &fake_commit_fails;
+  f.rollback = &fake_rollback;
+  var fs: RcSession = rc_session_new(&f);
+  if (rc_session_begin(&fs, RC_TX_DEFAULT) != RC_OK) { return 9; }
+  if (FAKE_BEGINS != 1) { return 10; }
+  if (rc_session_commit(&fs) != RC_ERR_ADAPTER) { return 11; }
+  if (FAKE_ROLLBACKS != 1) { return 12; }
+  if (rc_session_in_tx(&fs)) { return 13; }
+  if (rc_session_begin(&fs, RC_TX_DEFAULT) != RC_OK) { return 14; }
+  if (FAKE_BEGINS != 2) { return 15; }
+  return 0;
+}
+
+// --- 5. the transaction helper --------------------------------------------------
+
+struct Work {
+  answer: int32;  // what the body returns
+  calls: int32;   // how many times it ran
+  depth: int32;   // the session depth it saw
+}
+
+fn body(ctx: rawptr, s: RcSession*) -> int32 {
+  var w: Work* = (Work*)ctx;
+  w->calls = w->calls + 1;
+  w->depth = rc_session_depth(s);
+  return w->answer;
+}
+
+fn check_transaction() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+
+  var ok: Work;
+  ok.answer = RC_OK;
+  ok.calls = 0;
+  ok.depth = 0;
+  if (rc_session_transaction(&s, RC_TX_IMMEDIATE, &body, (rawptr)&ok) != RC_OK) { return 2; }
+  if (ok.calls != 1 || ok.depth != 1) { return 3; }
+  if (rc_mem_commits(a) != 1) { return 4; }
+  if (rc_session_in_tx(&s)) { return 5; }
+
+  // The body's failure is what the caller sees, and nothing is committed.
+  var bad: Work;
+  bad.answer = RC_ERR_CONFLICT;
+  bad.calls = 0;
+  bad.depth = 0;
+  if (rc_session_transaction(&s, RC_TX_DEFAULT, &body, (rawptr)&bad) != RC_ERR_CONFLICT) { return 6; }
+  if (bad.calls != 1) { return 7; }
+  if (rc_mem_commits(a) != 1) { return 8; }
+  if (rc_mem_rollbacks(a) != 1) { return 9; }
+  if (rc_session_in_tx(&s)) { return 10; }
+
+  // Inside an open transaction the helper nests; its failure dooms the outer.
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 11; }
+  bad.calls = 0;
+  if (rc_session_transaction(&s, RC_TX_DEFAULT, &body, (rawptr)&bad) != RC_ERR_CONFLICT) { return 12; }
+  if (bad.depth != 2) { return 13; }
+  if (!rc_session_doomed(&s)) { return 14; }
+  if (rc_session_commit(&s) != RC_ERR_TX) { return 15; }
+  if (rc_mem_commits(a) != 1) { return 16; }
+  if (rc_mem_rollbacks(a) != 2) { return 17; }
+
+  // No body (a zero fn pointer, as in an empty vtable slot): refused,
+  // nothing begun.
+  var nobody: fn(rawptr, RcSession*) -> int32 = 0;
+  if (rc_session_transaction(&s, RC_TX_DEFAULT, nobody, 0) != RC_ERR_USAGE) { return 18; }
+  if (rc_mem_tx_depth(a) != 0) { return 19; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("session: flat begin and commit", check_flat())) { failures = failures + 1; }
+  if (!rc_report("session: nesting is flattened", check_nested())) { failures = failures + 1; }
+  if (!rc_report("session: inner rollback dooms the transaction", check_doomed())) { failures = failures + 1; }
+  if (!rc_report("session: misuse and adapter failures", check_failures())) { failures = failures + 1; }
+  if (!rc_report("session: transaction helper", check_transaction())) { failures = failures + 1; }
+  return rc_summary(failures, 5);
+}
+
+@test fn t_session() -> int32 {
+  if (check_flat() != 0) { return 1; }
+  if (check_nested() != 0) { return 2; }
+  if (check_doomed() != 0) { return 3; }
+  if (check_failures() != 0) { return 4; }
+  if (check_transaction() != 0) { return 5; }
+  return 0;
+}

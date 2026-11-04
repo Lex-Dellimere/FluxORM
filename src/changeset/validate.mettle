@@ -1,0 +1,159 @@
+// flux_orm/changeset/validate.mettle — validations, after Ecto's validate_*.
+//
+// Each one checks a changed field and records an error on the changeset when
+// the value fails; nothing is refused at the call, so every validation runs and
+// every error is collected. A field that was not changed (or whose put was
+// refused) is skipped, except by rc_validate_required, which also looks at the
+// bound row. A NULL change is left to rc_validate_required.
+//
+// Every validation returns RC_OK when the value passes or was skipped, and the
+// recorded code otherwise.
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "changeset";
+
+// The changed value of `field`, or false when the field has no change.
+fn rc_validate_change_of(cs: RcChangeset*, field: int32, out: RcValue*) -> bool {
+  if (cs == 0 || cs->values == 0) { return false; }
+  if (!rc_changeset_has(cs, field)) { return false; }
+  *out = cs->values[field];
+  if (rc_value_is_null(*out)) { return false; }
+  return true;
+}
+
+fn rc_validate_field_ok(cs: RcChangeset*, field: int32) -> int32 {
+  if (cs == 0) { return RC_ERR_USAGE; }
+  if (cs->values == 0) { return cs->err_code; }
+  if (field < 0 || field >= cs->meta.n_fields) {
+    return rc_changeset_add_error(cs, field, RC_ERR_USAGE, "field index out of range");
+  }
+  return RC_OK;
+}
+
+// UTF-8 code points, not bytes: "é" is one.
+fn rc_validate_chars(s: string) -> int64 {
+  var n: int64 = 0;
+  var i: uint64 = 0;
+  while (i < s.length) {
+    if ((s.chars[i] & (uint8)0xC0) != (uint8)0x80) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+// Each field must have a value that is not NULL and not empty text, either
+// as a change or in the bound row. Error: RC_ERR_CONSTRAINT "can't be blank".
+export fn rc_validate_required(cs: RcChangeset*, fields: int32*, n: int32) -> int32 {
+  if (cs == 0 || (fields == 0 && n > 0)) { return RC_ERR_USAGE; }
+  if (cs->values == 0) { return cs->err_code; }
+  var out: int32 = RC_OK;
+  var i: int32 = 0;
+  while (i < n) {
+    var f: int32 = fields[i];
+    var rc: int32 = rc_validate_field_ok(cs, f);
+    if (rc != RC_OK) {
+      out = rc;
+    } else if (!rc_changeset_field_has_error(cs, f)) {
+      var v: RcValue = RcNull;
+      if (rc_changeset_has(cs, f)) {
+        v = cs->values[f];
+      } else if (cs->base != 0) {
+        rc_meta_get(cs->meta, cs->base, cs->base_nulls, f, &v);
+      }
+      var blank: bool = rc_value_is_null(v);
+      var s: string = "";
+      if (rc_value_as_text(v, &s) == RC_OK && s.length == (uint64)0) { blank = true; }
+      if (blank) {
+        out = rc_changeset_add_error(cs, f, RC_ERR_CONSTRAINT, "can't be blank");
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// Text length in characters within [min, max]; -1 means no bound.
+// Errors: RC_ERR_RANGE "is too short" / "is too long".
+export fn rc_validate_length(cs: RcChangeset*, field: int32, min: int64,
+                             max: int64) -> int32 {
+  var rc: int32 = rc_validate_field_ok(cs, field);
+  if (rc != RC_OK) { return rc; }
+  var v: RcValue = RcNull;
+  if (!rc_validate_change_of(cs, field, &v)) { return RC_OK; }
+  var s: string = "";
+  if (rc_value_as_text(v, &s) != RC_OK) {
+    return rc_changeset_add_error(cs, field, RC_ERR_CAST, "is not text");
+  }
+  var n: int64 = rc_validate_chars(s);
+  if (min >= 0 && n < min) {
+    return rc_changeset_add_error(cs, field, RC_ERR_RANGE, "is too short");
+  }
+  if (max >= 0 && n > max) {
+    return rc_changeset_add_error(cs, field, RC_ERR_RANGE, "is too long");
+  }
+  return RC_OK;
+}
+
+// An integer within [lo, hi]. Errors: RC_ERR_RANGE "is too small" / "is too large".
+export fn rc_validate_int(cs: RcChangeset*, field: int32, lo: int64, hi: int64) -> int32 {
+  var rc: int32 = rc_validate_field_ok(cs, field);
+  if (rc != RC_OK) { return rc; }
+  var v: RcValue = RcNull;
+  if (!rc_validate_change_of(cs, field, &v)) { return RC_OK; }
+  var x: int64 = 0;
+  if (rc_value_as_i64(v, &x) != RC_OK) {
+    return rc_changeset_add_error(cs, field, RC_ERR_CAST, "is not an integer");
+  }
+  if (x < lo) { return rc_changeset_add_error(cs, field, RC_ERR_RANGE, "is too small"); }
+  if (x > hi) { return rc_changeset_add_error(cs, field, RC_ERR_RANGE, "is too large"); }
+  return RC_OK;
+}
+
+// A number within [lo, hi]; integers are compared as float64.
+export fn rc_validate_float(cs: RcChangeset*, field: int32, lo: float64,
+                            hi: float64) -> int32 {
+  var rc: int32 = rc_validate_field_ok(cs, field);
+  if (rc != RC_OK) { return rc; }
+  var v: RcValue = RcNull;
+  if (!rc_validate_change_of(cs, field, &v)) { return RC_OK; }
+  var x: float64 = 0.0;
+  if (rc_value_as_f64(v, &x) != RC_OK) {
+    return rc_changeset_add_error(cs, field, RC_ERR_CAST, "is not a number");
+  }
+  if (x < lo) { return rc_changeset_add_error(cs, field, RC_ERR_RANGE, "is too small"); }
+  if (x > hi) { return rc_changeset_add_error(cs, field, RC_ERR_RANGE, "is too large"); }
+  return RC_OK;
+}
+
+// The value must equal one of `allowed`. Error: RC_ERR_CONSTRAINT "is invalid".
+export fn rc_validate_inclusion(cs: RcChangeset*, field: int32, allowed: RcValue*,
+                                n: int32) -> int32 {
+  var rc: int32 = rc_validate_field_ok(cs, field);
+  if (rc != RC_OK) { return rc; }
+  if (allowed == 0 && n > 0) { return RC_ERR_USAGE; }
+  var v: RcValue = RcNull;
+  if (!rc_validate_change_of(cs, field, &v)) { return RC_OK; }
+  var i: int32 = 0;
+  while (i < n) {
+    if (rc_value_same(v, allowed[i])) { return RC_OK; }
+    i = i + 1;
+  }
+  return rc_changeset_add_error(cs, field, RC_ERR_CONSTRAINT, "is invalid");
+}
+
+// A custom check, like Ecto's validate_change: `check(ctx, value)` answers
+// true when the value is fine; otherwise `reason` is recorded with
+// RC_ERR_CONSTRAINT. Use it for formats, since Mettle has no regex.
+export fn rc_validate_change(cs: RcChangeset*, field: int32,
+                             check: fn(rawptr, RcValue) -> bool, ctx: rawptr,
+                             reason: string) -> int32 {
+  var rc: int32 = rc_validate_field_ok(cs, field);
+  if (rc != RC_OK) { return rc; }
+  if (check == 0) { return RC_ERR_USAGE; }
+  var v: RcValue = RcNull;
+  if (!rc_validate_change_of(cs, field, &v)) { return RC_OK; }
+  if (check(ctx, v)) { return RC_OK; }
+  return rc_changeset_add_error(cs, field, RC_ERR_CONSTRAINT, reason);
+}

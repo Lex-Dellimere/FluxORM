@@ -1,4 +1,4 @@
-// reach/core/buf.mettle — a growable byte buffer for statement text.
+// flux_orm/core/buf.mettle — a growable byte buffer for statement text.
 //
 // Mettle's `+` on strings allocates a new string per operator, so building a
 // statement by concatenation is one allocation per token. This is one buffer,
@@ -105,7 +105,7 @@ export fn rc_buf_put_i64(b: RcBuf*, v: int64) -> int32 {
   return RC_OK;
 }
 
-// Quotes an identifier with double quotes, doubling any embedded quote. dacor
+// Quotes an identifier with double quotes, doubling any embedded quote. MeoSQL
 // has no reserved-word list yet; quoting everything is the only safe default.
 export fn rc_buf_ident(b: RcBuf*, s: string) -> int32 {
   var rc: int32 = rc_buf_putc(b, (uint8)34);
