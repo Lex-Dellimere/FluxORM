@@ -233,21 +233,29 @@ Conventions:
 
 ## Build and test
 
-flux_orm needs the head Mettle compiler. `mbuild.toml` has no toolchain pin,
-so select it with `METTLE`.
+flux_orm is a library: there are no programs to link. It needs the dev Mettle
+compiler; `mbuild.toml` has no toolchain pin, so select it with `METTLE`.
 
 ```
 MB=/home/nox/Projects/mettle/mbuild/build/bootstrap/mbuild
 export METTLE=/home/nox/Projects/mettle/Mettle/bin/mettle
-$MB check             # type-check every test program and what it imports
+$MB check             # type-check src/flux_orm.mettle and what it imports
 $MB test              # every @test, in the interpreter
-$MB build && $MB build -r
-for t in build/linux/{debug,release}/t_*; do $t || echo "FAIL $t"; done
 ```
 
-`$MB run t_query` builds and runs one test. `tests/live_meosql.mettle` runs
-flux_orm against a real MeoSQL server; start one first
-(`../meosql/build/linux/release/meosql --db /tmp/flux_live.meo`), then
-`$MB run live_meosql`. Run release as well as debug:
-compiler bugs have shown up in release only. Imports are file-relative, so the
-compiler can be run from anywhere.
+Each `tests/t_*.mettle` is also a program. Build and run them in debug and
+release (compiler bugs have shown up in release only):
+
+```
+for t in tests/t_*.mettle; do
+  for mode in "" --release; do
+    $MB mettle -- $mode --build $t -o /tmp/flux_test && /tmp/flux_test || echo "FAIL $t $mode"
+  done
+done
+```
+
+`tests/live_meosql.mettle` runs flux_orm against a real MeoSQL server. Start one
+(`../meosql/build/linux/release/meosql --db /tmp/flux_live.meo`), then build and
+run that file the same way.
+
+Imports are file-relative, so the compiler can be run from anywhere.

@@ -4,7 +4,7 @@
 // the default port with an empty database, then run this:
 //
 //   ../meosql/build/linux/release/meosql --db /tmp/flux_live.meo
-//   mbuild run live_meosql
+//   mbuild mettle -- --build tests/live_meosql.mettle -o /tmp/live && /tmp/live
 //
 // It migrates, inserts, loads, saves with a version check (and a stale save),
 // reports a duplicate key on its field, queries, preloads, counts, deletes in
