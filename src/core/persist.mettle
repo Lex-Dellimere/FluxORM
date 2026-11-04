@@ -1,8 +1,8 @@
 // flux_orm/core/persist.mettle — insert, load by key, delete by key.
 //
 // Builds the three single-row statements straight from RcMeta and binds
-// RcValue arguments: values in, rows out, no cursor, no user data in the
-// statement text. Queries are query/'s; updates are changeset/'s.
+// RcValue arguments: no user data in the statement text. Queries live in
+// query/, updates in changeset/.
 
 import "std/mem";
 
@@ -35,10 +35,23 @@ fn rc_persist_put_table(b: RcBuf*, m: RcMeta) -> int32 {
   return rc_buf_ident(b, m.table);
 }
 
-// Inserts one entity. An auto primary key whose null bit is set is omitted
-// from the column list and read back from the result. `e.nulls` records
-// which other fields are NULL, and those bind as RcNull. A version field
-// always starts at 1, and created/updated timestamps are set from core/clock.
+// Inserts one entity's row.
+//   a   the adapter
+//   e   an RC_ST_NEW entity. An auto primary key whose null bit is set is
+//       left out and filled from the store's assigned id; other NULL fields
+//       bind as RcNull. Before the statement runs, a version field is set to
+//       1 and CREATED/UPDATED fields to the clock's time, in the model.
+// Returns RC_OK and makes the entity CLEAN. Errors:
+//   RC_ERR_USAGE   `a` or `e` is 0, the entity is not NEW, every field would
+//                  be left out, or a timestamp is needed and no clock is set
+//   any rc_meta_check error (RC_ERR_USAGE, RC_ERR_UNSUPPORTED)
+//   RC_ERR_NOMEM   building the statement failed
+//   any adapter code: RC_ERR_CONFLICT for a unique violation,
+//                  RC_ERR_CONSTRAINT, RC_ERR_CLOSED, RC_ERR_ADAPTER, ...
+//   RC_ERR_ADAPTER the store assigned no id for an auto key (the row may be
+//                  stored anyway)
+// On error the entity stays NEW, but the version and timestamps may already
+// be written into the model.
 export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   if (a == 0 || e == 0) { return RC_ERR_USAGE; }
   if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
@@ -93,7 +106,7 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
         if (rc != RC_OK) { return rc; }
       }
       rc = rc_buf_ident(&buf, m.fields[i].column);
-      if (rc == RC_OK) { rc = rc_stmt_col(&st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
+      if (rc == RC_OK) { rc = rc_stmt_field(&st, m.fields[i]); }
       if (rc != RC_OK) { return rc; }
       first = false;
       n_args = n_args + 1;
@@ -157,8 +170,19 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
 }
 
 // Fills `model` from row `row` of a result whose columns are in RcMeta order,
-// which is what rc_query_select produces. Text fields borrow from `res`, so
-// `res` must outlive the model (the same rule as rc_persist_load).
+// which is what rc_query_select produces.
+//   m       the model's metadata
+//   res     the result; borrowed. Text fields point into it, so it must
+//           outlive the model (keep it with rc_session_keep).
+//   row     row index, 0-based
+//   model   the model struct to fill; every field is written
+//   nulls   receives the model's null bitmap
+// Returns RC_OK; RC_ERR_USAGE when a pointer is 0 or `row` is out of range;
+// RC_ERR_ADAPTER when the result's column count is not the model's field
+// count; any rc_meta_set error for a cell that does not fit its field
+// (RC_ERR_CAST, RC_ERR_RANGE, RC_ERR_CONSTRAINT for NULL in a NOT NULL
+// field, RC_ERR_UNSUPPORTED). On error the model is partly filled. Wrap the
+// filled model with rc_entity_loaded.
 export fn rc_persist_hydrate(m: RcMeta, res: RcResult*, row: int32, model: rawptr,
                              nulls: uint64*) -> int32 {
   if (res == 0 || model == 0 || nulls == 0) { return RC_ERR_USAGE; }
@@ -175,14 +199,24 @@ export fn rc_persist_hydrate(m: RcMeta, res: RcResult*, row: int32, model: rawpt
   return RC_OK;
 }
 
-// Loads one row by primary key into `model`, which must already be zeroed.
+// Loads one row by primary key into `model`.
 //
 // Lifetime, and it is the one thing to get right here: a model's string fields
 // are 16-byte *views*. The loader therefore adopts cells out of the result
 // instead of copying them, and hands the result back through `owner`.
-// `*owner` must outlive every use of the model, then be freed with
-// rc_result_free. A copy per field would need an owner list inside the plain
-// Mettle struct; a session arena is the planned owner.
+//   a       the adapter
+//   m       the model's metadata; the table must have a primary key
+//   pk      the key value; borrowed for the call
+//   model   the model struct to fill
+//   nulls   receives the model's null bitmap
+//   owner   receives the result the model points into. On RC_OK it must
+//           outlive every use of the model, then be freed with
+//           rc_result_free (or moved into a session with rc_session_keep).
+//           On error it is empty and needs no free.
+// Returns RC_OK; RC_ERR_USAGE when a pointer is 0 or the table has no primary
+// key; any rc_meta_check error; RC_ERR_NOMEM; any code the adapter returns;
+// RC_ERR_NOT_FOUND when no row has that key; any rc_persist_hydrate error.
+// Wrap the filled model with rc_entity_loaded.
 export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
                           nulls: uint64*, owner: RcResult*) -> int32 {
   if (a == 0 || model == 0 || nulls == 0 || owner == 0) { return RC_ERR_USAGE; }
@@ -213,7 +247,7 @@ export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
   defer rc_stmt_free(&st);
   var c: int32 = 0;
   while (c < m.n_fields) {
-    rc = rc_stmt_col(&st, m.fields[c].column, m.fields[c].ty, m.fields[c].flags);
+    rc = rc_stmt_field(&st, m.fields[c]);
     if (rc != RC_OK) { return rc; }
     c = c + 1;
   }
@@ -239,6 +273,16 @@ export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
   return RC_OK;
 }
 
+// Deletes an entity's row by primary key. A versioned row is deleted only
+// while it still holds the version the model has.
+//   a   the adapter
+//   e   the entity; must not be DELETED and must have a non-NULL key
+// Returns RC_OK and makes the entity DELETED. Errors: RC_ERR_USAGE when `a`
+// or `e` is 0, the entity is already DELETED, or the table or entity has no
+// key; RC_ERR_NOMEM; any code the adapter returns; RC_ERR_NOT_FOUND when no
+// row matched on an unversioned table; RC_ERR_CONFLICT when no row matched
+// on a versioned one (someone changed or deleted it first). On error the
+// state is unchanged.
 export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
   if (a == 0 || e == 0) { return RC_ERR_USAGE; }
   if (e->state == RC_ST_DELETED) { return RC_ERR_USAGE; }
@@ -278,7 +322,7 @@ export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
     if (rc != RC_OK) { return rc; }
     rc = rc_buf_put(&buf, " = ?");
     if (rc != RC_OK) { return rc; }
-    rc = rc_entity_get(e, vf, &args[1]);
+    rc = rc_entity_get_field(e, vf, &args[1]);
     if (rc == RC_OK) { rc = rc_stmt_term(&st, m.fields[vf].column, RC_W_EQ, 1, 1); }
     if (rc != RC_OK) { return rc; }
     n_args = 2;
@@ -287,7 +331,10 @@ export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
   rc = rc_adapter_run(a, rc_buf_text(&buf), &st, &args[0], n_args, &res);
   if (rc != RC_OK) { return rc; }
   defer rc_result_free(&res);
-  if (vf >= 0 && res.affected == 0) { return RC_ERR_CONFLICT; }
+  if (res.affected == 0) {
+    if (vf >= 0) { return RC_ERR_CONFLICT; }   // changed or deleted since read
+    return RC_ERR_NOT_FOUND;
+  }
   e->state = RC_ST_DELETED;
   return RC_OK;
 }

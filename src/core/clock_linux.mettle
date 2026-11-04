@@ -1,13 +1,16 @@
 // flux_orm/core/clock_linux.mettle — the Linux wall clock.
 //
-// clock_gettime(228) with CLOCK_REALTIME (0) through a raw syscall. Kept out
-// of core/clock so the tests never import it: the compile-time interpreter
-// cannot run a syscall. Install it with rc_clock_set(&rc_clock_realtime_us).
+// clock_gettime with CLOCK_REALTIME through a raw syscall. 228 is the x86-64
+// syscall number. Kept out of core/clock so the tests never import it: the
+// compile-time interpreter cannot run a syscall.
 
 const RC_SYS_CLOCK_GETTIME: int64 = 228;
 const RC_CLOCK_REALTIME: int64 = 0;
 
-// Unix microseconds, or 0 if the kernel refuses.
+// Reads the realtime clock. Install it with
+// rc_clock_set(&rc_clock_realtime_us).
+// Returns Unix microseconds, or 0 if the kernel refuses (which rc_clock_now
+// turns into RC_ERR_USAGE).
 export fn rc_clock_realtime_us() -> int64 {
   var ts: int64[2];  // struct timespec { tv_sec; tv_nsec; }
   ts[0] = 0;

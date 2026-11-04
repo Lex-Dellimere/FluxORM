@@ -4,6 +4,9 @@
 // of these codes. Adapters map their own codes into this range; nothing above
 // the adapter ever sees a MeoSQL status or an errno.
 
+// Status codes. RC_OK (0) is success and every failure is negative.
+// RC_ERR_NOT_FOUND: no row matched. RC_ERR_CLOSED: the connection or handle is
+// closed. RC_ERR_NOMEM: an allocation failed.
 export const RC_OK: int32 = 0;
 export const RC_ERR: int32 = -1;             // unspecified, always a bug
 export const RC_ERR_CAST: int32 = -2;        // RcValue arm does not fit the field
@@ -17,8 +20,12 @@ export const RC_ERR_CLOSED: int32 = -9;
 export const RC_ERR_TX: int32 = -10;         // transaction state machine refused
 export const RC_ERR_NOMEM: int32 = -11;
 export const RC_ERR_ADAPTER: int32 = -12;    // adapter reported a failure
-export const RC_ERR_SCRIPT: int32 = -13;     // test double ran out of script
+export const RC_ERR_SCRIPT: int32 = -13;     // reserved for test doubles
 
+// Short lowercase name of a status code, for logs and test output.
+//   code   any int32; need not be an RC_* code
+// Returns a static string ("ok", "not_found", ...) or "unknown" for a code
+// that is not listed above. Never allocates; do not free the result.
 export fn rc_status_name(code: int32) -> string {
   if (code == RC_OK) { return "ok"; }
   if (code == RC_ERR) { return "error"; }
@@ -37,4 +44,5 @@ export fn rc_status_name(code: int32) -> string {
   return "unknown";
 }
 
+// True when `code` is RC_OK, false for any other value.
 export fn rc_status_ok(code: int32) -> bool { return code == RC_OK; }

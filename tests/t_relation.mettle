@@ -103,17 +103,37 @@ fn new_adapter(out: RcAdapter**) -> int32 {
 
 // The three relation declarations the tests use, in one place so a test cannot
 // accidentally assert against a different shape than the one it loaded.
+// Declared by column name; check 8 asserts they equal the index forms.
 fn rel_posts() -> RcRelation {
-  return rc_relation("posts", RC_REL_HAS_MANY, 0, "posts", 1);
+  return rc_relation_has_many("posts", user_meta(), "id", post_meta(), "user_id");
 }
 
 fn rel_user() -> RcRelation {
-  return rc_relation("user", RC_REL_BELONGS_TO, 1, "users", 0);
+  return rc_relation_belongs_to("user", post_meta(), "user_id", user_meta(), "id");
 }
 
 fn rel_post_tags() -> RcRelation {
-  return rc_relation_through("posts", 0, "posts", 0, "user_posts", "user_id",
-                             "post_id");
+  return rc_relation_has_many_through("posts", user_meta(), "id", post_meta(), "id",
+                                      user_post_meta());
+}
+
+fn same_rel(a: RcRelation, b: RcRelation) -> bool {
+  return a.name == b.name && a.kind == b.kind && a.local_field == b.local_field
+      && a.foreign_table == b.foreign_table && a.foreign_field == b.foreign_field
+      && a.through_table == b.through_table && a.through_local == b.through_local
+      && a.through_foreign == b.through_foreign;
+}
+
+fn check_by_name() -> int32 {
+  if (!same_rel(rel_posts(), rc_relation("posts", RC_REL_HAS_MANY, 0, "posts", 1))) { return 1; }
+  if (!same_rel(rel_user(), rc_relation("user", RC_REL_BELONGS_TO, 1, "users", 0))) { return 2; }
+  var t: RcRelation = rc_relation_through("posts", 0, "posts", 0, "user_posts", "user_id",
+                                          "post_id");
+  if (!same_rel(rel_post_tags(), t)) { return 3; }
+  // An unknown column fails the check instead of picking some field.
+  var bad: RcRelation = rc_relation_has_many("posts", user_meta(), "id", post_meta(), "author_id");
+  if (rc_relation_check(&bad, user_meta(), post_meta(), (RcMeta*)0) != RC_ERR_USAGE) { return 4; }
+  return 0;
 }
 
 // --- 1. startup refuses bad metadata ----------------------------------------
@@ -228,7 +248,7 @@ fn check_startup() -> int32 {
   text_meta.fields = &text_fields[0];
   text_meta.n_fields = 2;
   text_meta.pk = -1;
-  if (rc_relation_check(&ok3, um, pm, &text_meta) != RC_ERR_USAGE) { return 23; }
+  if (rc_relation_check(&ok3, um, pm, &text_meta) != RC_ERR_CAST) { return 23; }
 
   // A mapping table declared on a two-table relation: the author believes the
   // through table is used, the loader would ignore it.
@@ -799,7 +819,8 @@ export fn main() -> int32 {
   if (!rc_report("relation: no owners means no statement", check_no_owners())) { failures = failures + 1; }
   if (!rc_report("relation: hydrate borrows the result", check_hydrate())) { failures = failures + 1; }
   if (!rc_report("relation: a failing exec changes nothing", check_fail_exec())) { failures = failures + 1; }
-  return rc_summary(failures, 7);
+  if (!rc_report("relation: declared by column name", check_by_name())) { failures = failures + 1; }
+  return rc_summary(failures, 8);
 }
 
 @test fn t_relation() -> int32 {
@@ -810,5 +831,6 @@ export fn main() -> int32 {
   if (check_no_owners() != 0) { return 5; }
   if (check_hydrate() != 0) { return 6; }
   if (check_fail_exec() != 0) { return 7; }
+  if (check_by_name() != 0) { return 8; }
   return 0;
 }

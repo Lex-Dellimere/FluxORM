@@ -9,12 +9,19 @@ import "status";
 
 var RC_CLOCK: fn() -> int64 = 0;
 
+// Installs the process-wide clock that timestamp writes read.
+//   now   function answering Unix microseconds; replaces any earlier clock.
+//         Passing 0 is the same as rc_clock_clear.
 export fn rc_clock_set(now: fn() -> int64) { RC_CLOCK = now; }
 
+// Removes the installed clock. Writes that need a timestamp then fail with
+// RC_ERR_USAGE until a clock is set again.
 export fn rc_clock_clear() { RC_CLOCK = 0; }
 
-// Unix microseconds into *out. RC_ERR_USAGE when no clock is installed or it
-// answers 0 or less.
+// Reads the installed clock.
+//   out   receives Unix microseconds; untouched on failure
+// Returns RC_OK; RC_ERR_USAGE when `out` is 0, no clock is installed, or the
+// clock answers 0 or less.
 export fn rc_clock_now(out: int64*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   if (RC_CLOCK == 0) { return RC_ERR_USAGE; }

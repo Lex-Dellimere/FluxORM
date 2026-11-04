@@ -96,13 +96,13 @@ fn check_access() -> int32 {
   if (!rc_nulls_has(e.nulls, 0)) { return 2; }
   if (rc_entity_has_pk(&e)) { return 3; }
 
-  if (rc_entity_set(&e, 1, RcText("a@example.com")) != RC_OK) { return 4; }
-  if (rc_entity_set(&e, 2, RcText("Ada")) != RC_OK) { return 5; }
-  if (rc_entity_set(&e, 3, RcInt(36)) != RC_OK) { return 6; }
-  if (rc_entity_set(&e, 4, RcBool(true)) != RC_OK) { return 7; }
-  if (rc_entity_set(&e, 5, RcFloat(9.5)) != RC_OK) { return 8; }
-  if (rc_entity_set(&e, 6, RcTime(1700000000000000)) != RC_OK) { return 9; }
-  if (rc_entity_set(&e, 7, RcInt(2)) != RC_OK) { return 10; }
+  if (rc_entity_set_field(&e, 1, RcText("a@example.com")) != RC_OK) { return 4; }
+  if (rc_entity_set_field(&e, 2, RcText("Ada")) != RC_OK) { return 5; }
+  if (rc_entity_set_field(&e, 3, RcInt(36)) != RC_OK) { return 6; }
+  if (rc_entity_set_field(&e, 4, RcBool(true)) != RC_OK) { return 7; }
+  if (rc_entity_set_field(&e, 5, RcFloat(9.5)) != RC_OK) { return 8; }
+  if (rc_entity_set_field(&e, 6, RcTime(1700000000000000)) != RC_OK) { return 9; }
+  if (rc_entity_set_field(&e, 7, RcInt(2)) != RC_OK) { return 10; }
 
   // The write went through the compiler's layout, not ours.
   if (u.age != 36) { return 11; }
@@ -112,40 +112,40 @@ fn check_access() -> int32 {
   if (u.created_at != 1700000000000000) { return 15; }
 
   var v: RcValue = RcNull;
-  if (rc_entity_get(&e, 3, &v) != RC_OK) { return 16; }
+  if (rc_entity_get_field(&e, 3, &v) != RC_OK) { return 16; }
   if (!rc_value_same(v, RcInt(36))) { return 17; }
-  if (rc_entity_get(&e, 7, &v) != RC_OK) { return 18; }
+  if (rc_entity_get_field(&e, 7, &v) != RC_OK) { return 18; }
   if (!rc_value_same(v, RcInt(2))) { return 19; }
 
   // int32 range is enforced on the way in, not discovered by the store.
-  if (rc_entity_set(&e, 3, RcInt(2147483648)) != RC_ERR_RANGE) { return 20; }
+  if (rc_entity_set_field(&e, 3, RcInt(2147483648)) != RC_ERR_RANGE) { return 20; }
   if (u.age != 36) { return 21; }
-  if (rc_entity_set(&e, 3, RcInt(-2147483648)) != RC_OK) { return 22; }
+  if (rc_entity_set_field(&e, 3, RcInt(-2147483648)) != RC_OK) { return 22; }
   if (u.age != -2147483648) { return 23; }
 
   // Type checks are strict, and a rejected write changes nothing.
-  if (rc_entity_set(&e, 5, RcText("nope")) != RC_ERR_CAST) { return 30; }
+  if (rc_entity_set_field(&e, 5, RcText("nope")) != RC_ERR_CAST) { return 30; }
   if (u.score != 9.5) { return 31; }
-  if (rc_entity_set(&e, 4, RcInt(1)) != RC_ERR_CAST) { return 32; }
+  if (rc_entity_set_field(&e, 4, RcInt(1)) != RC_ERR_CAST) { return 32; }
 
   // NOT NULL refuses a null.
-  if (rc_entity_set(&e, 1, RcNull) != RC_ERR_CONSTRAINT) { return 40; }
+  if (rc_entity_set_field(&e, 1, RcNull) != RC_ERR_CONSTRAINT) { return 40; }
   if (u.email != "a@example.com") { return 41; }
 
   // A nullable field accepts a null, records it, and clears the storage.
-  if (rc_entity_set(&e, 3, RcNull) != RC_OK) { return 42; }
+  if (rc_entity_set_field(&e, 3, RcNull) != RC_OK) { return 42; }
   if (u.age != 0) { return 43; }
   if (!rc_nulls_has(e.nulls, 3)) { return 44; }
-  if (rc_entity_get(&e, 3, &v) != RC_OK) { return 45; }
+  if (rc_entity_get_field(&e, 3, &v) != RC_OK) { return 45; }
   if (!rc_value_is_null(v)) { return 46; }
 
   // Clearing the null restores a value and clears the bit.
-  if (rc_entity_set(&e, 3, RcInt(7)) != RC_OK) { return 47; }
+  if (rc_entity_set_field(&e, 3, RcInt(7)) != RC_OK) { return 47; }
   if (rc_nulls_has(e.nulls, 3)) { return 48; }
   if (u.age != 7) { return 49; }
 
   // Explicitly setting the auto key clears its null bit.
-  if (rc_entity_set(&e, 0, RcInt(100)) != RC_OK) { return 50; }
+  if (rc_entity_set_field(&e, 0, RcInt(100)) != RC_OK) { return 50; }
   if (rc_nulls_has(e.nulls, 0)) { return 51; }
   if (!rc_entity_has_pk(&e)) { return 52; }
   if (!rc_value_same(rc_entity_pk(&e), RcInt(100))) { return 53; }
@@ -156,8 +156,8 @@ fn check_access() -> int32 {
   if (rc_entity_state_name(e.state) != "new") { return 61; }
 
   // An out-of-range index is a caller bug, not a crash.
-  if (rc_entity_set(&e, 99, RcInt(1)) != RC_ERR_USAGE) { return 70; }
-  if (rc_entity_get(&e, -1, &v) != RC_ERR_USAGE) { return 71; }
+  if (rc_entity_set_field(&e, 99, RcInt(1)) != RC_ERR_USAGE) { return 70; }
+  if (rc_entity_get_field(&e, -1, &v) != RC_ERR_USAGE) { return 71; }
   return 0;
 }
 
@@ -299,7 +299,7 @@ fn check_schema() -> int32 {
   var m: RcMeta = rc_schema_meta(&WIDE, &wide_fields, "wide", "Wide", 520,
                                  (RcColumn*)0, 0);
   if (rc_schema_status(&WIDE) != RC_ERR_UNSUPPORTED) { return 2; }
-  if (m.n_fields != 65) { return 3; }
+  if (m.n_fields != 0) { return 3; }   // unusable, not truncated
   // The test models built with it are valid and keep their overrides.
   if (user_meta_status() != RC_OK) { return 4; }
   var u: RcMeta = user_meta();

@@ -8,6 +8,11 @@
 // u8 flags 0, u16 reserved 0, u32 rid) and its payload. Every payload must be
 // read exactly: short or trailing bytes are a protocol error, which decodes
 // as RC_ERR_ADAPTER.
+//
+// Encoders append one whole frame to an RcWire and return RC_OK, RC_ERR_USAGE
+// for a 0 pointer, RC_ERR_RANGE for a string or value too long for its length
+// field, or RC_ERR_NOMEM (sticky in w->err). On failure the buffer may hold a
+// partial frame: rc_wire_clear it before reuse.
 
 import "std/mem";
 
@@ -17,8 +22,9 @@ import "../core/meta";
 import "adapter";
 import "stmt";
 
-export const RC_WIRE_HEADER: int32 = 12;
+export const RC_WIRE_HEADER: int32 = 12;  // header bytes before every payload
 
+// Frame kinds: requests (client -> server), then replies.
 export const RC_WIRE_HELLO: int32 = 1;
 export const RC_WIRE_PING: int32 = 2;
 export const RC_WIRE_BEGIN: int32 = 3;
@@ -31,18 +37,23 @@ export const RC_WIRE_HELLO_OK: int32 = 65;  // 0x41
 export const RC_WIRE_ERROR: int32 = 66;     // 0x42
 export const RC_WIRE_RESULT: int32 = 67;    // 0x43
 
-export const RC_WIRE_CAP_COUNT: int32 = 1;
-export const RC_WIRE_CAP_ASSIGN_ADD: int32 = 2;
+// Server capability bits, from HELLO_OK's caps.
+export const RC_WIRE_CAP_COUNT: int32 = 1;       // RC_OP_COUNT is supported
+export const RC_WIRE_CAP_ASSIGN_ADD: int32 = 2;  // `col = col + value` updates
 
 // --- writing -----------------------------------------------------------------
 
+// A growable request buffer. Frames are appended; the bytes to send are
+// data[0..len).
 export struct RcWire {
-  data: uint8*;
-  len: int64;
-  cap: int64;
+  data: uint8*;  // owned; 0 until the first write
+  len: int64;    // bytes written
+  cap: int64;    // bytes allocated
   err: int32;    // sticky: RC_ERR_NOMEM once a grow failed
 }
 
+// Returns an empty buffer; nothing is allocated until the first write. Free
+// it with rc_wire_free.
 export fn rc_wire_new() -> RcWire {
   var w: RcWire;
   w.data = 0;
@@ -52,14 +63,17 @@ export fn rc_wire_new() -> RcWire {
   return w;
 }
 
+// Frees the buffer's bytes and empties it. 0 is a no-op. err is not reset.
 export fn rc_wire_free(w: RcWire*) {
   if (w == 0) { return; }
   if (w->data != 0) { free((rawptr)w->data); }
+  w->err = RC_OK;
   w->data = 0;
   w->len = 0;
   w->cap = 0;
 }
 
+// Empties the buffer and clears err, keeping the allocation. 0 is a no-op.
 export fn rc_wire_clear(w: RcWire*) {
   if (w == 0) { return; }
   w->len = 0;
@@ -127,8 +141,14 @@ fn rc_wire_f64_from(u: uint64) -> float64 {
   return *p;
 }
 
-// One value: u8 tag, then its body (PROTOCOL.md "Values").
+// Appends one value: u8 tag, then its body (PROTOCOL.md "Values").
+//   w  the buffer; may not be 0
+//   v  the value. RcInt, RcTime and RcBool go as INT, RcUint as INT, RcFloat
+//      as REAL (bit-exact), RcText as TEXT, RcBlob as BLOB
+// Returns w->err (RC_OK, or RC_ERR_NOMEM), or RC_ERR_RANGE for an RcUint
+// above INT64_MAX or a text / blob over 4 GiB (nothing written).
 export fn rc_wire_val(w: RcWire*, v: RcValue) -> int32 {
+  if (w == 0) { return RC_ERR_USAGE; }
   match (v) {
     case RcNull: { rc_wire_u8(w, 0); }
     case RcInt(x): {
@@ -195,8 +215,14 @@ fn rc_wire_end(w: RcWire*, at: int64) -> int32 {
   return RC_OK;
 }
 
-// HELLO: "MEOS", major 1, minor 0, the largest reply we accept, the token
-// (empty for none) and a client name for the server's logs.
+// Appends a HELLO frame: "MEOS", major 1, minor 0, then:
+//   w          the buffer
+//   rid        request id; 1 on a fresh connection
+//   max_frame  the largest reply payload we accept (server wants >= 65536)
+//   token      auth token, "" for none; at most 65535 bytes (RC_ERR_RANGE)
+//   name       client name for the server's logs; at most 64 bytes, else
+//              RC_ERR_USAGE
+// Returns RC_OK or a code from the header comment.
 export fn rc_wire_hello(w: RcWire*, rid: uint32, max_frame: uint32, token: string,
                         name: string) -> int32 {
   if (w == 0) { return RC_ERR_USAGE; }
@@ -215,13 +241,23 @@ export fn rc_wire_hello(w: RcWire*, rid: uint32, max_frame: uint32, token: strin
   return rc_wire_end(w, at);
 }
 
-// A request with no payload: PING, COMMIT, ROLLBACK, BYE.
+// Appends a request with no payload.
+//   w     the buffer
+//   kind  RC_WIRE_PING, RC_WIRE_COMMIT, RC_WIRE_ROLLBACK or RC_WIRE_BYE (not
+//         checked)
+//   rid   request id
+// Returns RC_OK, RC_ERR_USAGE (w is 0) or RC_ERR_NOMEM.
 export fn rc_wire_empty(w: RcWire*, kind: int32, rid: uint32) -> int32 {
   if (w == 0) { return RC_ERR_USAGE; }
   var at: int64 = rc_wire_start(w, kind, rid);
   return rc_wire_end(w, at);
 }
 
+// Appends a BEGIN frame.
+//   w     the buffer
+//   rid   request id
+//   mode  RC_TX_* (0 default, 1 deferred, 2 immediate); sent as one byte
+// Returns RC_OK, RC_ERR_USAGE (w is 0) or RC_ERR_NOMEM.
 export fn rc_wire_begin(w: RcWire*, rid: uint32, mode: int32) -> int32 {
   if (w == 0) { return RC_ERR_USAGE; }
   var at: int64 = rc_wire_start(w, RC_WIRE_BEGIN, rid);
@@ -231,7 +267,9 @@ export fn rc_wire_begin(w: RcWire*, rid: uint32, mode: int32) -> int32 {
 
 // RC_T_* -> the wire's column type: 1 INT, 2 REAL, 3 TEXT, 4 BLOB.
 fn rc_wire_type(ty: int32) -> int64 {
-  if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) { return 1; }
+  if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) {
+    return 1;
+  }
   if (ty == RC_T_F64) { return 2; }
   if (ty == RC_T_TEXT) { return 3; }
   if (ty == RC_T_BLOB) { return 4; }
@@ -247,9 +285,16 @@ fn rc_wire_cflags(flags: int32) -> int64 {
   return out;
 }
 
-// QUERY: the RcStmt field for field (PROTOCOL.md "QUERY statement"). Column
-// types and flags are sent only for CREATE and ADD_COLUMN. A statement with
-// joins is RC_ERR_UNSUPPORTED: MeoSQL has none, and it is not sent.
+// Appends a QUERY frame: the RcStmt field for field (PROTOCOL.md "QUERY
+// statement"), args last.
+//   w    the buffer
+//   rid  request id
+//   st   the statement; borrowed, read only. Column types and flags are sent
+//        only for CREATE and ADD_COLUMN
+// Returns RC_OK, or RC_ERR_USAGE (w or st is 0, or n_args > 0 with no args),
+// RC_ERR_UNSUPPORTED (st has joins: MeoSQL has none; nothing is written),
+// RC_ERR_RANGE (a name over 65535 bytes, or an arg as in rc_wire_val), or
+// RC_ERR_NOMEM.
 export fn rc_wire_query(w: RcWire*, rid: uint32, st: RcStmt*) -> int32 {
   if (w == 0 || st == 0) { return RC_ERR_USAGE; }
   if (st->n_joins > 0) { return RC_ERR_UNSUPPORTED; }
@@ -264,6 +309,9 @@ export fn rc_wire_query(w: RcWire*, rid: uint32, st: RcStmt*) -> int32 {
   if (rc == RC_OK) { rc = rc_wire_str16(w, st->name); }
   if (rc != RC_OK) { return rc; }
   var defs: bool = st->op == RC_OP_CREATE || st->op == RC_OP_ADD_COLUMN;
+  if (st->n_cols > 65535 || st->n_terms > 65535 || st->n_order > 65535) {
+    return RC_ERR_RANGE;
+  }
   rc_wire_le(w, (uint64)st->n_cols, 2);
   var i: int32 = 0;
   while (i < st->n_cols) {
@@ -313,13 +361,17 @@ export fn rc_wire_query(w: RcWire*, rid: uint32, st: RcStmt*) -> int32 {
 
 // --- reading -----------------------------------------------------------------
 
+// A cursor over received bytes. Readers never run past n; any failure sets
+// `bad` and later reads return 0.
 export struct RcWireRead {
-  p: uint8*;
-  n: int64;
-  off: int64;
+  p: uint8*;     // the bytes; borrowed
+  n: int64;      // number of bytes at p
+  off: int64;    // next byte to read
   bad: bool;     // ran past the end, or a rule failed
 }
 
+// Returns a cursor over p[0..n), borrowed (p must outlive it). p = 0 with
+// n > 0 starts out bad.
 export fn rc_wire_read(p: uint8*, n: int64) -> RcWireRead {
   var r: RcWireRead;
   r.p = p;
@@ -402,7 +454,13 @@ fn rc_wire_get_val(r: RcWireRead*, out: RcValue*) -> int32 {
   return RC_ERR_ADAPTER;
 }
 
-// The 12-byte header. RC_ERR_ADAPTER for nonzero flags or reserved bits.
+// Decodes a 12-byte frame header.
+//   p     at least RC_WIRE_HEADER bytes
+//   len   receives the payload length (not range-checked here)
+//   kind  receives the frame kind (RC_WIRE_*)
+//   rid   receives the request id; 0 means a server-initiated frame
+// Returns RC_OK, RC_ERR_USAGE when any pointer is 0, or RC_ERR_ADAPTER for
+// nonzero flags or reserved bits (the outputs are still written).
 export fn rc_wire_header(p: uint8*, len: int64*, kind: int32*, rid: uint32*) -> int32 {
   if (p == 0 || len == 0 || kind == 0 || rid == 0) { return RC_ERR_USAGE; }
   var r: RcWireRead = rc_wire_read(p, (int64)RC_WIRE_HEADER);
@@ -415,15 +473,21 @@ export fn rc_wire_header(p: uint8*, len: int64*, kind: int32*, rid: uint32*) -> 
   return RC_OK;
 }
 
+// A decoded HELLO_OK.
 export struct RcWireHello {
-  major: int32;
-  minor: int32;
-  max_frame: int64;
-  session: uint64;
-  caps: int32;
-  name: string;   // a view into the payload
+  major: int32;      // protocol major; always 1 when decoded OK
+  minor: int32;      // min(client, server) minor
+  max_frame: int64;  // largest request payload the server accepts, <= 2^31-1
+  session: uint64;   // server session id, for logs
+  caps: int32;       // RC_WIRE_CAP_* bits
+  name: string;      // server name; a view into the payload
 }
 
+// Decodes a HELLO_OK payload.
+//   p, n  the payload; borrowed, must outlive out->name
+//   out   receives the fields
+// Returns RC_OK, RC_ERR_USAGE (out is 0), or RC_ERR_ADAPTER for a short or
+// long payload, a NUL in the name, or a major other than 1.
 export fn rc_wire_hello_ok(p: uint8*, n: int64, out: RcWireHello*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   var r: RcWireRead = rc_wire_read(p, n);
@@ -445,6 +509,12 @@ export struct RcWireError {
   message: string; // a view into the payload
 }
 
+// Decodes an ERROR payload.
+//   p, n  the payload; borrowed, must outlive out->message
+//   out   receives the fields
+// Returns RC_OK, RC_ERR_USAGE (out is 0), or RC_ERR_ADAPTER for a short or
+// long payload, a code <= 0, a fatal byte > 1, tx > 2, or a NUL in the
+// message. Map out->code with rc_wire_status.
 export fn rc_wire_error(p: uint8*, n: int64, out: RcWireError*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   var r: RcWireRead = rc_wire_read(p, n);
@@ -458,7 +528,13 @@ export fn rc_wire_error(p: uint8*, n: int64, out: RcWireError*) -> int32 {
   return RC_OK;
 }
 
-// A RESULT payload into an owned RcResult (free it with rc_result_free).
+// Decodes a RESULT payload into an owned RcResult.
+//   p, n  the payload; borrowed, may be freed after the call
+//   out   initialised on entry, then filled; text and blob cells are copies
+// Returns RC_OK, RC_ERR_USAGE (out is 0), RC_ERR_NOMEM, or RC_ERR_ADAPTER for
+// a malformed payload (short or long, a column hint > 4, rows with no
+// columns, a bad value tag). Free out with rc_result_free on RC_OK; on an
+// error nothing is left to free.
 export fn rc_wire_result(p: uint8*, n: int64, out: RcResult*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   rc_result_init(out);
@@ -500,8 +576,18 @@ export fn rc_wire_result(p: uint8*, n: int64, out: RcResult*) -> int32 {
   return RC_OK;
 }
 
-// MeoSQL status code (positive) -> RC_*. CORRUPT, NOT_A_DB and VERSION also
-// mean the connection must not be reused; the adapter drops it.
+// Maps a MeoSQL status code (positive, from an ERROR frame) to an RC_* code:
+//   2 NOMEM                    -> RC_ERR_NOMEM
+//   10 USAGE, 16 SCHEMA        -> RC_ERR_USAGE
+//   11 UNSUPPORTED, 17 TOOBIG  -> RC_ERR_UNSUPPORTED
+//   13 CONFLICT                -> RC_ERR_CONFLICT
+//   14 CONSTRAINT              -> RC_ERR_CONSTRAINT
+//   15 TX                      -> RC_ERR_TX
+//   18 MISMATCH                -> RC_ERR_CAST
+//   21 TIMEOUT                 -> RC_ERR_CLOSED
+//   anything else              -> RC_ERR_ADAPTER (IO, BUSY, CORRUPT, AUTH...)
+// CORRUPT (4), NOT_A_DB (5) and VERSION (6) also mean the connection must not
+// be reused; the adapter drops it.
 export fn rc_wire_status(code: int32) -> int32 {
   if (code == 2) { return RC_ERR_NOMEM; }
   if (code == 10) { return RC_ERR_USAGE; }

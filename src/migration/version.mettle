@@ -28,26 +28,31 @@ import "../adapter/adapter";
 import "../adapter/stmt";
 import "ddl";
 
-export const RC_MIG_LEDGER: string = "_flux_orm_migrations";
+export const RC_MIG_LEDGER: string = "_flux_orm_migrations";  // ledger table
 
-// A migration is SQL text for text stores, or an `up` callback for stores
-// without SQL (MeoSQL): `up` runs inside the migration's transaction, usually
-// rc_migration_create for each table. When `up` is set, `up_sql` may be empty.
-// `down_sql` / `down` undo it; a migration with neither cannot be rolled back.
+// One schema change. It is SQL text for text stores, or an `up` callback for
+// stores without SQL (MeoSQL, which has no `exec`): `up` runs inside the
+// migration's transaction, usually rc_migration_create for each table, and
+// returns RC_OK or a code that rolls the migration back. When `up` is set it
+// wins and `up_sql` may be empty. `down` / `down_sql` undo it the same way
+// (`down` wins); a migration with neither cannot be rolled back. Strings are
+// borrowed and are normally literals.
 export struct RcMigration {
-  version: int64;
-  name: string;
-  up_sql: string;
-  up: fn(RcAdapter*) -> int32;
-  down_sql: string;
-  down: fn(RcAdapter*) -> int32;
+  version: int64;                // > 0, unique, ascending within the set
+  name: string;                  // non-empty; stored in the ledger
+  up_sql: string;                // SQL run by rc_adapter_exec, or ""
+  up: fn(RcAdapter*) -> int32;   // callback instead of up_sql, or 0
+  down_sql: string;              // SQL that undoes it, or ""
+  down: fn(RcAdapter*) -> int32; // callback instead of down_sql, or 0
 }
 
+// A list of migrations, as passed to rc_migration_run / rc_migration_down.
 export struct RcMigrationSet {
-  items: RcMigration*;
-  n: int32;
+  items: RcMigration*;  // borrowed array, sorted by version
+  n: int32;             // entries in items
 }
 
+// What a run or rollback did. Filled on every return, success or failure.
 export struct RcMigrationReport {
   applied: int32;        // applied by this run
   up_to: int64;          // highest version applied after this run
@@ -71,8 +76,11 @@ export struct RcMigrationReport {
 // run. No test depends on wall time; the tests assert the injected value.
 var RC_MIG_CLOCK: int64 = 0;
 
+// Sets the applied_at value (unix micros) written to the ledger from now on;
+// 0 goes back to writing 0. Process-wide; call once before rc_migration_run.
 export fn rc_migration_set_clock(us: int64) { RC_MIG_CLOCK = us; }
 
+// Returns the injected clock value in unix micros, or 0 when none was set.
 export fn rc_migration_now_micros() -> int64 {
   if (RC_MIG_CLOCK != 0) { return RC_MIG_CLOCK; }
   return 0;
@@ -80,6 +88,12 @@ export fn rc_migration_now_micros() -> int64 {
 
 // --- set ---------------------------------------------------------------------
 
+// Wraps an array of migrations as a set.
+//   items  the migrations, sorted by ascending version; borrowed, must outlive
+//          the set (a static array is usual). May be 0 when n is 0
+//   n      number of migrations
+// Returns the set by value. Nothing is checked here; rc_migration_run and
+// rc_migration_down call rc_migration_check.
 export fn rc_migration_set(items: RcMigration*, n: int32) -> RcMigrationSet {
   var s: RcMigrationSet;
   s.items = items;
@@ -87,13 +101,16 @@ export fn rc_migration_set(items: RcMigration*, n: int32) -> RcMigrationSet {
   return s;
 }
 
-// Validates the set before anything reaches the store. A migration list is
-// compiled-in constants, so every failure here is a programming error and is
-// reported as RC_ERR_USAGE without touching the adapter:
+// Validates a set without touching the store. A migration list is
+// compiled-in constants, so every failure here is a programming error.
+//   s  the set
+// Returns RC_OK, or RC_ERR_USAGE for any of:
 //
+//   - n < 0, or items is 0 with n > 0
 //   - a version <= 0 (the ledger's PK would accept 0 and hide it)
 //   - an empty name (the ledger row would be unreadable in a log)
-//   - empty up_sql (a migration that does nothing but record itself)
+//   - empty up_sql and no `up` (a migration that does nothing but record
+//     itself)
 //   - versions not strictly ascending, which covers both duplicates and a
 //     descending pair. Order is the contract: the ledger's ORDER BY ASC and the
 //     apply loop both assume the set is already sorted, and sorting a caller's
@@ -116,10 +133,18 @@ export fn rc_migration_check(s: RcMigrationSet) -> int32 {
 }
 
 // --- ledger statements -------------------------------------------------------
-// The three statements are fixed text, built through rc_buf_ident so the
-// quoting rule has one implementation. They are asserted verbatim in
-// tests/t_migration.mettle; changing one is a schema change, not a refactor.
+// Lower level: rc_migration_run and rc_migration_down build and run these
+// themselves; apps do not need them. The statements are fixed text, built
+// through rc_buf_ident so the quoting rule has one implementation. They are
+// asserted verbatim in tests/t_migration.mettle; changing one is a schema
+// change, not a refactor.
+//
+// The text builders append to `b` (not cleared) and return RC_OK, RC_ERR_USAGE
+// when b is 0, or RC_ERR_NOMEM. The `_stmt` builders overwrite `*out` with the
+// same statement as an RcStmt and return RC_OK, RC_ERR_USAGE when out is 0, or
+// RC_ERR_NOMEM; unless out is 0, free *out with rc_stmt_free.
 
+// Appends the ledger's CREATE TABLE IF NOT EXISTS.
 export fn rc_migration_ledger_ddl(b: RcBuf*) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   var rc: int32 = rc_buf_put(b, "CREATE TABLE IF NOT EXISTS ");
@@ -141,6 +166,7 @@ export fn rc_migration_ledger_ddl(b: RcBuf*) -> int32 {
   return rc_buf_put(b, " INTEGER NOT NULL)");
 }
 
+// Appends SELECT "version" FROM the ledger ORDER BY "version" ASC.
 export fn rc_migration_ledger_select(b: RcBuf*) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   var rc: int32 = rc_buf_put(b, "SELECT ");
@@ -158,6 +184,7 @@ export fn rc_migration_ledger_select(b: RcBuf*) -> int32 {
   return rc_buf_put(b, " ASC");
 }
 
+// Appends the ledger INSERT; its 3 args are version, name, applied_at.
 export fn rc_migration_ledger_insert(b: RcBuf*) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   var rc: int32 = rc_buf_put(b, "INSERT INTO ");
@@ -179,8 +206,7 @@ export fn rc_migration_ledger_insert(b: RcBuf*) -> int32 {
   return rc_buf_put(b, ") VALUES (?, ?, ?)");
 }
 
-// The ledger statements as data, for adapters with `query`. `*out` is
-// replaced; free it with rc_stmt_free.
+// The ledger CREATE as an RcStmt, for adapters with `query`.
 export fn rc_migration_ledger_ddl_stmt(out: RcStmt*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   *out = rc_stmt_new(RC_OP_CREATE, RC_MIG_LEDGER);
@@ -191,6 +217,7 @@ export fn rc_migration_ledger_ddl_stmt(out: RcStmt*) -> int32 {
   return rc;
 }
 
+// The ledger SELECT as an RcStmt.
 export fn rc_migration_ledger_select_stmt(out: RcStmt*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   *out = rc_stmt_new(RC_OP_SELECT, RC_MIG_LEDGER);
@@ -199,6 +226,7 @@ export fn rc_migration_ledger_select_stmt(out: RcStmt*) -> int32 {
   return rc;
 }
 
+// The ledger INSERT as an RcStmt (one row; args version, name, applied_at).
 export fn rc_migration_ledger_insert_stmt(out: RcStmt*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   *out = rc_stmt_new(RC_OP_INSERT, RC_MIG_LEDGER);
@@ -209,6 +237,7 @@ export fn rc_migration_ledger_insert_stmt(out: RcStmt*) -> int32 {
   return rc;
 }
 
+// Appends DELETE FROM the ledger WHERE "version" = ? (1 arg: the version).
 export fn rc_migration_ledger_delete(b: RcBuf*) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   var rc: int32 = rc_buf_put(b, "DELETE FROM ");
@@ -219,14 +248,21 @@ export fn rc_migration_ledger_delete(b: RcBuf*) -> int32 {
   return rc;
 }
 
+// The ledger DELETE as an RcStmt.
 export fn rc_migration_ledger_delete_stmt(out: RcStmt*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   *out = rc_stmt_new(RC_OP_DELETE, RC_MIG_LEDGER);
   return rc_stmt_term(out, "version", RC_W_EQ, 0, 1);
 }
 
-// Creates m's table if it does not exist, through whichever path the adapter
-// takes. This is what an `up` callback calls.
+// Creates m's table if it does not exist (CREATE TABLE IF NOT EXISTS), as SQL
+// text or as an RcStmt, whichever the adapter takes. This is what an `up`
+// callback calls.
+//   a  the adapter; borrowed
+//   m  the model's meta
+// Returns RC_OK, or RC_ERR_USAGE (a is 0, or m malformed), RC_ERR_UNSUPPORTED
+// (a field type with no column), RC_ERR_NOMEM, or the adapter's code.
+// Nothing is left to free.
 export fn rc_migration_create(a: RcAdapter*, m: RcMeta) -> int32 {
   if (a == 0) { return RC_ERR_USAGE; }
   var buf: RcBuf = rc_buf_new(256);
@@ -386,14 +422,28 @@ fn rc_mig_read_ledger(a: RcAdapter*, buf: RcBuf*, cap_hint: int32, applied: int6
 
 // --- run ---------------------------------------------------------------------
 
-// Applies every version in `s` that the ledger does not already have.
+// Applies every migration in `s` that the ledger does not have yet, in
+// ascending order, each in its own transaction (RC_TX_IMMEDIATE).
+//   a    the adapter; borrowed, already open
+//   s    the set; borrowed
+//   out  the report; always filled: applied = migrations applied by this run,
+//        up_to = highest version applied afterwards, failed_version and code
+//        say what stopped the run (0 / RC_OK on success)
+// Returns RC_OK (also when nothing was missing), or:
+//   RC_ERR_USAGE     out is 0 (nothing filled), a or s is 0, or the set fails
+//                    rc_migration_check (no statement runs)
+//   RC_ERR_CONFLICT  the ledger has a version the set does not know: the
+//                    store is ahead of the code. failed_version is that one;
+//                    nothing is applied
+//   RC_ERR_NOMEM     an allocation failed
+//   RC_ERR_ADAPTER   the ledger SELECT returned an unreadable shape
+//   any code from the adapter or an `up` callback; that migration is rolled
+//   back, failed_version names it, and earlier ones in this run stay applied
 //
-// Exec sequence, and it is asserted by call count in the test:
-//   1. ledger DDL                       (no transaction)
+// Statement sequence, asserted by call count in the test:
+//   1. ledger CREATE IF NOT EXISTS      (no transaction)
 //   2. ledger SELECT                    (no transaction)
-//   3. per missing migration: up_sql, then the ledger INSERT, then commit
-//
-// A set that fails rc_migration_check performs no exec at all.
+//   3. per missing migration: begin, up_sql / up, the ledger INSERT, commit
 export fn rc_migration_run(a: RcAdapter*, s: RcMigrationSet*,
                            out: RcMigrationReport*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
@@ -485,10 +535,10 @@ fn rc_mig_revert(a: RcAdapter*, m: RcMigration, buf: RcBuf*) -> int32 {
     return rc;
   }
   rc_buf_clear(buf);
-  rc = rc_migration_ledger_delete(buf);
-  var st: RcStmt;
-  if (rc == RC_OK) { rc = rc_migration_ledger_delete_stmt(&st); }
+  var st: RcStmt = rc_stmt_new(RC_OP_DELETE, RC_MIG_LEDGER);
   defer rc_stmt_free(&st);
+  rc = rc_migration_ledger_delete(buf);
+  if (rc == RC_OK) { rc = rc_migration_ledger_delete_stmt(&st); }
   if (rc != RC_OK) {
     rc_adapter_rollback(a);
     return rc;
@@ -496,22 +546,37 @@ fn rc_mig_revert(a: RcAdapter*, m: RcMigration, buf: RcBuf*) -> int32 {
   var args: RcValue[1];
   args[0] = RcInt(m.version);
   rc = rc_adapter_run(a, rc_buf_text(buf), &st, &args[0], 1, &res);
+  rc_result_free(&res);
   if (rc != RC_OK) {
     rc_adapter_rollback(a);
     return rc;
   }
-  rc_result_free(&res);
   rc = rc_adapter_commit(a);
   if (rc != RC_OK) { rc_adapter_rollback(a); }
   return rc;
 }
 
 // Rolls back every applied version above `to`, newest first, each in its own
-// transaction (like `mix ecto.rollback --to`). `to` = 0 rolls back everything.
-// Before anything runs, a version to undo that the code does not know is
-// RC_ERR_CONFLICT and one without a down step is RC_ERR_UNSUPPORTED, both with
-// failed_version set. The report's `applied` counts rolled-back versions and
-// `up_to` is the highest version still applied.
+// transaction (like `mix ecto.rollback --to`): the down step, then the ledger
+// row is deleted.
+//   a    the adapter; borrowed, already open
+//   s    the set; borrowed
+//   to   keep versions <= to; 0 rolls back everything; must be >= 0
+//   out  the report; always filled: applied = versions rolled back, up_to =
+//        highest version still applied on success, failed_version and code
+//        say what stopped it (0 / RC_OK on success)
+// Returns RC_OK (also when nothing is above `to`), or:
+//   RC_ERR_USAGE        out is 0 (nothing filled), a or s is 0, to < 0, or the
+//                       set fails rc_migration_check
+//   RC_ERR_CONFLICT     an applied version above `to` is not in the set
+//   RC_ERR_UNSUPPORTED  an applied version above `to` has no down step
+//   RC_ERR_NOMEM        an allocation failed
+//   RC_ERR_ADAPTER      the ledger SELECT returned an unreadable shape
+//   any code from the adapter or a `down` callback; that version's
+//   transaction is rolled back, failed_version names it, and versions undone
+//   before it stay undone
+// CONFLICT and UNSUPPORTED are checked for every version first, so either one
+// means nothing was rolled back.
 export fn rc_migration_down(a: RcAdapter*, s: RcMigrationSet*, to: int64,
                             out: RcMigrationReport*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
@@ -565,8 +630,10 @@ export fn rc_migration_down(a: RcAdapter*, s: RcMigrationSet*, to: int64,
     if (m.version > to && rc_mig_has(applied, n_applied, m.version)) {
       rc = rc_mig_revert(a, m, &buf);
       if (rc != RC_OK) {
+        // Everything above m was undone; m itself was rolled back intact.
         out->code = rc;
         out->failed_version = m.version;
+        out->up_to = m.version;
         return rc;
       }
       out->applied = out->applied + 1;

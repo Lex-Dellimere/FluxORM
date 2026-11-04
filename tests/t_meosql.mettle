@@ -230,7 +230,7 @@ fn check_offline() -> int32 {
   // A join is refused before anything is sent.
   var jq: RcQuery = rc_query_select(user_meta());
   defer rc_query_free(&jq);
-  rc_query_join(&jq, post_meta(), 0, 1, RC_JOIN_INNER);
+  rc_query_join_field(&jq, post_meta(), 0, 1, RC_JOIN_INNER);
   if (rc_query_exec(&jq, a, &res) != RC_ERR_UNSUPPORTED) { return 5; }
   // Bad addresses.
   if (rc_adapter_open(a, "127.0.0.1:") != RC_ERR_USAGE) { return 6; }

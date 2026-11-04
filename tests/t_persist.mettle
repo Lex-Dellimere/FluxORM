@@ -43,13 +43,13 @@ fn check_insert() -> int32 {
   memset((rawptr)&u, 0, (int64)sizeof(User));
   var e: RcEntity = rc_entity_new(m, (rawptr)&u);
 
-  if (rc_entity_set(&e, 1, RcText("ada@example.com")) != RC_OK) { return 2; }
-  if (rc_entity_set(&e, 2, RcText("Ada")) != RC_OK) { return 3; }
-  if (rc_entity_set(&e, 3, RcNull) != RC_OK) { return 4; }   // nullable age
-  if (rc_entity_set(&e, 4, RcBool(true)) != RC_OK) { return 5; }
-  if (rc_entity_set(&e, 5, RcFloat(9.5)) != RC_OK) { return 6; }
-  if (rc_entity_set(&e, 6, RcTime(1700000000000000)) != RC_OK) { return 7; }
-  if (rc_entity_set(&e, 7, RcInt(2)) != RC_OK) { return 8; }
+  if (rc_entity_set_field(&e, 1, RcText("ada@example.com")) != RC_OK) { return 2; }
+  if (rc_entity_set_field(&e, 2, RcText("Ada")) != RC_OK) { return 3; }
+  if (rc_entity_set_field(&e, 3, RcNull) != RC_OK) { return 4; }   // nullable age
+  if (rc_entity_set_field(&e, 4, RcBool(true)) != RC_OK) { return 5; }
+  if (rc_entity_set_field(&e, 5, RcFloat(9.5)) != RC_OK) { return 6; }
+  if (rc_entity_set_field(&e, 6, RcTime(1700000000000000)) != RC_OK) { return 7; }
+  if (rc_entity_set_field(&e, 7, RcInt(2)) != RC_OK) { return 8; }
 
   if (rc_mem_push_ok(a, 1, 42) != RC_OK) { return 9; }
   if (rc_persist_insert(a, &e) != RC_OK) { return 10; }
@@ -88,12 +88,12 @@ fn check_insert_explicit_key() -> int32 {
   var u: User;
   memset((rawptr)&u, 0, (int64)sizeof(User));
   var e: RcEntity = rc_entity_new(m, (rawptr)&u);
-  if (rc_entity_set(&e, 0, RcInt(7)) != RC_OK) { return 2; }
-  if (rc_entity_set(&e, 1, RcText("b@example.com")) != RC_OK) { return 3; }
-  if (rc_entity_set(&e, 2, RcText("Bob")) != RC_OK) { return 4; }
-  if (rc_entity_set(&e, 4, RcBool(false)) != RC_OK) { return 5; }
-  if (rc_entity_set(&e, 6, RcTime(1)) != RC_OK) { return 6; }
-  if (rc_entity_set(&e, 7, RcInt(1)) != RC_OK) { return 7; }
+  if (rc_entity_set_field(&e, 0, RcInt(7)) != RC_OK) { return 2; }
+  if (rc_entity_set_field(&e, 1, RcText("b@example.com")) != RC_OK) { return 3; }
+  if (rc_entity_set_field(&e, 2, RcText("Bob")) != RC_OK) { return 4; }
+  if (rc_entity_set_field(&e, 4, RcBool(false)) != RC_OK) { return 5; }
+  if (rc_entity_set_field(&e, 6, RcTime(1)) != RC_OK) { return 6; }
+  if (rc_entity_set_field(&e, 7, RcInt(1)) != RC_OK) { return 7; }
 
   if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 8; }
   if (rc_persist_insert(a, &e) != RC_OK) { return 9; }
@@ -178,7 +178,7 @@ fn check_delete() -> int32 {
   var u: User;
   memset((rawptr)&u, 0, (int64)sizeof(User));
   var e: RcEntity = rc_entity_new(m, (rawptr)&u);
-  if (rc_entity_set(&e, 0, RcInt(42)) != RC_OK) { return 2; }
+  if (rc_entity_set_field(&e, 0, RcInt(42)) != RC_OK) { return 2; }
   e.state = RC_ST_CLEAN;
 
   if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 3; }
@@ -210,11 +210,11 @@ fn check_insert_conflict_keeps_state() -> int32 {
   var u: User;
   memset((rawptr)&u, 0, (int64)sizeof(User));
   var e: RcEntity = rc_entity_new(m, (rawptr)&u);
-  if (rc_entity_set(&e, 1, RcText("dup@example.com")) != RC_OK) { return 2; }
-  if (rc_entity_set(&e, 2, RcText("Dup")) != RC_OK) { return 3; }
-  if (rc_entity_set(&e, 4, RcBool(true)) != RC_OK) { return 4; }
-  if (rc_entity_set(&e, 6, RcTime(5)) != RC_OK) { return 5; }
-  if (rc_entity_set(&e, 7, RcInt(2)) != RC_OK) { return 6; }
+  if (rc_entity_set_field(&e, 1, RcText("dup@example.com")) != RC_OK) { return 2; }
+  if (rc_entity_set_field(&e, 2, RcText("Dup")) != RC_OK) { return 3; }
+  if (rc_entity_set_field(&e, 4, RcBool(true)) != RC_OK) { return 4; }
+  if (rc_entity_set_field(&e, 6, RcTime(5)) != RC_OK) { return 5; }
+  if (rc_entity_set_field(&e, 7, RcInt(2)) != RC_OK) { return 6; }
 
   if (rc_mem_fail_next(a, RC_ERR_CONFLICT) != RC_OK) { return 7; }
   if (rc_persist_insert(a, &e) != RC_ERR_CONFLICT) { return 8; }
@@ -223,7 +223,7 @@ fn check_insert_conflict_keeps_state() -> int32 {
   if (rc_entity_has_pk(&e)) { return 10; }
   if (u.id != 0) { return 11; }
   var kept: RcValue = RcNull;
-  if (rc_entity_get(&e, 1, &kept) != RC_OK) { return 12; }
+  if (rc_entity_get_field(&e, 1, &kept) != RC_OK) { return 12; }
   if (!rc_value_same(kept, RcText("dup@example.com"))) { return 21; }
 
   // The retry is a fresh statement and succeeds.
@@ -237,7 +237,7 @@ fn check_insert_conflict_keeps_state() -> int32 {
   var d: Doc;
   memset((rawptr)&d, 0, (int64)sizeof(Doc));
   var de: RcEntity = rc_entity_new(dm, (rawptr)&d);
-  if (rc_entity_set(&de, 0, RcInt(1)) != RC_OK) { return 17; }
+  if (rc_entity_set_field(&de, 0, RcInt(1)) != RC_OK) { return 17; }
   var before: int32 = rc_mem_call_count(a);
   if (rc_persist_insert(a, &de) != RC_ERR_UNSUPPORTED) { return 18; }
   if (rc_mem_call_count(a) != before) { return 19; }
@@ -255,7 +255,7 @@ fn check_versioned() -> int32 {
   memset((rawptr)&n, 0, (int64)sizeof(Note));
   n.version = 9;
   var e: RcEntity = rc_entity_new(m, (rawptr)&n);
-  if (rc_entity_set(&e, 1, RcText("hi")) != RC_OK) { return 2; }
+  if (rc_entity_set_field(&e, 1, RcText("hi")) != RC_OK) { return 2; }
   if (rc_mem_push_ok(a, 1, 5) != RC_OK) { return 3; }
   if (rc_persist_insert(a, &e) != RC_OK) { return 4; }
   if (rc_mem_last_sql(a) != "INSERT INTO \"notes\" (\"text\", \"version\") VALUES (?, ?)") { return 5; }
@@ -283,7 +283,7 @@ fn check_timestamps() -> int32 {
   var t: Task;
   memset((rawptr)&t, 0, (int64)sizeof(Task));
   var e: RcEntity = rc_entity_new(task_meta(), (rawptr)&t);
-  if (rc_entity_set(&e, 1, RcText("write docs")) != RC_OK) { return 2; }
+  if (rc_entity_set_field(&e, 1, RcText("write docs")) != RC_OK) { return 2; }
 
   // No clock: refused, nothing sent.
   rc_clock_clear();

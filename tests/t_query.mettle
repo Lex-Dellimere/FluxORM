@@ -81,7 +81,7 @@ fn check_select_text() -> int32 {
   if (rc_dialect_name(q.dial) != "meosql") { return 4; }
 
   // persist's load statement: WHERE pk = ? LIMIT 1, from where_eq + limit.
-  if (rc_query_where_eq(&q, 0, RcInt(42)) != RC_OK) { return 5; }
+  if (rc_query_where_field(&q, 0, RC_CMP_EQ, RcInt(42)) != RC_OK) { return 5; }
   if (rc_query_limit(&q, 1) != RC_OK) { return 6; }
   if (rc_query_sql(&q) != SELECT_SQL) { return 7; }
   if (rc_query_n_args(&q) != 1) { return 8; }
@@ -105,9 +105,9 @@ fn check_where_args() -> int32 {
   vals[1] = RcInt(31);
   vals[2] = RcInt(32);
 
-  if (rc_query_where_eq(&q, 1, RcText("ada@example.com")) != RC_OK) { return 2; }
-  if (rc_query_where_in(&q, 3, &vals[0], 3) != RC_OK) { return 3; }
-  if (rc_query_where_eq(&q, 7, RcInt(2)) != RC_OK) { return 4; }
+  if (rc_query_where_field(&q, 1, RC_CMP_EQ, RcText("ada@example.com")) != RC_OK) { return 2; }
+  if (rc_query_where_in_field(&q, 3, &vals[0], 3) != RC_OK) { return 3; }
+  if (rc_query_where_field(&q, 7, RC_CMP_EQ, RcInt(2)) != RC_OK) { return 4; }
 
   var want: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" WHERE \"email\" = ? AND \"age\" IN (?, ?, ?) AND \"role\" = ?";
   if (rc_query_sql(&q) != want) { return 5; }
@@ -147,7 +147,7 @@ fn check_null_logic() -> int32 {
   // where_eq(field, RcNull) is three-valued logic: it must emit IS NULL and
   // must not bind a value.
   var q1: RcQuery = rc_query_select(m);
-  if (rc_query_where_eq(&q1, 3, RcNull) != RC_OK) {
+  if (rc_query_where_field(&q1, 3, RC_CMP_EQ, RcNull) != RC_OK) {
     rc_query_free(&q1);
     return 2;
   }
@@ -177,7 +177,7 @@ fn check_null_logic() -> int32 {
 
   // where_null is the same statement, spelled explicitly.
   var q2: RcQuery = rc_query_select(m);
-  if (rc_query_where_null(&q2, 3) != RC_OK) {
+  if (rc_query_where_null_field(&q2, 3) != RC_OK) {
     rc_query_free(&q2);
     return 8;
   }
@@ -190,7 +190,7 @@ fn check_null_logic() -> int32 {
   // where_not_null, and a NULL term followed by a placeholder term: the arg
   // list starts at the placeholder, so the null term does not consume a slot.
   var q3: RcQuery = rc_query_select(m);
-  if (rc_query_where_not_null(&q3, 3) != RC_OK) {
+  if (rc_query_where_not_null_field(&q3, 3) != RC_OK) {
     rc_query_free(&q3);
     return 10;
   }
@@ -201,11 +201,11 @@ fn check_null_logic() -> int32 {
   rc_query_free(&q3);
 
   var q4: RcQuery = rc_query_select(m);
-  if (rc_query_where_eq(&q4, 3, RcNull) != RC_OK) {
+  if (rc_query_where_field(&q4, 3, RC_CMP_EQ, RcNull) != RC_OK) {
     rc_query_free(&q4);
     return 12;
   }
-  if (rc_query_where_eq(&q4, 1, RcText("x")) != RC_OK) {
+  if (rc_query_where_field(&q4, 1, RC_CMP_EQ, RcText("x")) != RC_OK) {
     rc_query_free(&q4);
     return 13;
   }
@@ -232,7 +232,7 @@ fn check_order_limit_offset() -> int32 {
 
   var q: RcQuery = rc_query_select(m);
   defer rc_query_free(&q);
-  if (rc_query_order_by(&q, 1, true) != RC_OK) { return 1; }
+  if (rc_query_order_by_field(&q, 1, RC_ASC) != RC_OK) { return 1; }
   if (rc_query_limit(&q, 10) != RC_OK) { return 2; }
   if (rc_query_offset(&q, 5) != RC_OK) { return 3; }
   var want: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" ORDER BY \"email\" ASC LIMIT 10 OFFSET 5";
@@ -242,8 +242,8 @@ fn check_order_limit_offset() -> int32 {
   // Repeated order_by appends a term; there is exactly one ORDER BY keyword.
   var q2: RcQuery = rc_query_select(m);
   defer rc_query_free(&q2);
-  if (rc_query_order_by(&q2, 2, false) != RC_OK) { return 6; }
-  if (rc_query_order_by(&q2, 1, true) != RC_OK) { return 7; }
+  if (rc_query_order_by_field(&q2, 2, RC_DESC) != RC_OK) { return 6; }
+  if (rc_query_order_by_field(&q2, 1, RC_ASC) != RC_OK) { return 7; }
   if (rc_query_sql(&q2) != "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" ORDER BY \"name\" DESC, \"email\" ASC") {
     return 8;
   }
@@ -255,7 +255,7 @@ fn check_order_limit_offset() -> int32 {
   defer rc_query_free(&q3);
   if (rc_query_limit(&q3, 1) != RC_OK) { return 11; }
   if (rc_query_limit(&q3, 2) != RC_ERR_USAGE) { return 12; }
-  if (rc_query_order_by(&q3, 1, true) != RC_ERR_USAGE) { return 13; }
+  if (rc_query_order_by_field(&q3, 1, RC_ASC) != RC_ERR_USAGE) { return 13; }
   if (rc_query_offset(&q3, 1) != RC_OK) { return 14; }
   if (rc_query_offset(&q3, 2) != RC_ERR_USAGE) { return 15; }
   if (rc_query_sql(&q3) != "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" LIMIT 1 OFFSET 1") {
@@ -276,7 +276,7 @@ fn check_join() -> int32 {
 
   var q: RcQuery = rc_query_select(um);
   defer rc_query_free(&q);
-  if (rc_query_join(&q, pm, 0, 1, RC_JOIN_LEFT) != RC_OK) { return 2; }
+  if (rc_query_join_field(&q, pm, 0, 1, RC_JOIN_LEFT) != RC_OK) { return 2; }
   var want: string = "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" LEFT JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\"";
   if (rc_query_sql(&q) != want) { return 3; }
   if (rc_query_n_args(&q) != 0) { return 4; }
@@ -290,7 +290,7 @@ fn check_join() -> int32 {
   // INNER is spelled without LEFT.
   var q2: RcQuery = rc_query_select(um);
   defer rc_query_free(&q2);
-  if (rc_query_join(&q2, pm, 0, 1, RC_JOIN_INNER) != RC_OK) { return 8; }
+  if (rc_query_join_field(&q2, pm, 0, 1, RC_JOIN_INNER) != RC_OK) { return 8; }
   if (rc_query_sql(&q2) != "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\"") {
     return 9;
   }
@@ -301,15 +301,15 @@ fn check_join() -> int32 {
 
   var qa: RcQuery = rc_query_select(um);
   defer rc_query_free(&qa);
-  if (rc_query_where_eq(&qa, 1, RcText("ada@example.com")) != RC_OK) { return 10; }
-  if (rc_query_join(&qa, pm, 0, 1, RC_JOIN_LEFT) != RC_OK) { return 11; }
+  if (rc_query_where_field(&qa, 1, RC_CMP_EQ, RcText("ada@example.com")) != RC_OK) { return 10; }
+  if (rc_query_join_field(&qa, pm, 0, 1, RC_JOIN_LEFT) != RC_OK) { return 11; }
   if (rc_query_sql(&qa) != want2) { return 12; }
   if (rc_query_n_args(&qa) != 1) { return 13; }
 
   var qb: RcQuery = rc_query_select(um);
   defer rc_query_free(&qb);
-  if (rc_query_join(&qb, pm, 0, 1, RC_JOIN_LEFT) != RC_OK) { return 14; }
-  if (rc_query_where_eq(&qb, 1, RcText("ada@example.com")) != RC_OK) { return 15; }
+  if (rc_query_join_field(&qb, pm, 0, 1, RC_JOIN_LEFT) != RC_OK) { return 14; }
+  if (rc_query_where_field(&qb, 1, RC_CMP_EQ, RcText("ada@example.com")) != RC_OK) { return 15; }
   if (rc_query_sql(&qb) != want2) { return 16; }
   if (rc_query_sql(&qa) != rc_query_sql(&qb)) { return 17; }
   if (rc_query_n_args(&qb) != 1) { return 18; }
@@ -317,11 +317,11 @@ fn check_join() -> int32 {
   // Refusals: unknown flavour, field outside either table, JOIN after LIMIT.
   var q3: RcQuery = rc_query_select(um);
   defer rc_query_free(&q3);
-  if (rc_query_join(&q3, pm, 0, 1, 9) != RC_ERR_USAGE) { return 19; }
-  if (rc_query_join(&q3, pm, 8, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 20; }
-  if (rc_query_join(&q3, pm, 0, 5, RC_JOIN_INNER) != RC_ERR_USAGE) { return 21; }
+  if (rc_query_join_field(&q3, pm, 0, 1, 9) != RC_ERR_USAGE) { return 19; }
+  if (rc_query_join_field(&q3, pm, 8, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 20; }
+  if (rc_query_join_field(&q3, pm, 0, 5, RC_JOIN_INNER) != RC_ERR_USAGE) { return 21; }
   if (rc_query_limit(&q3, 3) != RC_OK) { return 22; }
-  if (rc_query_join(&q3, pm, 0, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 23; }
+  if (rc_query_join_field(&q3, pm, 0, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 23; }
   if (rc_query_sql(&q3) != "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" LIMIT 3") {
     return 24;
   }
@@ -472,40 +472,40 @@ fn check_misuse() -> int32 {
   defer rc_query_free(&q);
   var one: RcValue[1];
   one[0] = RcInt(7);
-  if (rc_query_where_in(&q, 3, &one[0], 0) != RC_ERR_USAGE) { return 2; }
-  if (rc_query_where_in(&q, 3, &one[0], -1) != RC_ERR_USAGE) { return 3; }
-  if (rc_query_where_in(&q, 3, 0, 2) != RC_ERR_USAGE) { return 4; }
+  if (rc_query_where_in_field(&q, 3, &one[0], 0) != RC_ERR_USAGE) { return 2; }
+  if (rc_query_where_in_field(&q, 3, &one[0], -1) != RC_ERR_USAGE) { return 3; }
+  if (rc_query_where_in_field(&q, 3, 0, 2) != RC_ERR_USAGE) { return 4; }
   if (rc_query_n_args(&q) != 0) { return 5; }
   if (rc_query_sql(&q) != SELECT_BASE) { return 6; }
-  if (rc_query_where_in(&q, 3, &one[0], 1) != RC_OK) { return 7; }
+  if (rc_query_where_in_field(&q, 3, &one[0], 1) != RC_OK) { return 7; }
   if (rc_query_sql(&q) != "SELECT \"id\", \"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\" FROM \"users\" WHERE \"age\" IN (?)") {
     return 8;
   }
 
   // Field index bounds, on both ends.
-  if (rc_query_where_eq(&q, -1, RcInt(1)) != RC_ERR_USAGE) { return 9; }
-  if (rc_query_where_eq(&q, 8, RcInt(1)) != RC_ERR_USAGE) { return 10; }
-  if (rc_query_where_null(&q, 8) != RC_ERR_USAGE) { return 11; }
-  if (rc_query_where_not_null(&q, -1) != RC_ERR_USAGE) { return 12; }
-  if (rc_query_order_by(&q, 8, true) != RC_ERR_USAGE) { return 13; }
-  if (rc_query_join(&q, pm, 8, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 16; }
+  if (rc_query_where_field(&q, -1, RC_CMP_EQ, RcInt(1)) != RC_ERR_USAGE) { return 9; }
+  if (rc_query_where_field(&q, 8, RC_CMP_EQ, RcInt(1)) != RC_ERR_USAGE) { return 10; }
+  if (rc_query_where_null_field(&q, 8) != RC_ERR_USAGE) { return 11; }
+  if (rc_query_where_not_null_field(&q, -1) != RC_ERR_USAGE) { return 12; }
+  if (rc_query_order_by_field(&q, 8, RC_ASC) != RC_ERR_USAGE) { return 13; }
+  if (rc_query_join_field(&q, pm, 8, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 16; }
 
   // Clause order: where/order after LIMIT, and where after ORDER BY.
   if (rc_query_limit(&q, 4) != RC_OK) { return 17; }
   var after_limit: string = rc_query_sql(&q);
-  if (rc_query_where_eq(&q, 1, RcText("x")) != RC_ERR_USAGE) { return 18; }
-  if (rc_query_where_null(&q, 3) != RC_ERR_USAGE) { return 19; }
-  if (rc_query_order_by(&q, 1, true) != RC_ERR_USAGE) { return 20; }
-  if (rc_query_join(&q, pm, 0, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 21; }
+  if (rc_query_where_field(&q, 1, RC_CMP_EQ, RcText("x")) != RC_ERR_USAGE) { return 18; }
+  if (rc_query_where_null_field(&q, 3) != RC_ERR_USAGE) { return 19; }
+  if (rc_query_order_by_field(&q, 1, RC_ASC) != RC_ERR_USAGE) { return 20; }
+  if (rc_query_join_field(&q, pm, 0, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 21; }
   if (rc_query_sql(&q) != after_limit) { return 22; }
   if (rc_mem_call_count(a) != 0) { return 23; }
 
   // A SELECT is not an INSERT; an INSERT is not a WHERE target.
   var ins: RcQuery = rc_query_insert_batch(m, 1);
   defer rc_query_free(&ins);
-  if (rc_query_where_eq(&ins, 0, RcInt(1)) != RC_ERR_USAGE) { return 24; }
+  if (rc_query_where_field(&ins, 0, RC_CMP_EQ, RcInt(1)) != RC_ERR_USAGE) { return 24; }
   if (rc_query_limit(&ins, 1) != RC_ERR_USAGE) { return 25; }
-  if (rc_query_join(&ins, pm, 0, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 26; }
+  if (rc_query_join_field(&ins, pm, 0, 1, RC_JOIN_INNER) != RC_ERR_USAGE) { return 26; }
   if (rc_query_sql(&ins) != "INSERT INTO \"users\" (\"email\", \"name\", \"age\", \"active\", \"score\", \"created_at\", \"role\") VALUES (?, ?, ?, ?, ?, ?, ?)") {
     return 27;
   }
@@ -518,7 +518,7 @@ fn check_misuse() -> int32 {
   var res: RcResult;
   if (rc_query_exec(&bad, a, &res) != RC_ERR_UNSUPPORTED) { return 29; }
   if (rc_mem_call_count(a) != 0) { return 30; }
-  if (rc_query_where_eq(&bad, 0, RcInt(1)) != RC_ERR_UNSUPPORTED) { return 31; }
+  if (rc_query_where_field(&bad, 0, RC_CMP_EQ, RcInt(1)) != RC_ERR_UNSUPPORTED) { return 31; }
   return 0;
 }
 
@@ -541,7 +541,7 @@ fn check_borrowed_args() -> int32 {
   if (heap != "borrowed") { free(p); return 2; }
 
   var q: RcQuery = rc_query_select(m);
-  if (rc_query_where_eq(&q, 1, RcText(heap)) != RC_OK) {
+  if (rc_query_where_field(&q, 1, RC_CMP_EQ, RcText(heap)) != RC_OK) {
     rc_query_free(&q);
     free(p);
     return 3;
@@ -583,10 +583,10 @@ fn check_no_growth() -> int32 {
   var slots0: int32 = q.n_cap;
   if (cap0 <= 0 || slots0 <= 0) { return 1; }
 
-  if (rc_query_where_eq(&q, 1, RcText("a@example.com")) != RC_OK) { return 2; }
-  if (rc_query_where_eq(&q, 3, RcInt(30)) != RC_OK) { return 3; }
-  if (rc_query_where_not_null(&q, 2) != RC_OK) { return 4; }
-  if (rc_query_order_by(&q, 1, true) != RC_OK) { return 5; }
+  if (rc_query_where_field(&q, 1, RC_CMP_EQ, RcText("a@example.com")) != RC_OK) { return 2; }
+  if (rc_query_where_field(&q, 3, RC_CMP_EQ, RcInt(30)) != RC_OK) { return 3; }
+  if (rc_query_where_not_null_field(&q, 2) != RC_OK) { return 4; }
+  if (rc_query_order_by_field(&q, 1, RC_ASC) != RC_OK) { return 5; }
   if (rc_query_limit(&q, 10) != RC_OK) { return 6; }
   if (rc_query_offset(&q, 5) != RC_OK) { return 7; }
 
@@ -608,7 +608,7 @@ fn check_exec_thin() -> int32 {
   var m: RcMeta = user_meta();
   var q: RcQuery = rc_query_select(m);
   defer rc_query_free(&q);
-  if (rc_query_where_eq(&q, 6, RcTime(1700000000000000)) != RC_OK) { return 2; }
+  if (rc_query_where_field(&q, 6, RC_CMP_EQ, RcTime(1700000000000000)) != RC_OK) { return 2; }
 
   // An adapter failure is passed through unchanged and records nothing: the
   // builder adds no retry, no translation, no state.
@@ -657,7 +657,7 @@ fn check_update() -> int32 {
   if (rc_query_sql(&q) != "UPDATE \"users\" SET \"name\" = ?, \"age\" = ?") { return 3; }
 
   // WHERE before the SET values are all in would bind out of order.
-  if (rc_query_where_eq(&q, 0, RcInt(42)) != RC_ERR_USAGE) { return 4; }
+  if (rc_query_where_field(&q, 0, RC_CMP_EQ, RcInt(42)) != RC_ERR_USAGE) { return 4; }
   var res: RcResult;
   if (rc_query_exec(&q, a, &res) != RC_ERR_USAGE) { return 5; }
   if (rc_query_push_arg(&q, RcText("Grace")) != RC_OK) { return 6; }
@@ -669,17 +669,17 @@ fn check_update() -> int32 {
   if (rc_mem_call_count(a) != 0) { return 10; }
 
   // SELECT-only clauses stay SELECT-only.
-  if (rc_query_order_by(&q, 0, true) != RC_ERR_USAGE) { return 11; }
+  if (rc_query_order_by_field(&q, 0, RC_ASC) != RC_ERR_USAGE) { return 11; }
   if (rc_query_limit(&q, 1) != RC_ERR_USAGE) { return 12; }
 
-  if (rc_query_where_eq(&q, 0, RcInt(42)) != RC_OK) { return 13; }
+  if (rc_query_where_field(&q, 0, RC_CMP_EQ, RcInt(42)) != RC_OK) { return 13; }
   var want: string = "UPDATE \"users\" SET \"name\" = ?, \"age\" = ? WHERE \"id\" = ?";
   // A second WHERE term after the first is fine.
   var q2: RcQuery = rc_query_update(m, rc_nulls_set((uint64)0, 2));
   defer rc_query_free(&q2);
   if (rc_query_push_arg(&q2, RcText("x")) != RC_OK) { return 27; }
-  if (rc_query_where_eq(&q2, 0, RcInt(1)) != RC_OK) { return 28; }
-  if (rc_query_where_eq(&q2, 7, RcInt(2)) != RC_OK) { return 29; }
+  if (rc_query_where_field(&q2, 0, RC_CMP_EQ, RcInt(1)) != RC_OK) { return 28; }
+  if (rc_query_where_field(&q2, 7, RC_CMP_EQ, RcInt(2)) != RC_OK) { return 29; }
   if (rc_query_sql(&q) != want) { return 14; }
   if (rc_query_n_args(&q) != 3) { return 15; }
   if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 16; }
@@ -696,7 +696,7 @@ fn check_update() -> int32 {
   var qn: RcQuery = rc_query_update(m, rc_nulls_set((uint64)0, 3));
   defer rc_query_free(&qn);
   if (rc_query_push_arg(&qn, RcNull) != RC_OK) { return 23; }
-  if (rc_query_where_eq(&qn, 5, RcNull) != RC_OK) { return 24; }
+  if (rc_query_where_field(&qn, 5, RC_CMP_EQ, RcNull) != RC_OK) { return 24; }
   if (rc_query_sql(&qn) != "UPDATE \"users\" SET \"age\" = ? WHERE \"score\" IS NULL") { return 25; }
   if (has_text(rc_query_sql(&qn), "= NULL")) { return 26; }
   return 0;
@@ -739,12 +739,12 @@ fn check_where_cmp() -> int32 {
   var q: RcQuery = rc_query_select(m);
   defer rc_query_free(&q);
 
-  if (rc_query_where_cmp(&q, 3, RC_CMP_GE, RcInt(18)) != RC_OK) { return 1; }
-  if (rc_query_where_cmp(&q, 3, RC_CMP_LT, RcInt(65)) != RC_OK) { return 2; }
-  if (rc_query_where_cmp(&q, 5, RC_CMP_GT, RcFloat(1.5)) != RC_OK) { return 3; }
-  if (rc_query_where_cmp(&q, 5, RC_CMP_LE, RcFloat(9.5)) != RC_OK) { return 4; }
-  if (rc_query_where_cmp(&q, 7, RC_CMP_NE, RcInt(1)) != RC_OK) { return 5; }
-  if (rc_query_where_cmp(&q, 1, RC_CMP_EQ, RcText("ada@example.com")) != RC_OK) { return 6; }
+  if (rc_query_where_field(&q, 3, RC_CMP_GE, RcInt(18)) != RC_OK) { return 1; }
+  if (rc_query_where_field(&q, 3, RC_CMP_LT, RcInt(65)) != RC_OK) { return 2; }
+  if (rc_query_where_field(&q, 5, RC_CMP_GT, RcFloat(1.5)) != RC_OK) { return 3; }
+  if (rc_query_where_field(&q, 5, RC_CMP_LE, RcFloat(9.5)) != RC_OK) { return 4; }
+  if (rc_query_where_field(&q, 7, RC_CMP_NE, RcInt(1)) != RC_OK) { return 5; }
+  if (rc_query_where_field(&q, 1, RC_CMP_EQ, RcText("ada@example.com")) != RC_OK) { return 6; }
   var want: string = SELECT_BASE + " WHERE \"age\" >= ? AND \"age\" < ? AND \"score\" > ? AND \"score\" <= ? AND \"role\" <> ? AND \"email\" = ?";
   if (rc_query_sql(&q) != want) { return 7; }
   if (rc_query_n_args(&q) != 6) { return 8; }
@@ -757,32 +757,61 @@ fn check_where_cmp() -> int32 {
   // and leaves the statement exactly as it was.
   var qn: RcQuery = rc_query_select(m);
   defer rc_query_free(&qn);
-  if (rc_query_where_cmp(&qn, 3, RC_CMP_NE, RcNull) != RC_OK) { return 12; }
-  if (rc_query_where_cmp(&qn, 5, RC_CMP_EQ, RcNull) != RC_OK) { return 13; }
+  if (rc_query_where_field(&qn, 3, RC_CMP_NE, RcNull) != RC_OK) { return 12; }
+  if (rc_query_where_field(&qn, 5, RC_CMP_EQ, RcNull) != RC_OK) { return 13; }
   var before: string = SELECT_BASE + " WHERE \"age\" IS NOT NULL AND \"score\" IS NULL";
   if (rc_query_sql(&qn) != before) { return 14; }
-  if (rc_query_where_cmp(&qn, 3, RC_CMP_LT, RcNull) != RC_ERR_USAGE) { return 15; }
-  if (rc_query_where_cmp(&qn, 3, RC_CMP_GE, RcNull) != RC_ERR_USAGE) { return 16; }
+  if (rc_query_where_field(&qn, 3, RC_CMP_LT, RcNull) != RC_ERR_USAGE) { return 15; }
+  if (rc_query_where_field(&qn, 3, RC_CMP_GE, RcNull) != RC_ERR_USAGE) { return 16; }
   if (rc_query_sql(&qn) != before) { return 17; }
   if (rc_query_n_args(&qn) != 0) { return 18; }
   if (has_text(rc_query_sql(&qn), "NULL ?")) { return 19; }
 
   // Unknown operator and bad field index are refused without changing the text.
-  if (rc_query_where_cmp(&qn, 3, 99, RcInt(1)) != RC_ERR_USAGE) { return 20; }
-  if (rc_query_where_cmp(&qn, -1, RC_CMP_LT, RcInt(1)) != RC_ERR_USAGE) { return 21; }
-  if (rc_query_where_cmp(&qn, 8, RC_CMP_LT, RcInt(1)) != RC_ERR_USAGE) { return 22; }
+  if (rc_query_where_field(&qn, 3, 99, RcInt(1)) != RC_ERR_USAGE) { return 20; }
+  if (rc_query_where_field(&qn, -1, RC_CMP_LT, RcInt(1)) != RC_ERR_USAGE) { return 21; }
+  if (rc_query_where_field(&qn, 8, RC_CMP_LT, RcInt(1)) != RC_ERR_USAGE) { return 22; }
   if (rc_query_sql(&qn) != before) { return 23; }
 
   // After ORDER BY a WHERE term is a clause-order bug.
-  if (rc_query_order_by(&qn, 0, true) != RC_OK) { return 24; }
-  if (rc_query_where_cmp(&qn, 3, RC_CMP_GT, RcInt(1)) != RC_ERR_USAGE) { return 25; }
+  if (rc_query_order_by_field(&qn, 0, RC_ASC) != RC_OK) { return 24; }
+  if (rc_query_where_field(&qn, 3, RC_CMP_GT, RcInt(1)) != RC_ERR_USAGE) { return 25; }
 
   // An UPDATE can be keyed by a comparison too.
   var qu: RcQuery = rc_query_update(m, rc_nulls_set((uint64)0, 4));
   defer rc_query_free(&qu);
   if (rc_query_push_arg(&qu, RcBool(false)) != RC_OK) { return 26; }
-  if (rc_query_where_cmp(&qu, 6, RC_CMP_LT, RcTime(1700000000000000)) != RC_OK) { return 27; }
+  if (rc_query_where_field(&qu, 6, RC_CMP_LT, RcTime(1700000000000000)) != RC_OK) { return 27; }
   if (rc_query_sql(&qu) != "UPDATE \"users\" SET \"active\" = ? WHERE \"created_at\" < ?") { return 28; }
+  return 0;
+}
+
+// --- 15. columns by name -------------------------------------------------------
+
+fn check_names() -> int32 {
+  var q: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&q);
+  var ages: RcValue[2];
+  ages[0] = RcInt(30);
+  ages[1] = RcInt(31);
+  if (rc_query_where(&q, "email", RC_CMP_EQ, RcText("a@b.c")) != RC_OK) { return 1; }
+  if (rc_query_where_in(&q, "age", &ages[0], 2) != RC_OK) { return 2; }
+  if (rc_query_where_null(&q, "score") != RC_OK) { return 3; }
+  if (rc_query_where_not_null(&q, "role") != RC_OK) { return 4; }
+  if (rc_query_order_by(&q, "name", RC_DESC) != RC_OK) { return 5; }
+  var want: string = SELECT_BASE + " WHERE \"email\" = ? AND \"age\" IN (?, ?) AND \"score\" IS NULL AND \"role\" IS NOT NULL ORDER BY \"name\" DESC";
+  if (rc_query_sql(&q) != want) { return 6; }
+  // Unknown names and directions are refused and change nothing.
+  if (rc_query_where(&q, "nope", RC_CMP_EQ, RcInt(1)) != RC_ERR_USAGE) { return 7; }
+  if (rc_query_order_by(&q, "nope", RC_ASC) != RC_ERR_USAGE) { return 8; }
+  if (rc_query_order_by(&q, "age", 7) != RC_ERR_USAGE) { return 9; }
+  if (rc_query_sql(&q) != want) { return 10; }
+
+  var jq: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&jq);
+  if (rc_query_join(&jq, post_meta(), "id", "user_id", RC_JOIN_LEFT) != RC_OK) { return 11; }
+  if (rc_query_sql(&jq) != SELECT_BASE + " LEFT JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\"") { return 12; }
+  if (rc_query_join(&jq, post_meta(), "id", "nope", RC_JOIN_INNER) != RC_ERR_USAGE) { return 13; }
   return 0;
 }
 
@@ -802,7 +831,8 @@ export fn main() -> int32 {
   if (!rc_report("query: update from a dirty mask", check_update())) { failures = failures + 1; }
   if (!rc_report("query: unsafe updates are refused", check_update_refusals())) { failures = failures + 1; }
   if (!rc_report("query: comparison operators", check_where_cmp())) { failures = failures + 1; }
-  return rc_summary(failures, 14);
+  if (!rc_report("query: columns by name", check_names())) { failures = failures + 1; }
+  return rc_summary(failures, 15);
 }
 
 @test fn t_query() -> int32 {
@@ -820,5 +850,6 @@ export fn main() -> int32 {
   if (check_update() != 0) { return 12; }
   if (check_update_refusals() != 0) { return 13; }
   if (check_where_cmp() != 0) { return 14; }
+  if (check_names() != 0) { return 15; }
   return 0;
 }

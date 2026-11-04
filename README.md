@@ -98,12 +98,13 @@ var n: Note;
 memset((rawptr)&n, 0, (int64)sizeof(Note));
 var e: RcEntity = rc_entity_new(note_meta(), (rawptr)&n);
 var cs: RcChangeset = rc_changeset_new(note_meta());
-rc_changeset_put_text(&cs, 1, "draft");
-rc_validate_length(&cs, 1, 1, 200);
-rc_changeset_unique(&cs, 1);  // a duplicate key is reported on "text"
+rc_changeset_cast(&cs, "text", "draft");
+rc_validate_required(&cs, "text");
+rc_validate_length(&cs, "text", 1, 200);
+rc_changeset_unique(&cs, "text");  // a duplicate key is reported on "text"
 rc_repo_insert(&s, &cs, &e);
 // On failure, rc_changeset_error_at(&cs, i) for i < rc_changeset_error_count(&cs)
-// gives each error's field, code and reason ("is too long", ...).
+// gives each error's field name, code and reason ("is too long", ...).
 rc_changeset_free(&cs);
 
 // Load by key, change one field, save. Only "text" is sent, matched on the
@@ -113,15 +114,15 @@ var ge: RcEntity;
 rc_repo_get(&s, note_meta(), RcInt(n.id), (rawptr)&got, &ge);
 var edit: RcChangeset = rc_changeset_new(note_meta());
 rc_changeset_bind(&edit, (rawptr)&got, ge.nulls);
-rc_changeset_put_text(&edit, 1, "final");
+rc_changeset_cast(&edit, "text", "final");
 var rc: int32 = rc_repo_update(&s, &edit, &ge);
 // RC_ERR_CONFLICT: someone else changed the row first; nothing was written.
 rc_changeset_free(&edit);
 
 // Query, and read each row into a model.
 var q: RcQuery = rc_query_select(note_meta());
-rc_query_where_cmp(&q, 2, RC_CMP_GT, RcInt(1));
-rc_query_order_by(&q, 0, true);
+rc_query_where(&q, "version", RC_CMP_GT, RcInt(1));
+rc_query_order_by(&q, "id", RC_ASC);
 var rows: RcRows;
 rc_repo_all(&s, &q, &rows);
 var i: int32 = 0;
@@ -171,14 +172,65 @@ rc_migration_down(adapter, &set, 0, &rep);  // roll back to version 0
 `rc_migration_add_column`, `rc_migration_create_index` and
 `rc_migration_drop_index` cover the other schema changes.
 
-For many rows at once, build `rc_query_update_all`, `rc_query_delete` or
-`rc_query_count`, add WHERE terms, and run it with `rc_repo_update_all`,
-`rc_repo_delete_all` or `rc_repo_count`. An UPDATE or DELETE without a WHERE is
-refused.
+Load a relation for many owners in one statement, after Ecto's preload:
+
+```mettle
+var posts_rel: RcRelation = rc_relation_has_many("posts", user_meta(), "id",
+                                                 post_meta(), "user_id");
+var pre: RcPreload;
+rc_repo_preload(&s, &users, &posts_rel, &pre);   // users: from rc_repo_all
+var n: int32 = rc_preload_count(&pre, &user);    // user: one of those rows
+rc_preload_get(&pre, &user, 0, (rawptr)&post, &post_e);
+```
+
+For many rows at once:
+
+```mettle
+var up: RcQuery = rc_query_update_all(user_meta());
+rc_query_set(&up, "active", RcBool(false));
+rc_query_where(&up, "created_at", RC_CMP_LT, RcTime(cutoff));
+var changed: int32 = 0;
+rc_repo_update_all(&s, &up, &changed);
+rc_query_free(&up);
+```
+
+`rc_query_delete` and `rc_query_count` work the same way with
+`rc_repo_delete_all` and `rc_repo_count`. An UPDATE or DELETE without a WHERE
+is refused.
 
 Every call returns an `RC_*` code (`src/core/status.mettle`). `rc_repo_one`
 expects exactly one row. Wrap related writes in
 `rc_session_begin`/`rc_session_commit`, or `rc_session_transaction`.
+
+## Reference
+
+Every exported function has a comment above it in `src/` with its inputs,
+what it returns and who owns what. This is the map of the calls an app uses.
+
+Conventions:
+- Every call returns an `RC_*` status (`src/core/status.mettle`): `RC_OK` or
+  an `RC_ERR_*` code. Results come back through out-parameters.
+- Columns and fields are named by their field name (or the column name from
+  the override table). Each such call has a `_field` twin that takes a field
+  index instead, for generated code.
+- Values (`RcValue`) passed in are borrowed: keep text alive until the call
+  that uses them has run. Query constructors report failure in the query's
+  `err`, and `rc_query_exec` returns it.
+
+| Area | Calls |
+|---|---|
+| Models | `rc_schema_field`, `rc_schema_meta`, `rc_schema_status` |
+| Session | `rc_session_new`, `rc_session_begin`, `rc_session_commit`, `rc_session_rollback`, `rc_session_transaction`, `rc_session_clear`, `rc_session_free` |
+| Repo | `rc_repo_insert`, `rc_repo_get`, `rc_repo_one`, `rc_repo_all` + `rc_rows_get`, `rc_repo_update`, `rc_repo_delete`, `rc_repo_update_all`, `rc_repo_delete_all`, `rc_repo_count`, `rc_repo_multi`, `rc_repo_preload`, `rc_repo_preload_one`, `rc_preload_count`, `rc_preload_get` |
+| Queries | `rc_query_select`, `rc_query_where`, `rc_query_where_in`, `rc_query_where_null`, `rc_query_where_not_null`, `rc_query_order_by`, `rc_query_limit`, `rc_query_offset`, `rc_query_join`, `rc_query_update_all` + `rc_query_set`, `rc_query_delete`, `rc_query_count`, `rc_query_free` |
+| Changesets | `rc_changeset_new`, `rc_changeset_bind`, `rc_changeset_cast`, `rc_changeset_put`, `rc_changeset_put_null`, `rc_changeset_changed`, `rc_changeset_unique`, `rc_changeset_valid`, `rc_changeset_error_count`, `rc_changeset_error_at`, `rc_changeset_free` |
+| Validations | `rc_validate_required`, `rc_validate_length`, `rc_validate_int`, `rc_validate_float`, `rc_validate_inclusion`, `rc_validate_change` |
+| Entities | `rc_entity_new`, `rc_entity_get`, `rc_entity_set`, `rc_entity_pk` |
+| Multi | `rc_multi_new`, `rc_multi_insert`, `rc_multi_update`, `rc_multi_delete`, `rc_multi_update_all`, `rc_multi_delete_all`, `rc_multi_run`, `rc_multi_failed_name`, `rc_multi_free` |
+| Relations | `rc_relation_has_many`, `rc_relation_belongs_to`, `rc_relation_has_many_through`, `rc_relation_load`, `rc_relation_group`, `rc_relation_count`, `rc_relation_hydrate`, `rc_relation_free` |
+| Migrations | `rc_migration_set`, `rc_migration_run`, `rc_migration_down`, `rc_migration_create`, `rc_migration_drop`, `rc_migration_add_column`, `rc_migration_create_index`, `rc_migration_drop_index` |
+| Adapters | `rc_meosql_adapter`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
+| Clock | `rc_clock_set`, `rc_clock_realtime_us` |
 
 ## Build and test
 

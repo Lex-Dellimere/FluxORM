@@ -23,9 +23,9 @@ fn new_adapter(out: RcAdapter**) -> int32 {
 fn loaded_note(n: Note*, e: RcEntity*) -> int32 {
   memset((rawptr)n, 0, (int64)sizeof(Note));
   *e = rc_entity_new(note_meta(), (rawptr)n);
-  if (rc_entity_set(e, 0, RcInt(5)) != RC_OK) { return 1; }
-  if (rc_entity_set(e, 1, RcText("draft")) != RC_OK) { return 2; }
-  if (rc_entity_set(e, 2, RcInt(3)) != RC_OK) { return 3; }
+  if (rc_entity_set_field(e, 0, RcInt(5)) != RC_OK) { return 1; }
+  if (rc_entity_set_field(e, 1, RcText("draft")) != RC_OK) { return 2; }
+  if (rc_entity_set_field(e, 2, RcInt(3)) != RC_OK) { return 3; }
   e->state = RC_ST_CLEAN;
   return 0;
 }
@@ -47,15 +47,15 @@ fn fixture(f: Fixture*) -> int32 {
   memset((rawptr)&f->post, 0, (int64)sizeof(Post));
   f->pe = rc_entity_new(post_meta(), (rawptr)&f->post);
   f->pcs = rc_changeset_new(post_meta());
-  if (rc_changeset_put_text(&f->pcs, 1, "7") != RC_OK) { return 1; }
-  if (rc_changeset_put_text(&f->pcs, 2, "Hello") != RC_OK) { return 2; }
+  if (rc_changeset_cast_field(&f->pcs, 1, "7") != RC_OK) { return 1; }
+  if (rc_changeset_cast_field(&f->pcs, 2, "Hello") != RC_OK) { return 2; }
   if (loaded_note(&f->note, &f->ne) != 0) { return 3; }
   f->ncs = rc_changeset_new(note_meta());
   if (rc_changeset_bind(&f->ncs, (rawptr)&f->note, f->ne.nulls) != RC_OK) { return 4; }
-  if (rc_changeset_put_text(&f->ncs, 1, "final") != RC_OK) { return 5; }
+  if (rc_changeset_cast_field(&f->ncs, 1, "final") != RC_OK) { return 5; }
   memset((rawptr)&f->user, 0, (int64)sizeof(User));
   f->ue = rc_entity_loaded(user_meta(), (rawptr)&f->user, (uint64)0);
-  if (rc_entity_set(&f->ue, 0, RcInt(9)) != RC_OK) { return 6; }
+  if (rc_entity_set_field(&f->ue, 0, RcInt(9)) != RC_OK) { return 6; }
   f->ue.state = RC_ST_CLEAN;
   return 0;
 }
@@ -90,11 +90,10 @@ fn check_commit() -> int32 {
   // Names are unique.
   if (rc_multi_delete(&m, "user", &f.ue) != RC_ERR_USAGE) { return 4; }
 
-  var vals: RcValue[8];
-  vals[4] = RcBool(false);
-  var up: RcQuery = rc_query_update_all(user_meta(), rc_nulls_set((uint64)0, 4), &vals[0]);
+  var up: RcQuery = rc_query_update_all(user_meta());
   defer rc_query_free(&up);
-  if (rc_query_where_eq(&up, 7, RcInt(2)) != RC_OK) { return 5; }
+  if (rc_query_set(&up, "active", RcBool(false)) != RC_OK) { return 19; }
+  if (rc_query_where(&up, "role", RC_CMP_EQ, RcInt(2)) != RC_OK) { return 5; }
   if (rc_multi_update_all(&m, "deactivate", &up) != RC_OK) { return 6; }
 
   if (rc_mem_push_ok(a, 1, 40) != RC_OK) { return 7; }
