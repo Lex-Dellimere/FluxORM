@@ -56,7 +56,7 @@
 //
 // What MeoSQL's SQL v1 grammar (D7) does not parse yet, though flux_orm emits
 // it: JOIN / LEFT JOIN (-> RC_ERR_UNSUPPORTED) and the rc_query_where_cmp
-// operators <, <=, >, >=, <> (-> RC_ERR_USAGE); both arrive in MeoSQL M3.
+// operators <, <=, >, >=, <> (also -> RC_ERR_UNSUPPORTED); both arrive in M3.
 // MeoSQL also has no nested transactions; core/session flattens nesting
 // before it reaches the adapter.
 
