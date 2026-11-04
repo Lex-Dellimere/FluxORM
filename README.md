@@ -261,3 +261,7 @@ done
 run that file the same way.
 
 Imports are file-relative, so the compiler can be run from anywhere.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

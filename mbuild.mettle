@@ -9,6 +9,8 @@ import "mbuild/api";
 
 fn project() {
   mb_package("flux_orm", "0.1.0");
+  mb_meta("license", "Apache-2.0");
+  mb_meta("repository", "https://github.com/Lex-Dellimere/FluxORM");
   mb_import_root("src");
   mb_targets("linux");
 }
