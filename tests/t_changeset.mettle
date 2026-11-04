@@ -20,6 +20,7 @@ import "../src/core/status";
 import "../src/core/value";
 import "../src/core/meta";
 import "../src/core/entity";
+import "../src/core/clock";
 import "../src/adapter/adapter";
 import "../src/adapter/mem";
 import "../src/changeset/cast";
@@ -792,6 +793,56 @@ fn check_save_versioned() -> int32 {
   return 0;
 }
 
+// --- 12. save sets the updated timestamp -----------------------------------
+
+fn check_save_timestamps() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_mem(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+
+  var t: Task;
+  memset((rawptr)&t, 0, (int64)sizeof(Task));
+  var e: RcEntity = rc_entity_new(task_meta(), (rawptr)&t);
+  if (rc_entity_set(&e, 0, RcInt(8)) != RC_OK) { return 2; }
+  if (rc_entity_set(&e, 1, RcText("write docs")) != RC_OK) { return 3; }
+  if (rc_entity_set(&e, 2, RcTime(100)) != RC_OK) { return 4; }
+  if (rc_entity_set(&e, 3, RcTime(100)) != RC_OK) { return 5; }
+  e.state = RC_ST_CLEAN;
+  var cs: RcChangeset = rc_changeset_new(task_meta());
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_bind(&cs, (rawptr)&t, e.nulls) != RC_OK) { return 6; }
+  if (rc_changeset_put_text(&cs, 1, "ship docs") != RC_OK) { return 7; }
+
+  // No clock: refused before the model changes.
+  rc_clock_clear();
+  if (rc_changeset_save(a, &cs, &e) != RC_ERR_USAGE) { return 8; }
+  if (t.title != "write docs") { return 9; }
+  if (rc_mem_call_count(a) != 0) { return 10; }
+
+  var cs2: RcChangeset = rc_changeset_new(task_meta());
+  defer rc_changeset_free(&cs2);
+  if (rc_changeset_bind(&cs2, (rawptr)&t, e.nulls) != RC_OK) { return 11; }
+  if (rc_changeset_put_text(&cs2, 1, "ship docs") != RC_OK) { return 12; }
+  rc_clock_set(&test_clock);
+  defer rc_clock_clear();
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 13; }
+  if (rc_changeset_save(a, &cs2, &e) != RC_OK) { return 14; }
+  var want: string = "UPDATE \"tasks\" SET \"title\" = ?, \"updated_at\" = ? WHERE \"id\" = ?";
+  if (rc_mem_last_sql(a) != want) { return 15; }
+  if (!rc_value_same(rc_mem_last_args(a)[1], RcTime(TEST_NOW))) { return 16; }
+  if (t.updated_at != TEST_NOW) { return 17; }
+  if (t.created_at != 100) { return 18; }
+
+  // created_at is never written after insert.
+  var cs3: RcChangeset = rc_changeset_new(task_meta());
+  defer rc_changeset_free(&cs3);
+  if (rc_changeset_bind(&cs3, (rawptr)&t, e.nulls) != RC_OK) { return 19; }
+  if (rc_changeset_put(&cs3, 2, RcTime(5)) != RC_OK) { return 20; }
+  if (rc_changeset_save(a, &cs3, &e) != RC_ERR_USAGE) { return 21; }
+  if (t.created_at != 100) { return 22; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("changeset: cast matrix", check_cast_matrix())) { failures = failures + 1; }
@@ -805,7 +856,8 @@ export fn main() -> int32 {
   if (!rc_report("changeset: save sends one update of the dirty fields", check_save())) { failures = failures + 1; }
   if (!rc_report("changeset: save edges write nothing wrong", check_save_edges())) { failures = failures + 1; }
   if (!rc_report("changeset: versioned save refuses a stale write", check_save_versioned())) { failures = failures + 1; }
-  return rc_summary(failures, 11);
+  if (!rc_report("changeset: save sets the updated timestamp", check_save_timestamps())) { failures = failures + 1; }
+  return rc_summary(failures, 12);
 }
 
 @test fn t_changeset() -> int32 {
@@ -820,5 +872,6 @@ export fn main() -> int32 {
   if (check_save() != 0) { return 9; }
   if (check_save_edges() != 0) { return 10; }
   if (check_save_versioned() != 0) { return 11; }
+  if (check_save_timestamps() != 0) { return 12; }
   return 0;
 }

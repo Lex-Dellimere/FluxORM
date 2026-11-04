@@ -11,6 +11,7 @@ import "value";
 import "meta";
 import "entity";
 import "buf";
+import "clock";
 import "../adapter/adapter";
 
 fn rc_persist_put_columns(b: RcBuf*, m: RcMeta) -> int32 {
@@ -36,7 +37,7 @@ fn rc_persist_put_table(b: RcBuf*, m: RcMeta) -> int32 {
 // Inserts one entity. An auto primary key whose null bit is set is omitted
 // from the column list and read back from the result. `e.nulls` records
 // which other fields are NULL, and those bind as RcNull. A version field
-// always starts at 1.
+// always starts at 1, and created/updated timestamps are set from core/clock.
 export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   if (a == 0 || e == 0) { return RC_ERR_USAGE; }
   if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
@@ -44,6 +45,19 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   var bad: int32 = -1;
   var rc: int32 = rc_meta_check(m, &bad);
   if (rc != RC_OK) { return rc; }
+  if (rc_meta_any(m, RC_F_CREATED | RC_F_UPDATED)) {
+    var now: int64 = 0;
+    rc = rc_clock_now(&now);
+    if (rc != RC_OK) { return rc; }
+    var t: int32 = 0;
+    while (t < m.n_fields) {
+      if ((m.fields[t].flags & (RC_F_CREATED | RC_F_UPDATED)) != 0) {
+        rc = rc_meta_set(m, e->model, &e->nulls, t, RcTime(now));
+        if (rc != RC_OK) { return rc; }
+      }
+      t = t + 1;
+    }
+  }
   var vf: int32 = rc_meta_version(m);
   if (vf >= 0) {
     rc = rc_meta_set(m, e->model, &e->nulls, vf, RcInt(1));

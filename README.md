@@ -4,7 +4,7 @@ An ORM for the [MeoSQL](../meosql) database, written in Mettle.
 
 Status: models, queries, inserts, loads, updates of changed fields, deletes,
 relations without N+1, up-only migrations, sessions with transactions and
-stale-write detection all work and are tested in the interpreter, debug and
+stale-write detection and automatic timestamps all work and are tested in the interpreter, debug and
 release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub until
 MeoSQL has its network server; the tests run against an in-memory adapter that
 records statements.
@@ -27,7 +27,8 @@ tests/          models.mettle (the model template) and one t_*.mettle per area
 Mettle reflects at compile time only, so a model's metadata is generated with
 `comptime for` over `typeof(T).fields`: field names, offsets and types come
 from the compiler, with no hand-written offset table. An override table adds
-what a struct cannot say (column names, keys, NOT NULL, a version column).
+what a struct cannot say (column names, keys, NOT NULL, a version column,
+`RC_F_CREATED`/`RC_F_UPDATED` timestamps).
 Copy the shape in `tests/models.mettle`.
 
 ```mettle
@@ -47,6 +48,7 @@ const NOTE_COLS: RcColumn[3] = [
 ## Use
 
 ```mettle
+rc_clock_set(&rc_clock_realtime_us);  // once, if any model has timestamps
 var s: RcSession = rc_session_new(adapter);
 var a: RcAdapter* = rc_session_adapter(&s);
 

@@ -39,6 +39,7 @@ import "../core/status";
 import "../core/value";
 import "../core/meta";
 import "../core/entity";
+import "../core/clock";
 import "../adapter/adapter";
 import "../query/builder";
 import "cast";
@@ -428,6 +429,9 @@ export fn rc_changeset_apply(cs: RcChangeset*, e: RcEntity*) -> int32 {
 // RC_ERR_CONFLICT: the other write is kept, not overwritten. On success the
 // model's version becomes old + 1. A table without one is last-writer-wins.
 //
+// RC_F_UPDATED fields are set to core/clock's time on every save that writes
+// something; without a clock such a save is refused before anything changes.
+//
 // An empty changeset writes nothing and does not call the adapter. An adapter
 // failure is returned unchanged and the entity stays DIRTY: the model holds
 // the new values, the store does not. Zero affected rows is RC_ERR_CONFLICT
@@ -452,10 +456,18 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
   if (q.err != RC_OK) {
     return rc_changeset_note(cs, -1, q.err, "the update was refused");
   }
+  var now: int64 = 0;
+  var rc: int32 = RC_OK;
+  var stamped: bool = rc_meta_any(cs->meta, RC_F_UPDATED);
+  if (stamped) {
+    rc = rc_clock_now(&now);
+    if (rc != RC_OK) {
+      return rc_changeset_note(cs, -1, rc, "no clock for the updated timestamp");
+    }
+  }
   // Read the version the model was loaded with before anything changes.
   var vf: int32 = rc_meta_version(cs->meta);
   var old_ver: int64 = 0;
-  var rc: int32 = RC_OK;
   if (vf >= 0) {
     var cur: RcValue = RcNull;
     rc = rc_entity_get(e, vf, &cur);
@@ -478,6 +490,14 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
       rc = rc_entity_get(e, i, &v);
       if (rc != RC_OK) { return rc; }
       rc = rc_query_push_arg(&q, v);
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  i = 0;
+  while (stamped && i < cs->meta.n_fields) {
+    if ((cs->meta.fields[i].flags & RC_F_UPDATED) != 0) {
+      rc = rc_query_push_arg(&q, RcTime(now));
       if (rc != RC_OK) { return rc; }
     }
     i = i + 1;
@@ -505,6 +525,14 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
   if (vf >= 0) {
     rc = rc_meta_set(e->meta, e->model, &e->nulls, vf, RcInt(old_ver + 1));
     if (rc != RC_OK) { return rc; }
+  }
+  i = 0;
+  while (stamped && i < e->meta.n_fields) {
+    if ((e->meta.fields[i].flags & RC_F_UPDATED) != 0) {
+      rc = rc_meta_set(e->meta, e->model, &e->nulls, i, RcTime(now));
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
   }
   e->state = RC_ST_CLEAN;
   return RC_OK;

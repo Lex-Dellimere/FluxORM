@@ -262,6 +262,20 @@ fn check_validation() -> int32 {
   if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 18; }
   if (note_meta_status() != RC_OK) { return 19; }
 
+  // Timestamps: RC_T_TIME only, not both flags on one field, never the key.
+  valid_fields(&f[0]);
+  f[1].ty = RC_T_TIME;
+  f[1].flags = RC_F_CREATED;
+  f[2].ty = RC_T_TIME;
+  f[2].flags = RC_F_UPDATED;
+  if (rc_meta_check(m, (int32*)0) != RC_OK) { return 22; }
+  f[1].ty = RC_T_I64;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_UNSUPPORTED) { return 23; }
+  f[1].ty = RC_T_TIME;
+  f[1].flags = RC_F_CREATED | RC_F_UPDATED;
+  if (rc_meta_check(m, (int32*)0) != RC_ERR_USAGE) { return 24; }
+  if (task_meta_status() != RC_OK) { return 25; }
+
   // A slice (uint8[]) has no owned representation and is refused at startup.
   if (doc_field_count() != 2) { return 20; }
   if (doc_meta_status() != RC_ERR_UNSUPPORTED) { return 21; }
