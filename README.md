@@ -221,7 +221,7 @@ Conventions:
 |---|---|
 | Models | `rc_schema_field`, `rc_schema_meta`, `rc_schema_status` |
 | Session | `rc_session_new`, `rc_session_begin`, `rc_session_commit`, `rc_session_rollback`, `rc_session_transaction`, `rc_session_clear`, `rc_session_free` |
-| Repo | `rc_repo_insert`, `rc_repo_get`, `rc_repo_get_by`, `rc_repo_one`, `rc_repo_all` + `rc_rows_get`, `rc_repo_update`, `rc_repo_delete`, `rc_repo_update_all`, `rc_repo_delete_all`, `rc_repo_count`, `rc_repo_exists`, `rc_repo_multi`, `rc_repo_preload`, `rc_repo_preload_one`, `rc_preload_count`, `rc_preload_get` |
+| Repo | `rc_repo_insert`, `rc_repo_insert_all`, `rc_repo_get`, `rc_repo_get_by`, `rc_repo_one`, `rc_repo_all` + `rc_rows_get`, `rc_repo_update`, `rc_repo_delete`, `rc_repo_update_all`, `rc_repo_delete_all`, `rc_repo_count`, `rc_repo_exists`, `rc_repo_multi`, `rc_repo_preload`, `rc_repo_preload_one`, `rc_preload_count`, `rc_preload_get` |
 | Queries | `rc_query_select`, `rc_query_where`, `rc_query_where_in`, `rc_query_where_null`, `rc_query_where_not_null`, `rc_query_order_by`, `rc_query_limit`, `rc_query_offset`, `rc_query_join`, `rc_query_update_all` + `rc_query_set`, `rc_query_delete`, `rc_query_count`, `rc_query_free` |
 | Changesets | `rc_changeset_new`, `rc_changeset_bind`, `rc_changeset_cast`, `rc_changeset_put`, `rc_changeset_put_null`, `rc_changeset_changed`, `rc_changeset_unique`, `rc_changeset_valid`, `rc_changeset_error_count`, `rc_changeset_error_at`, `rc_changeset_free` |
 | Validations | `rc_validate_required`, `rc_validate_length`, `rc_validate_int`, `rc_validate_float`, `rc_validate_inclusion`, `rc_validate_change` |

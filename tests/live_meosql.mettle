@@ -172,6 +172,29 @@ export fn main() -> int32 {
   if (rc == RC_OK) { println("  ok   count posts with id >= 1: {cnt}"); }
   else { println("  FAIL count: {rc_status_name(rc)}"); }
 
+  // insert_all, get_by and exists
+  var batch: Post[2];
+  memset((rawptr)&batch[0], 0, (int64)sizeof(Post) * 2);
+  batch[0].user_id = uid[0];
+  batch[0].title = "d";
+  batch[1].user_id = uid[1];
+  batch[1].title = "e";
+  var added: int32 = 0;
+  if (!step("insert_all 2 posts", rc_repo_insert_all(&s, post_meta(), (rawptr)&batch[0], 2, &added))) { return 16; }
+  var cnt2: int64 = 0;
+  rc = rc_repo_count(&s, &cq, &cnt2);
+  if (rc != RC_OK || added != 2 || cnt2 != cnt + 2) { println("  FAIL insert_all: added {added}, count {cnt} -> {cnt2}"); return 17; }
+  var bp: Post;
+  var bpe: RcEntity;
+  if (!step("get_by title = e", rc_repo_get_by(&s, post_meta(), "title", RcText("e"), (rawptr)&bp, &bpe))) { return 18; }
+  if (bp.user_id != uid[1]) { println("  FAIL get_by: wrong row"); return 19; }
+  var xq: RcQuery = rc_query_count(post_meta());
+  rc_query_where(&xq, "title", RC_CMP_EQ, RcText("zzz"));
+  var found: bool = true;
+  if (!step("exists title = zzz", rc_repo_exists(&s, &xq, &found))) { return 20; }
+  if (found) { println("  FAIL exists: found a missing row"); return 21; }
+  rc_query_free(&xq);
+
   // delete_all
   var dq: RcQuery = rc_query_delete(post_meta());
   rc_query_where(&dq, "title", RC_CMP_EQ, RcText("c"));

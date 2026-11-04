@@ -25,6 +25,7 @@ import "../core/value";
 import "../core/meta";
 import "../core/entity";
 import "../core/session";
+import "../core/clock";
 import "../core/persist";
 import "../adapter/adapter";
 import "../query/builder";
@@ -101,6 +102,72 @@ export fn rc_repo_update(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32
 export fn rc_repo_delete(s: RcSession*, e: RcEntity*) -> int32 {
   if (s == 0) { return RC_ERR_USAGE; }
   return rc_persist_delete(rc_session_adapter(s), e);
+}
+
+// Inserts many models in one statement, like Ecto's Repo.insert_all, e.g.
+// rc_repo_insert_all(&s, user_meta(), (rawptr)&users[0], 3, &n).
+// No changesets: each model is sent as it is. RC_F_AUTO columns are left out
+// (the store assigns them; ids are not read back), and no field is NULL, so
+// use rc_repo_insert for rows that need either. Before sending, each model's
+// version field is set to 1 and its CREATED/UPDATED fields to the clock's
+// time, as rc_repo_insert does. One statement means all rows or none.
+//   s       the session
+//   m       the table
+//   models  n model structs back to back (an array), m.size bytes each
+//   n       rows, at least 1
+//   count   receives the rows inserted (0 on failure)
+// Returns RC_OK, or:
+//   RC_ERR_USAGE        a pointer is 0, n < 1, every column is RC_F_AUTO, or
+//                       a timestamp is needed and no clock is set
+//   RC_ERR_UNSUPPORTED  a field kind has no mapping, or the batch is larger
+//                       than the server accepts in one frame (split it)
+//   RC_ERR_CONFLICT     a duplicate key; nothing was inserted
+//   RC_ERR_NOMEM, or the adapter's code
+// On failure the models may hold the version and timestamps set above.
+export fn rc_repo_insert_all(s: RcSession*, m: RcMeta, models: rawptr, n: int32,
+                             count: int32*) -> int32 {
+  if (count == 0) { return RC_ERR_USAGE; }
+  *count = 0;
+  if (s == 0 || models == 0 || n < 1) { return RC_ERR_USAGE; }
+  var q: RcQuery = rc_query_insert_batch(m, n);
+  defer rc_query_free(&q);
+  if (q.err != RC_OK) { return q.err; }
+  var now: int64 = 0;
+  var stamps: bool = rc_meta_any(m, RC_F_CREATED | RC_F_UPDATED);
+  if (stamps) {
+    var rc0: int32 = rc_clock_now(&now);
+    if (rc0 != RC_OK) { return rc0; }
+  }
+  var vf: int32 = rc_meta_version(m);
+  var r: int32 = 0;
+  while (r < n) {
+    var model: rawptr = (rawptr)((uint8*)models + (int64)r * (int64)m.size);
+    var nulls: uint64 = 0;
+    var i: int32 = 0;
+    while (i < m.n_fields) {
+      var flags: int32 = m.fields[i].flags;
+      var rc: int32 = RC_OK;
+      if ((flags & (RC_F_CREATED | RC_F_UPDATED)) != 0) {
+        rc = rc_meta_set(m, model, &nulls, i, RcTime(now));
+      } else if (i == vf) {
+        rc = rc_meta_set(m, model, &nulls, i, RcInt(1));
+      }
+      if (rc == RC_OK && (flags & RC_F_AUTO) == 0) {
+        var v: RcValue = RcNull;
+        rc = rc_meta_get(m, model, 0, i, &v);
+        if (rc == RC_OK) { rc = rc_query_push_arg(&q, v); }
+      }
+      if (rc != RC_OK) { return rc; }
+      i = i + 1;
+    }
+    r = r + 1;
+  }
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(&q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  *count = res.affected;
+  rc_result_free(&res);
+  return RC_OK;
 }
 
 // Loads one row by primary key, like Ecto's Repo.get, e.g.
