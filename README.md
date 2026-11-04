@@ -24,7 +24,7 @@ src/changeset/       casting user input, dirty fields, validations, save
 src/relation/        has-many / belongs-to / through, loaded in batches
 src/migration/       versioned up/down migrations, CREATE TABLE from metadata,
                      drop, add column, indexes
-src/repo/            insert, get, one, all, update, delete, Multi, through a session
+src/repo/            Repo calls, Multi and preload through a session; the pool
 tests/               models.mettle (the model template), one t_*.mettle per area
 ```
 
