@@ -4,11 +4,11 @@ An ORM for the [MeoSQL](../meosql) database, written in Mettle.
 
 Status: models, queries, inserts, loads, updates of changed fields, deletes,
 update_all/delete_all/count, changeset validations, relations without N+1,
-up-only migrations, sessions with transactions and stale-write detection and
-automatic timestamps and Multi all work and are tested in the interpreter,
-debug and release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub
-until MeoSQL has its network server; the tests run against an in-memory adapter
-that records statements.
+migrations with up and down, sessions with transactions and stale-write
+detection and automatic timestamps and Multi all work and are tested in the
+interpreter, debug and release. The MeoSQL adapter
+(`src/adapter/meosql.mettle`) is a stub until MeoSQL has its network server;
+the tests run against an in-memory adapter that records statements.
 
 ## Layout
 
@@ -21,7 +21,8 @@ src/adapter/         the adapter interface (SQL text, or statements as data),
 src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
 src/changeset/       casting user input, dirty fields, validations, save
 src/relation/        has-many / belongs-to / through, loaded in batches
-src/migration/       CREATE TABLE from metadata, versioned migrations
+src/migration/       versioned up/down migrations, CREATE TABLE from metadata,
+                     drop, add column, indexes
 src/repo/            insert, get, one, all, update, delete, Multi, through a session
 tests/               models.mettle (the model template), one t_*.mettle per area
 ```
@@ -124,6 +125,27 @@ if (rc_repo_multi(&s, &m, RC_TX_DEFAULT) != RC_OK) {
 }
 rc_multi_free(&m);
 ```
+
+Migrations are versioned and run once each, in order, inside their own
+transaction. Each step is SQL text or a callback; callbacks also work with
+stores that take no SQL, like MeoSQL:
+
+```mettle
+fn up_notes(a: RcAdapter*) -> int32 { return rc_migration_create(a, note_meta()); }
+fn down_notes(a: RcAdapter*) -> int32 { return rc_migration_drop(a, note_meta()); }
+
+const MIGRATIONS: RcMigration[1] = [
+  { version: 1, name: "create notes", up: &up_notes, down: &down_notes },
+];
+
+var set: RcMigrationSet = rc_migration_set(&MIGRATIONS[0], 1);
+var rep: RcMigrationReport;
+rc_migration_run(adapter, &set, &rep);      // apply what is missing
+rc_migration_down(adapter, &set, 0, &rep);  // roll back to version 0
+```
+
+`rc_migration_add_column`, `rc_migration_create_index` and
+`rc_migration_drop_index` cover the other schema changes.
 
 For many rows at once, build `rc_query_update_all`, `rc_query_delete` or
 `rc_query_count`, add WHERE terms, and run it with `rc_repo_update_all`,

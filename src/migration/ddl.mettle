@@ -23,7 +23,7 @@ import "../adapter/stmt";
 // phase adds without teaching this table about it, returns the empty string;
 // the caller treats that as a refusal rather than emitting a column with no
 // type.
-fn rc_migration_affinity(ty: int32) -> string {
+export fn rc_migration_affinity(ty: int32) -> string {
   if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) {
     return "INTEGER";
   }

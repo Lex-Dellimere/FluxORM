@@ -231,6 +231,19 @@ fn check_typed_migrations() -> int32 {
   if ((st.cols[0].flags & RC_F_PK) == 0 || (st.cols[1].flags & RC_F_UNIQUE) == 0) { return 10; }
   if ((st.cols[3].flags & RC_F_NOT_NULL) != 0) { return 11; }
 
+  // Schema changes as data.
+  fake_reset();
+  var idx: int32[1];
+  idx[0] = 1;
+  if (rc_migration_create_index(&a, user_meta(), "users_email", &idx[0], 1, true) != RC_OK) { return 14; }
+  if (FAKE_LAST.op != RC_OP_CREATE_INDEX || FAKE_LAST.name != "users_email") { return 15; }
+  if (!FAKE_LAST.unique || FAKE_LAST.n_cols != 1 || FAKE_LAST.table != "users") { return 16; }
+  if (rc_migration_drop(&a, user_meta()) != RC_OK || FAKE_LAST.op != RC_OP_DROP) { return 17; }
+  if (rc_migration_add_column(&a, user_meta(), 3) != RC_OK) { return 18; }
+  if (FAKE_LAST.op != RC_OP_ADD_COLUMN || FAKE_LAST.n_cols != 1) { return 19; }
+  if (rc_migration_drop_index(&a, user_meta(), "users_email") != RC_OK) { return 20; }
+  if (FAKE_LAST.op != RC_OP_DROP_INDEX || FAKE_LAST.name != "users_email") { return 21; }
+
   // A text-only migration on a store without text is refused and rolled back.
   fake_reset();
   var text: RcMigration[1];

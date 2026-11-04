@@ -19,6 +19,10 @@ export const RC_OP_SELECT: int32 = 3;
 export const RC_OP_UPDATE: int32 = 4;
 export const RC_OP_DELETE: int32 = 5;
 export const RC_OP_COUNT: int32 = 6;
+export const RC_OP_DROP: int32 = 7;          // DROP TABLE IF EXISTS
+export const RC_OP_ADD_COLUMN: int32 = 8;    // one column in cols
+export const RC_OP_CREATE_INDEX: int32 = 9;  // name, unique, cols = indexed columns
+export const RC_OP_DROP_INDEX: int32 = 10;   // name
 
 // Term operators. EQ..GE equal the builder's RC_CMP_*.
 export const RC_W_EQ: int32 = 0;
@@ -55,7 +59,9 @@ export struct RcStmtOrder {
 export struct RcStmt {
   op: int32;            // RC_OP_*, 0 = none
   table: string;
-  if_not_exists: bool;
+  if_not_exists: bool;  // also IF EXISTS for the drops
+  name: string;         // index name, for the index ops
+  unique: bool;         // a unique index
   cols: RcStmtCol*;
   n_cols: int32;
   cap_cols: int32;
@@ -78,6 +84,8 @@ export fn rc_stmt_new(op: int32, table: string) -> RcStmt {
   st.op = op;
   st.table = table;
   st.if_not_exists = false;
+  st.name = "";
+  st.unique = false;
   st.cols = 0;
   st.n_cols = 0;
   st.cap_cols = 0;

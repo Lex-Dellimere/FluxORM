@@ -23,5 +23,6 @@ import "relation/relation";
 import "relation/load";
 import "migration/ddl";
 import "migration/version";
+import "migration/schema";
 import "repo/repo";
 import "repo/multi";
