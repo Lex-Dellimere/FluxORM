@@ -490,25 +490,37 @@ fn check_schema_changes() -> int32 {
   if (rc_migration_drop(a, m) != RC_OK) { return 2; }
   if (rc_mem_last_sql(a) != "DROP TABLE IF EXISTS \"users\"") { return 3; }
 
-  if (rc_migration_add_column(a, m, 3) != RC_OK) { return 4; }
+  if (rc_migration_add_column_field(a, m, 3) != RC_OK) { return 4; }
   if (rc_mem_last_sql(a) != "ALTER TABLE \"users\" ADD COLUMN \"age\" INTEGER") { return 5; }
   // Existing rows have no value for a NOT NULL column: refused, nothing sent.
   var calls: int32 = rc_mem_call_count(a);
-  if (rc_migration_add_column(a, m, 2) != RC_ERR_UNSUPPORTED) { return 6; }
-  if (rc_migration_add_column(a, m, 0) != RC_ERR_UNSUPPORTED) { return 7; }
-  if (rc_migration_add_column(a, m, 8) != RC_ERR_USAGE) { return 8; }
+  if (rc_migration_add_column_field(a, m, 2) != RC_ERR_UNSUPPORTED) { return 6; }
+  if (rc_migration_add_column_field(a, m, 0) != RC_ERR_UNSUPPORTED) { return 7; }
+  if (rc_migration_add_column_field(a, m, 8) != RC_ERR_USAGE) { return 8; }
   if (rc_mem_call_count(a) != calls) { return 9; }
 
   var email: int32[1];
   email[0] = 1;
-  if (rc_migration_create_index(a, m, "users_email", &email[0], 1, true) != RC_OK) { return 10; }
+  if (rc_migration_create_index_field(a, m, "users_email", &email[0], 1, true) != RC_OK) { return 10; }
   if (rc_mem_last_sql(a) != "CREATE UNIQUE INDEX IF NOT EXISTS \"users_email\" ON \"users\" (\"email\")") { return 11; }
   var two: int32[2];
   two[0] = 2;
   two[1] = 3;
-  if (rc_migration_create_index(a, m, "users_name_age", &two[0], 2, false) != RC_OK) { return 12; }
+  if (rc_migration_create_index_field(a, m, "users_name_age", &two[0], 2, false) != RC_OK) { return 12; }
   if (rc_mem_last_sql(a) != "CREATE INDEX IF NOT EXISTS \"users_name_age\" ON \"users\" (\"name\", \"age\")") { return 13; }
-  if (rc_migration_create_index(a, m, "", &two[0], 2, false) != RC_ERR_USAGE) { return 14; }
+  if (rc_migration_create_index_field(a, m, "", &two[0], 2, false) != RC_ERR_USAGE) { return 14; }
+
+  // The same by column name.
+  if (rc_migration_add_column(a, m, "score") != RC_OK) { return 17; }
+  if (rc_mem_last_sql(a) != "ALTER TABLE \"users\" ADD COLUMN \"score\" REAL") { return 18; }
+  if (rc_migration_add_column(a, m, "nope") != RC_ERR_USAGE) { return 19; }
+  var cols: string[2];
+  cols[0] = "name";
+  cols[1] = "age";
+  if (rc_migration_create_index(a, m, "users_name_age", &cols[0], 2, false) != RC_OK) { return 20; }
+  if (rc_mem_last_sql(a) != "CREATE INDEX IF NOT EXISTS \"users_name_age\" ON \"users\" (\"name\", \"age\")") { return 21; }
+  cols[1] = "nope";
+  if (rc_migration_create_index(a, m, "x", &cols[0], 2, false) != RC_ERR_USAGE) { return 22; }
 
   if (rc_migration_drop_index(a, m, "users_email") != RC_OK) { return 15; }
   if (rc_mem_last_sql(a) != "DROP INDEX IF EXISTS \"users_email\"") { return 16; }

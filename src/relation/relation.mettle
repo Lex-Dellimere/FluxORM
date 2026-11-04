@@ -81,6 +81,39 @@ fn rc_relation_kind_known(kind: int32) -> bool {
   return false;
 }
 
+// The ways an app declares a relation, after Ecto's has_many / belongs_to.
+// Columns are names, resolved against the two models; an unknown one leaves
+// the field at -1, which rc_relation_check reports as RC_ERR_USAGE.
+//
+//   rc_relation_has_many("posts", user_meta(), "id", post_meta(), "user_id")
+//   rc_relation_belongs_to("user", post_meta(), "user_id", user_meta(), "id")
+
+export fn rc_relation_has_many(name: string, owner: RcMeta, owner_col: string,
+                               target: RcMeta, target_col: string) -> RcRelation {
+  return rc_relation(name, RC_REL_HAS_MANY, rc_meta_find(owner, owner_col),
+                     target.table, rc_meta_find(target, target_col));
+}
+
+export fn rc_relation_belongs_to(name: string, owner: RcMeta, owner_col: string,
+                                 target: RcMeta, target_col: string) -> RcRelation {
+  return rc_relation(name, RC_REL_BELONGS_TO, rc_meta_find(owner, owner_col),
+                     target.table, rc_meta_find(target, target_col));
+}
+
+// Through a join table whose two columns hold the owner key and the target key.
+export fn rc_relation_has_many_through(name: string, owner: RcMeta, owner_col: string,
+                                       target: RcMeta, target_col: string,
+                                       through: RcMeta) -> RcRelation {
+  var tl: string = "";
+  var tf: string = "";
+  if (through.n_fields == 2) {
+    tl = through.fields[0].name;
+    tf = through.fields[1].name;
+  }
+  return rc_relation_through(name, rc_meta_find(owner, owner_col), target.table,
+                             rc_meta_find(target, target_col), through.table, tl, tf);
+}
+
 // Returns RC_OK or the refusal code. No statement is run and no allocation is
 // made, so this is safe to call from a loader and cheap enough to call on
 // every load (it is six comparisons and a string compare per check).
