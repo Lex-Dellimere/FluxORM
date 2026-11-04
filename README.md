@@ -29,12 +29,11 @@ tests/               models.mettle (the model template), one t_*.mettle per area
 
 ## Models
 
-Mettle reflects at compile time only, so a model's metadata is generated with
+Mettle reflects at compile time only, so a model's metadata comes from
 `comptime for` over `typeof(T).fields`: field names, offsets and types come
 from the compiler, with no hand-written offset table. An override table adds
-what a struct cannot say (column names, keys, NOT NULL, a version column,
-`RC_F_CREATED`/`RC_F_UPDATED` timestamps).
-Copy the shape in `tests/models.mettle`.
+what a struct cannot say (column names, keys, NOT NULL, unique, a version
+column, `RC_F_CREATED`/`RC_F_UPDATED` timestamps). See `tests/models.mettle`.
 
 ```mettle
 export struct Note {
@@ -48,7 +47,22 @@ const NOTE_COLS: RcColumn[3] = [
   { index: 1, column: "text", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
   { index: 2, column: "version", ty: RC_T_I64, flags: RC_F_VERSION | RC_F_NOT_NULL },
 ];
+
+var NOTE: RcSchema;
+
+fn note_fields(s: RcSchema*) {
+  comptime for f in typeof(Note).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
+}
+
+export fn note_meta() -> RcMeta {
+  return rc_schema_meta(&NOTE, &note_fields, "notes", "Note", (int64)sizeof(Note),
+                        &NOTE_COLS[0], 3);
+}
 ```
+
+`rc_schema_status(&NOTE)` says whether the model passed validation.
 
 ## Use
 

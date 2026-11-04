@@ -1,0 +1,83 @@
+// flux_orm/core/schema.mettle — the short way to declare a model.
+//
+// Mettle reflects on a named type only, so each model keeps one small field
+// function with a `comptime for`; everything else is here:
+//
+//   export struct Note { id: int64; text: string; version: int64; }
+//
+//   const NOTE_COLS: RcColumn[3] = [ ... keys, NOT NULL, version ... ];
+//
+//   var NOTE: RcSchema;
+//
+//   fn note_fields(s: RcSchema*) {
+//     comptime for f in typeof(Note).fields {
+//       rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+//     }
+//   }
+//
+//   export fn note_meta() -> RcMeta {
+//     return rc_schema_meta(&NOTE, &note_fields, "notes", "Note",
+//                           (int64)sizeof(Note), &NOTE_COLS[0], 3);
+//   }
+//
+// The metadata is built on the first call and kept. rc_schema_status says
+// whether it passed rc_meta_check.
+
+import "status";
+import "meta";
+
+export struct RcSchema {
+  fields: RcField[64];   // RC_MAX_FIELDS
+  meta: RcMeta;
+  n_seen: int32;         // fields reported, which may exceed 64
+  ready: bool;
+  status: int32;
+}
+
+// Records one field, as reported by `comptime for f in typeof(T).fields`.
+// Its column name is the field name until an RcColumn overrides it.
+export fn rc_schema_field(s: RcSchema*, name: string, kind: Kind, offset: int64,
+                          size: int64) {
+  if (s == 0) { return; }
+  var i: int32 = s->n_seen;
+  s->n_seen = s->n_seen + 1;
+  if (i >= RC_MAX_FIELDS) { return; }
+  s->fields[i].name = name;
+  s->fields[i].column = name;
+  s->fields[i].kind = kind;
+  s->fields[i].ty = rc_kind_type(kind);
+  s->fields[i].offset = (int32)offset;
+  s->fields[i].size = (int32)size;
+  s->fields[i].flags = 0;
+}
+
+// The model's metadata: built once by calling `fill`, then applying `cols`
+// with rc_meta_finalize. A model with more than 64 fields is refused
+// (RC_ERR_UNSUPPORTED in rc_schema_status) rather than truncated.
+export fn rc_schema_meta(s: RcSchema*, fill: fn(RcSchema*) -> void, table: string,
+                         name: string, size: int64, cols: RcColumn*,
+                         n_cols: int32) -> RcMeta {
+  if (!s->ready) {
+    s->n_seen = 0;
+    fill(s);
+    s->meta.table = table;
+    s->meta.name = name;
+    s->meta.size = (int32)size;
+    s->meta.fields = &s->fields[0];
+    s->meta.n_fields = s->n_seen;
+    s->meta.pk = -1;
+    if (s->n_seen > RC_MAX_FIELDS) {
+      s->status = RC_ERR_UNSUPPORTED;
+    } else {
+      s->status = rc_meta_finalize(&s->meta, cols, n_cols);
+    }
+    s->ready = true;
+  }
+  return s->meta;
+}
+
+// RC_OK when the model's metadata is valid; call after the first *_meta().
+export fn rc_schema_status(s: RcSchema*) -> int32 {
+  if (s == 0 || !s->ready) { return RC_ERR_USAGE; }
+  return s->status;
+}
