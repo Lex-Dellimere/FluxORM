@@ -140,7 +140,7 @@ fn check_all_one() -> int32 {
   if (push_users(a) != RC_OK) { return 2; }
   var q: RcQuery = rc_query_select(m);
   defer rc_query_free(&q);
-  if (rc_query_where_cmp(&q, 4, RC_CMP_EQ, RcBool(true)) != RC_OK) { return 3; }
+  if (rc_query_where_field(&q, 4, RC_CMP_EQ, RcBool(true)) != RC_OK) { return 3; }
   var rows: RcRows;
   if (rc_repo_all(&s, &q, &rows) != RC_OK) { return 4; }
   if (rows.n != 2) { return 5; }
@@ -219,15 +219,19 @@ fn check_bulk() -> int32 {
   var m: RcMeta = user_meta();
 
   // Deactivate every user created before a cutoff.
-  var vals: RcValue[8];
-  vals[4] = RcBool(false);
-  var up: RcQuery = rc_query_update_all(m, rc_nulls_set((uint64)0, 4), &vals[0]);
+  var up: RcQuery = rc_query_update_all(m);
   defer rc_query_free(&up);
   if (up.err != RC_OK) { return 2; }
+  if (rc_query_where(&up, "created_at", RC_CMP_LT, RcInt(1)) != RC_ERR_USAGE) { return 24; }  // nothing set
+  if (rc_query_set(&up, "active", RcBool(false)) != RC_OK) { return 25; }
+  if (rc_query_set(&up, "active", RcBool(true)) != RC_ERR_USAGE) { return 26; }  // set twice
+  if (rc_query_set(&up, "id", RcInt(1)) != RC_ERR_USAGE) { return 27; }        // the key
+  if (rc_query_set(&up, "nope", RcInt(1)) != RC_ERR_USAGE) { return 28; }
   var n: int32 = 0;
   if (rc_repo_update_all(&s, &up, &n) != RC_ERR_USAGE) { return 3; }  // no WHERE yet
   if (rc_mem_call_count(a) != 0) { return 4; }
-  if (rc_query_where_cmp(&up, 6, RC_CMP_LT, RcTime(1700000000000000)) != RC_OK) { return 5; }
+  if (rc_query_where(&up, "created_at", RC_CMP_LT, RcTime(1700000000000000)) != RC_OK) { return 5; }
+  if (rc_query_set(&up, "name", RcText("x")) != RC_ERR_USAGE) { return 29; }  // after WHERE
   if (rc_mem_push_ok(a, 3, 0) != RC_OK) { return 6; }
   if (rc_repo_update_all(&s, &up, &n) != RC_OK) { return 7; }
   if (n != 3) { return 8; }
@@ -236,28 +240,26 @@ fn check_bulk() -> int32 {
   if (!rc_value_same(rc_mem_last_args(a)[1], RcTime(1700000000000000))) { return 11; }
 
   // A versioned table cannot bump each row's version with one value.
-  var nv: RcValue[3];
-  nv[1] = RcText("x");
-  var vq: RcQuery = rc_query_update_all(note_meta(), rc_nulls_set((uint64)0, 1), &nv[0]);
+  var vq: RcQuery = rc_query_update_all(note_meta());
   defer rc_query_free(&vq);
   if (vq.err != RC_ERR_UNSUPPORTED) { return 12; }
 
-  // updated_at is set from the clock, and needs one.
-  var tv: RcValue[4];
-  tv[1] = RcText("done");
-  var tmask: uint64 = rc_nulls_set((uint64)0, 1);
-  rc_clock_clear();
-  var nq: RcQuery = rc_query_update_all(task_meta(), tmask, &tv[0]);
-  defer rc_query_free(&nq);
-  if (nq.err != RC_ERR_USAGE) { return 13; }
-  rc_clock_set(&test_clock);
-  defer rc_clock_clear();
-  var tq: RcQuery = rc_query_update_all(task_meta(), tmask, &tv[0]);
-  defer rc_query_free(&tq);
+  // updated_at is set from the clock when the SET list closes, and needs one.
   var ids: RcValue[2];
   ids[0] = RcInt(1);
   ids[1] = RcInt(2);
-  if (rc_query_where_in(&tq, 0, &ids[0], 2) != RC_OK) { return 14; }
+  rc_clock_clear();
+  var nq: RcQuery = rc_query_update_all(task_meta());
+  defer rc_query_free(&nq);
+  if (rc_query_set(&nq, "title", RcText("done")) != RC_OK) { return 30; }
+  if (rc_query_where_in(&nq, "id", &ids[0], 2) != RC_ERR_USAGE) { return 13; }
+  rc_clock_set(&test_clock);
+  defer rc_clock_clear();
+  var tq: RcQuery = rc_query_update_all(task_meta());
+  defer rc_query_free(&tq);
+  if (rc_query_set(&tq, "title", RcText("done")) != RC_OK) { return 31; }
+  if (rc_query_set(&tq, "updated_at", RcTime(1)) != RC_ERR_USAGE) { return 32; }  // the ORM's
+  if (rc_query_where_in(&tq, "id", &ids[0], 2) != RC_OK) { return 14; }
   if (rc_query_sql(&tq) != "UPDATE \"tasks\" SET \"title\" = ?, \"updated_at\" = ? WHERE \"id\" IN (?, ?)") { return 15; }
   if (!rc_value_same(rc_query_args(&tq)[1], RcTime(TEST_NOW))) { return 16; }
 
@@ -265,7 +267,7 @@ fn check_bulk() -> int32 {
   var dq: RcQuery = rc_query_delete(m);
   defer rc_query_free(&dq);
   if (rc_repo_delete_all(&s, &dq, &n) != RC_ERR_USAGE) { return 17; }
-  if (rc_query_where_eq(&dq, 4, RcBool(false)) != RC_OK) { return 18; }
+  if (rc_query_where_field(&dq, 4, RC_CMP_EQ, RcBool(false)) != RC_OK) { return 18; }
   if (rc_mem_push_ok(a, 2, 0) != RC_OK) { return 19; }
   if (rc_repo_delete_all(&s, &dq, &n) != RC_OK || n != 2) { return 20; }
   if (rc_mem_last_sql(a) != "DELETE FROM \"users\" WHERE \"active\" = ?") { return 21; }
@@ -273,8 +275,8 @@ fn check_bulk() -> int32 {
   // count: one integer cell; SELECT-only clauses are refused.
   var cq: RcQuery = rc_query_count(m);
   defer rc_query_free(&cq);
-  if (rc_query_where_cmp(&cq, 3, RC_CMP_GE, RcInt(18)) != RC_OK) { return 22; }
-  if (rc_query_order_by(&cq, 0, true) != RC_ERR_USAGE) { return 23; }
+  if (rc_query_where_field(&cq, 3, RC_CMP_GE, RcInt(18)) != RC_OK) { return 22; }
+  if (rc_query_order_by_field(&cq, 0, RC_ASC) != RC_ERR_USAGE) { return 23; }
   if (rc_query_sql(&cq) != "SELECT COUNT(*) FROM \"users\" WHERE \"age\" >= ?") { return 24; }
   var cell: RcValue[1];
   cell[0] = RcInt(5);

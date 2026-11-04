@@ -311,7 +311,7 @@ fn rc_relation_load_one(a: RcAdapter*, rel: RcRelation*, target_meta: RcMeta,
   var q: RcQuery = rc_query_select(target_meta);
   defer rc_query_free(&q);
   if (q.err != RC_OK) { return q.err; }
-  var rc: int32 = rc_query_where_in(&q, rel->foreign_field, vals, n_vals);
+  var rc: int32 = rc_query_where_in_field(&q, rel->foreign_field, vals, n_vals);
   if (rc != RC_OK) { return rc; }
   rc = rc_query_exec(&q, a, &out->res);
   if (rc != RC_OK) { return rc; }
@@ -331,7 +331,7 @@ fn rc_relation_load_through(a: RcAdapter*, rel: RcRelation*, target_meta: RcMeta
   if (qm.err != RC_OK) { return qm.err; }
   // Field 0 of the through meta is the owner column, by contract (checked in
   // rc_relation_check), so the projection order and this index cannot disagree.
-  var rc: int32 = rc_query_where_in(&qm, 0, vals, n_vals);
+  var rc: int32 = rc_query_where_in_field(&qm, 0, vals, n_vals);
   if (rc != RC_OK) { return rc; }
   rc = rc_query_exec(&qm, a, &out->through);
   if (rc != RC_OK) { return rc; }
@@ -385,7 +385,7 @@ fn rc_relation_load_through(a: RcAdapter*, rel: RcRelation*, target_meta: RcMeta
   var q: RcQuery = rc_query_select(target_meta);
   defer rc_query_free(&q);
   if (q.err != RC_OK) { return q.err; }
-  rc = rc_query_where_in(&q, rel->foreign_field, tvals, n_t);
+  rc = rc_query_where_in_field(&q, rel->foreign_field, tvals, n_t);
   if (rc != RC_OK) { return rc; }
   rc = rc_query_exec(&q, a, &out->res);
   if (rc != RC_OK) { return rc; }

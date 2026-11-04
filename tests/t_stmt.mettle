@@ -78,16 +78,16 @@ fn check_select() -> int32 {
   var ages: RcValue[2];
   ages[0] = RcInt(30);
   ages[1] = RcInt(31);
-  if (rc_query_where_cmp(&q, 1, RC_CMP_EQ, RcText("a@b.c")) != RC_OK) { return 1; }
-  if (rc_query_where_in(&q, 3, &ages[0], 2) != RC_OK) { return 2; }
-  if (rc_query_where_null(&q, 5) != RC_OK) { return 3; }
-  if (rc_query_where_cmp(&q, 7, RC_CMP_GE, RcInt(1)) != RC_OK) { return 4; }
-  if (rc_query_where_cmp(&q, 4, RC_CMP_NE, RcNull) != RC_OK) { return 5; }
-  if (rc_query_order_by(&q, 2, false) != RC_OK) { return 6; }
+  if (rc_query_where_field(&q, 1, RC_CMP_EQ, RcText("a@b.c")) != RC_OK) { return 1; }
+  if (rc_query_where_in_field(&q, 3, &ages[0], 2) != RC_OK) { return 2; }
+  if (rc_query_where_null_field(&q, 5) != RC_OK) { return 3; }
+  if (rc_query_where_field(&q, 7, RC_CMP_GE, RcInt(1)) != RC_OK) { return 4; }
+  if (rc_query_where_field(&q, 4, RC_CMP_NE, RcNull) != RC_OK) { return 5; }
+  if (rc_query_order_by_field(&q, 2, RC_DESC) != RC_OK) { return 6; }
   if (rc_query_limit(&q, 10) != RC_OK) { return 7; }
   if (rc_query_offset(&q, 20) != RC_OK) { return 8; }
   // A refused term adds nothing.
-  if (rc_query_where_cmp(&q, 3, RC_CMP_LT, RcNull) != RC_ERR_USAGE) { return 9; }
+  if (rc_query_where_field(&q, 3, RC_CMP_LT, RcNull) != RC_ERR_USAGE) { return 9; }
 
   var st: RcStmt* = rc_query_stmt(&q);
   if (st->op != RC_OP_SELECT || st->table != "users") { return 10; }
@@ -107,7 +107,7 @@ fn check_select() -> int32 {
   // A join is counted, so a store without joins can refuse it.
   var jq: RcQuery = rc_query_select(user_meta());
   defer rc_query_free(&jq);
-  if (rc_query_join(&jq, post_meta(), 0, 1, RC_JOIN_INNER) != RC_OK) { return 22; }
+  if (rc_query_join_field(&jq, post_meta(), 0, 1, RC_JOIN_INNER) != RC_OK) { return 22; }
   if (rc_query_stmt(&jq)->n_joins != 1) { return 23; }
   return 0;
 }
@@ -125,24 +125,23 @@ fn check_write_shapes() -> int32 {
   defer rc_query_free(&up);
   if (rc_query_push_arg(&up, RcText("x")) != RC_OK) { return 3; }
   if (rc_query_push_arg(&up, RcInt(4)) != RC_OK) { return 4; }
-  if (rc_query_where_eq(&up, 0, RcInt(5)) != RC_OK) { return 5; }
-  if (rc_query_where_eq(&up, 2, RcInt(3)) != RC_OK) { return 6; }
+  if (rc_query_where_field(&up, 0, RC_CMP_EQ, RcInt(5)) != RC_OK) { return 5; }
+  if (rc_query_where_field(&up, 2, RC_CMP_EQ, RcInt(3)) != RC_OK) { return 6; }
   st = rc_query_stmt(&up);
   if (st->op != RC_OP_UPDATE || st->n_cols != 2) { return 7; }
   if (st->cols[0].name != "text" || st->cols[1].name != "version") { return 8; }
   if (!term_is(st, 0, "id", RC_W_EQ, 2, 1) || !term_is(st, 1, "version", RC_W_EQ, 3, 1)) { return 9; }
 
-  var vals: RcValue[8];
-  vals[4] = RcBool(false);
-  var ua: RcQuery = rc_query_update_all(user_meta(), rc_nulls_set((uint64)0, 4), &vals[0]);
+  var ua: RcQuery = rc_query_update_all(user_meta());
   defer rc_query_free(&ua);
-  if (rc_query_where_cmp(&ua, 6, RC_CMP_LT, RcTime(5)) != RC_OK) { return 10; }
+  if (rc_query_set(&ua, "active", RcBool(false)) != RC_OK) { return 15; }
+  if (rc_query_where(&ua, "created_at", RC_CMP_LT, RcTime(5)) != RC_OK) { return 10; }
   st = rc_query_stmt(&ua);
   if (st->op != RC_OP_UPDATE || st->n_cols != 1 || !term_is(st, 0, "created_at", RC_W_LT, 1, 1)) { return 11; }
 
   var del: RcQuery = rc_query_delete(user_meta());
   defer rc_query_free(&del);
-  if (rc_query_where_eq(&del, 4, RcBool(false)) != RC_OK) { return 12; }
+  if (rc_query_where_field(&del, 4, RC_CMP_EQ, RcBool(false)) != RC_OK) { return 12; }
   st = rc_query_stmt(&del);
   if (st->op != RC_OP_DELETE || st->n_cols != 0 || !term_is(st, 0, "active", RC_W_EQ, 0, 1)) { return 13; }
 

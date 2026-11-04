@@ -602,10 +602,10 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
     rc = rc_query_push_arg(&q, RcInt(old_ver + 1));
     if (rc != RC_OK) { return rc; }
   }
-  rc = rc_query_where_eq(&q, e->meta.pk, rc_entity_pk(e));
+  rc = rc_query_where_field(&q, e->meta.pk, RC_CMP_EQ, rc_entity_pk(e));
   if (rc != RC_OK) { return rc; }
   if (vf >= 0) {
-    rc = rc_query_where_eq(&q, vf, RcInt(old_ver));
+    rc = rc_query_where_field(&q, vf, RC_CMP_EQ, RcInt(old_ver));
     if (rc != RC_OK) { return rc; }
   }
 

@@ -348,8 +348,8 @@ fn check_query() -> int32 {
   ages[1] = RcInt(32);
   var q: RcQuery = rc_query_select(m);
   defer rc_query_free(&q);
-  if (rc_query_where_in(&q, 3, &ages[0], 2) != RC_OK) { return 4; }
-  if (rc_query_order_by(&q, 2, true) != RC_OK) { return 5; }
+  if (rc_query_where_in_field(&q, 3, &ages[0], 2) != RC_OK) { return 4; }
+  if (rc_query_order_by_field(&q, 2, RC_ASC) != RC_OK) { return 5; }
   if (rc_query_limit(&q, 10) != RC_OK) { return 6; }
   if (rc_query_sql(&q) != FILTERED_SQL) { return 7; }
   if (rc_query_n_args(&q) != 2) { return 8; }
@@ -390,7 +390,7 @@ fn check_query() -> int32 {
   // nothing. `= NULL` cannot be produced at all.
   var qn: RcQuery = rc_query_select(m);
   defer rc_query_free(&qn);
-  if (rc_query_where_eq(&qn, 3, RcNull) != RC_OK) { return 24; }
+  if (rc_query_where_field(&qn, 3, RC_CMP_EQ, RcNull) != RC_OK) { return 24; }
   if (rc_query_sql(&qn) != IS_NULL_SQL) { return 25; }
   if (rc_query_n_args(&qn) != 0) { return 26; }
   if (has_text(rc_query_sql(&qn), "= NULL")) { return 27; }
@@ -885,7 +885,7 @@ fn check_query_models() -> int32 {
 
   var q: RcQuery = rc_query_select(m);
   defer rc_query_free(&q);
-  if (rc_query_where_cmp(&q, 4, RC_CMP_EQ, RcBool(true)) != RC_OK) { return 3; }
+  if (rc_query_where_field(&q, 4, RC_CMP_EQ, RcBool(true)) != RC_OK) { return 3; }
   var res: RcResult;
   if (rc_query_exec(&q, a, &res) != RC_OK) { return 4; }
   defer rc_result_free(&res);

@@ -120,8 +120,8 @@ rc_changeset_free(&edit);
 
 // Query, and read each row into a model.
 var q: RcQuery = rc_query_select(note_meta());
-rc_query_where_cmp(&q, 2, RC_CMP_GT, RcInt(1));
-rc_query_order_by(&q, 0, true);
+rc_query_where(&q, "version", RC_CMP_GT, RcInt(1));
+rc_query_order_by(&q, "id", RC_ASC);
 var rows: RcRows;
 rc_repo_all(&s, &q, &rows);
 var i: int32 = 0;
@@ -171,10 +171,20 @@ rc_migration_down(adapter, &set, 0, &rep);  // roll back to version 0
 `rc_migration_add_column`, `rc_migration_create_index` and
 `rc_migration_drop_index` cover the other schema changes.
 
-For many rows at once, build `rc_query_update_all`, `rc_query_delete` or
-`rc_query_count`, add WHERE terms, and run it with `rc_repo_update_all`,
-`rc_repo_delete_all` or `rc_repo_count`. An UPDATE or DELETE without a WHERE is
-refused.
+For many rows at once:
+
+```mettle
+var up: RcQuery = rc_query_update_all(user_meta());
+rc_query_set(&up, "active", RcBool(false));
+rc_query_where(&up, "created_at", RC_CMP_LT, RcTime(cutoff));
+var changed: int32 = 0;
+rc_repo_update_all(&s, &up, &changed);
+rc_query_free(&up);
+```
+
+`rc_query_delete` and `rc_query_count` work the same way with
+`rc_repo_delete_all` and `rc_repo_count`. An UPDATE or DELETE without a WHERE
+is refused.
 
 Every call returns an `RC_*` code (`src/core/status.mettle`). `rc_repo_one`
 expects exactly one row. Wrap related writes in

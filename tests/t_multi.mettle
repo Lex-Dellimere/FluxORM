@@ -90,11 +90,10 @@ fn check_commit() -> int32 {
   // Names are unique.
   if (rc_multi_delete(&m, "user", &f.ue) != RC_ERR_USAGE) { return 4; }
 
-  var vals: RcValue[8];
-  vals[4] = RcBool(false);
-  var up: RcQuery = rc_query_update_all(user_meta(), rc_nulls_set((uint64)0, 4), &vals[0]);
+  var up: RcQuery = rc_query_update_all(user_meta());
   defer rc_query_free(&up);
-  if (rc_query_where_eq(&up, 7, RcInt(2)) != RC_OK) { return 5; }
+  if (rc_query_set(&up, "active", RcBool(false)) != RC_OK) { return 19; }
+  if (rc_query_where(&up, "role", RC_CMP_EQ, RcInt(2)) != RC_OK) { return 5; }
   if (rc_multi_update_all(&m, "deactivate", &up) != RC_OK) { return 6; }
 
   if (rc_mem_push_ok(a, 1, 40) != RC_OK) { return 7; }

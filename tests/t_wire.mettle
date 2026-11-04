@@ -157,8 +157,8 @@ fn check_query() -> int32 {
 
   var q: RcQuery = rc_query_select(note_meta());
   defer rc_query_free(&q);
-  if (rc_query_where_eq(&q, 0, RcInt(5)) != RC_OK) { return 1; }
-  if (rc_query_order_by(&q, 2, false) != RC_OK) { return 2; }
+  if (rc_query_where_field(&q, 0, RC_CMP_EQ, RcInt(5)) != RC_OK) { return 1; }
+  if (rc_query_order_by_field(&q, 2, RC_DESC) != RC_OK) { return 2; }
   if (rc_query_limit(&q, 1) != RC_OK) { return 3; }
   if (rc_wire_query(&w, 3, rc_query_stmt(&q)) != RC_OK) { return 4; }
 
@@ -212,7 +212,7 @@ fn check_query() -> int32 {
   // A statement with a join is refused, not sent.
   var jq: RcQuery = rc_query_select(user_meta());
   defer rc_query_free(&jq);
-  if (rc_query_join(&jq, post_meta(), 0, 1, RC_JOIN_INNER) != RC_OK) { return 10; }
+  if (rc_query_join_field(&jq, post_meta(), 0, 1, RC_JOIN_INNER) != RC_OK) { return 10; }
   if (rc_wire_query(&w, 5, rc_query_stmt(&jq)) != RC_ERR_UNSUPPORTED) { return 11; }
   return 0;
 }
