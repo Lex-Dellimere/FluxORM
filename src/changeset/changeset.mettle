@@ -439,7 +439,10 @@ export fn rc_changeset_put(cs: RcChangeset*, name: string, v: RcValue) -> int32 
 // the result, e.g. rc_changeset_cast(&cs, "age", "42") puts RcInt(42).
 // Parsing is strict (see cast.mettle and rc_cast_text): no trimming, no
 // exponents, booleans only "1" "0" "true" "false", integer text for a time
-// (unix micros), no text form for a blob. Empty text means NULL.
+// (unix micros), no text form for a blob.
+// Empty text means NULL for every type, text fields included (as in Ecto), so
+// an empty form value on a NOT NULL text field fails "not null". To store an
+// empty string, use rc_changeset_put(cs, name, RcText("")).
 //   cs    the changeset
 //   name  field name, or column name if no field has it
 //   text  the text; borrowed. A text field keeps a view of it, so it must
