@@ -52,5 +52,8 @@ main = "tests/t_repo.mettle"
 [bin.t_session]
 main = "tests/t_session.mettle"
 
+[bin.t_validate]
+main = "tests/t_validate.mettle"
+
 [bin.t_value]
 main = "tests/t_value.mettle"

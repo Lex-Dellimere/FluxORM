@@ -18,6 +18,7 @@ import "query/dialect";
 import "query/builder";
 import "changeset/cast";
 import "changeset/changeset";
+import "changeset/validate";
 import "relation/relation";
 import "relation/load";
 import "migration/ddl";

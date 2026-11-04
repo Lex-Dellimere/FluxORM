@@ -482,11 +482,12 @@ fn check_errors() -> int32 {
   if (rc_changeset_error_reason(&cs) == "") { return 8; }
   if (rc_changeset_valid(&cs)) { return 9; }
 
-  // The error is sticky: the next write is refused with the same code and does
-  // not become dirty.
-  if (rc_changeset_put(&cs, 1, RcText("x@example.com")) != RC_ERR_USAGE) { return 10; }
-  if (rc_changeset_n_dirty(&cs) != 0) { return 11; }
-  if (rc_changeset_has(&cs, 1)) { return 12; }
+  // Errors are collected, not sticky: a put on another field still works, and
+  // the changeset stays invalid.
+  if (rc_changeset_put(&cs, 1, RcText("x@example.com")) != RC_OK) { return 10; }
+  if (!rc_changeset_has(&cs, 1)) { return 11; }
+  if (rc_changeset_valid(&cs)) { return 12; }
+  if (rc_changeset_error_count(&cs) != 1) { return 48; }
 
   // An invalid changeset writes nothing at all.
   var u: User;

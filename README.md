@@ -3,7 +3,7 @@
 An ORM for the [MeoSQL](../meosql) database, written in Mettle.
 
 Status: models, queries, inserts, loads, updates of changed fields, deletes,
-relations without N+1, up-only migrations, sessions with transactions and
+changeset validations, relations without N+1, up-only migrations, sessions with transactions and
 stale-write detection and automatic timestamps all work and are tested in the interpreter, debug and
 release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub until
 MeoSQL has its network server; the tests run against an in-memory adapter that
@@ -17,7 +17,7 @@ src/core/            values, status codes, model metadata, entities, sessions,
                      clock, single-row insert/load/delete
 src/adapter/         the adapter interface, the in-memory test adapter, MeoSQL
 src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
-src/changeset/       casting user input, dirty fields, save
+src/changeset/       casting user input, dirty fields, validations, save
 src/relation/        has-many / belongs-to / through, loaded in batches
 src/migration/       CREATE TABLE from metadata, versioned migrations
 src/repo/            insert, get, one, all, update, delete through a session
@@ -65,13 +65,18 @@ rc_clock_set(&rc_clock_realtime_us);  // once, if any model has timestamps
 var s: RcSession = rc_session_new(adapter);
 defer rc_session_free(&s);
 
-// Insert through a changeset: casts and NOT NULL checks run first.
+// Insert through a changeset. Casts, NOT NULL checks and validations run
+// first; every error is kept per field, and an invalid changeset is not sent.
 var n: Note;
 memset((rawptr)&n, 0, (int64)sizeof(Note));
 var e: RcEntity = rc_entity_new(note_meta(), (rawptr)&n);
 var cs: RcChangeset = rc_changeset_new(note_meta());
 rc_changeset_put_text(&cs, 1, "draft");
+rc_validate_length(&cs, 1, 1, 200);
+rc_changeset_unique(&cs, 1);  // a duplicate key is reported on "text"
 rc_repo_insert(&s, &cs, &e);
+// On failure, rc_changeset_error_at(&cs, i) for i < rc_changeset_error_count(&cs)
+// gives each error's field, code and reason ("is too long", ...).
 rc_changeset_free(&cs);
 
 // Load by key, change one field, save. Only "text" is sent, matched on the

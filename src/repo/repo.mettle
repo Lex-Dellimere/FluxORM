@@ -31,7 +31,8 @@ export struct RcRows {
 }
 
 // Inserts e, which must be NEW. A changeset (or 0) is applied first, so its
-// casts and NOT NULL checks run before anything is sent.
+// casts, NOT NULL checks and validations run before anything is sent. A
+// duplicate key is recorded on the changeset's unique field.
 export fn rc_repo_insert(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32 {
   if (s == 0 || e == 0) { return RC_ERR_USAGE; }
   if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
@@ -39,7 +40,9 @@ export fn rc_repo_insert(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32
     var rc: int32 = rc_changeset_apply(cs, e);
     if (rc != RC_OK) { return rc; }
   }
-  return rc_persist_insert(rc_session_adapter(s), e);
+  var out: int32 = rc_persist_insert(rc_session_adapter(s), e);
+  if (out == RC_ERR_CONFLICT && cs != 0) { rc_changeset_conflict(cs); }
+  return out;
 }
 
 export fn rc_repo_update(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32 {
