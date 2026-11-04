@@ -8,6 +8,8 @@ fn project() {
   mb_meta("license", "Apache-2.0");
   mb_import_root("src");
   mb_targets("linux");
+  // Live against meodb on 127.0.0.1:5491; skips when none is listening.
+  mb_test_bin("store_live", "tests/store_live.mettle");
 }
 
 fn deps() {

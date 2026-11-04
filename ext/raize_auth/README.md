@@ -79,15 +79,17 @@ Every function answers `RA_OK`, `RA_E_NOT_FOUND`, `RA_E_NOMEM` or
 ## Test
 
 `tests/store_live.mettle` runs the RaStore contract and a four-thread smoke
-test against a real server. From this directory:
+test against a real server. It is a test program (`mb_test_bin`), so mbuild
+links libsodium for it; with no server on 127.0.0.1:5491 it prints SKIP and
+passes. From this directory:
 
 ```
 MB=/home/nox/Projects/mettle/mbuild/build/linux/release/mbuild
 export METTLE=/home/nox/Projects/mettle/Mettle/bin/mettle
 ../../../meodb/build/linux/release/meodb --db /tmp/rfa.meo --listen 127.0.0.1:5491 &
-$MB mettle -- --build tests/store_live.mettle -o /tmp/store_live -l:libsodium.so.23
-/tmp/store_live
+$MB test --force store_live        # -r for release
 kill %1; rm -f /tmp/rfa.meo*
 ```
 
-Use an empty database each run; add `--release` to build optimised.
+Use an empty database each run. `--force` reruns it even when mbuild has
+cached a pass (for example one that skipped).
