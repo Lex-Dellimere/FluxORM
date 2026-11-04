@@ -197,6 +197,56 @@ export fn rc_repo_one(s: RcSession*, q: RcQuery*, model: rawptr, e: RcEntity*) -
   return rc_rows_get(&rows, 0, model, e);
 }
 
+// Loads the one row whose column equals v, like Ecto's Repo.get_by, e.g.
+// rc_repo_get_by(&s, user_meta(), "email", RcText("ada@x.io"), (rawptr)&u, &e).
+//   s       the session; keeps the result until rc_session_clear
+//   m       the table
+//   column  field name, or column name if no field has it
+//   v       the value to match; borrowed
+//   model   the caller's model struct; zeroed and filled. Its text fields
+//           point into the session's kept result
+//   e       receives a CLEAN entity for model
+// Returns RC_OK, or:
+//   RC_ERR_USAGE      a pointer is 0, column is unknown, or more than one row
+//                     matched (use a unique column)
+//   RC_ERR_NOT_FOUND  no row matched
+//   any code of rc_repo_one
+export fn rc_repo_get_by(s: RcSession*, m: RcMeta, column: string, v: RcValue,
+                         model: rawptr, e: RcEntity*) -> int32 {
+  var field: int32 = rc_meta_find(m, column);
+  if (field < 0) { return RC_ERR_USAGE; }
+  return rc_repo_get_by_field(s, m, field, v, model, e);
+}
+
+// rc_repo_get_by with a 0-based field index in place of the name. Returns
+// the same codes; RC_ERR_USAGE when field is out of range.
+export fn rc_repo_get_by_field(s: RcSession*, m: RcMeta, field: int32, v: RcValue,
+                               model: rawptr, e: RcEntity*) -> int32 {
+  if (s == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  var q: RcQuery = rc_query_select(m);
+  defer rc_query_free(&q);
+  var rc: int32 = rc_query_where_field(&q, field, RC_CMP_EQ, v);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_query_limit(&q, 2);   // 2 is enough to tell one row from many
+  if (rc != RC_OK) { return rc; }
+  return rc_repo_one(s, &q, model, e);
+}
+
+// Tells whether any row matches, like Ecto's Repo.exists?, e.g.
+// rc_repo_exists(&s, &q, &found) with q from rc_query_count plus WHERE terms.
+//   s      the session
+//   q      from rc_query_count; borrowed
+//   found  receives true when at least one row matches (false on failure)
+// Returns the codes of rc_repo_count. Nothing is kept.
+export fn rc_repo_exists(s: RcSession*, q: RcQuery*, found: bool*) -> int32 {
+  if (found == 0) { return RC_ERR_USAGE; }
+  *found = false;
+  var n: int64 = 0;
+  var rc: int32 = rc_repo_count(s, q, &n);
+  if (rc == RC_OK) { *found = n > 0; }
+  return rc;
+}
+
 // Loads row i of an rc_repo_all into a model.
 //   rows   from rc_repo_all
 //   i      0-based row, below rows->n
