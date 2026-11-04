@@ -239,10 +239,10 @@ fn check_decode() -> int32 {
   e_le(&h, 16777216, 4);
   e_le(&h, 42, 8);
   e_le(&h, 3, 4);
-  e_str(&h, "meosql 0.1.0");
+  e_str(&h, "meodb 0.1.0");
   var hello: RcWireHello;
   if (rc_wire_hello_ok(&h.b[0], (int64)h.n, &hello) != RC_OK) { return 4; }
-  if (hello.max_frame != 16777216 || hello.caps != 3 || hello.name != "meosql 0.1.0") { return 5; }
+  if (hello.max_frame != 16777216 || hello.caps != 3 || hello.name != "meodb 0.1.0") { return 5; }
   if (rc_wire_hello_ok(&h.b[0], (int64)h.n - 1, &hello) != RC_ERR_ADAPTER) { return 6; }
 
   // ERROR: CONFLICT, not fatal, transaction still open.

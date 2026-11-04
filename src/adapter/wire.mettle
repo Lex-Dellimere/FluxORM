@@ -1,6 +1,6 @@
 // flux_orm/adapter/wire.mettle — MeoDB wire protocol v1, encode and decode.
 //
-// Written from meosql/docs/PROTOCOL.md alone; MeoDB's code is not imported.
+// Written from meodb/docs/PROTOCOL.md alone; MeoDB's code is not imported.
 // No I/O here: frames are built into an RcWire byte buffer and replies are
 // decoded from bytes, so every rule is testable without a server.
 //

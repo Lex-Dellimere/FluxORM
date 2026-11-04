@@ -1,6 +1,6 @@
 # flux_orm
 
-An ORM for the [MeoDB](../meosql) database, written in Mettle.
+An ORM for the [MeoDB](../meodb) database, written in Mettle.
 
 Status: models, queries, inserts, loads, updates of changed fields, deletes,
 update_all/delete_all/count, changeset validations, relations without N+1,
@@ -257,7 +257,7 @@ done
 ```
 
 `tests/live_meodb.mettle` runs flux_orm against a real MeoDB server. Start one
-(`../meosql/build/linux/release/meosql --db /tmp/flux_live.meo`), then build and
+(`../meodb/build/linux/release/meodb --db /tmp/flux_live.meo`), then build and
 run that file the same way.
 
 Imports are file-relative, so the compiler can be run from anywhere.

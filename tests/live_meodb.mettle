@@ -3,7 +3,7 @@
 // Not part of the normal test run, because it needs a server. Start one on
 // the default port with an empty database, then run this:
 //
-//   ../meosql/build/linux/release/meosql --db /tmp/flux_live.meo
+//   ../meodb/build/linux/release/meodb --db /tmp/flux_live.meo
 //   mbuild mettle -- --build tests/live_meodb.mettle -o /tmp/live && /tmp/live
 //
 // It migrates, inserts, loads, saves with a version check (and a stale save),
@@ -194,6 +194,17 @@ export fn main() -> int32 {
   if (!step("exists title = zzz", rc_repo_exists(&s, &xq, &found))) { return 20; }
   if (found) { println("  FAIL exists: found a missing row"); return 21; }
   rc_query_free(&xq);
+
+  // index ops: create (twice: IF NOT EXISTS), UNIQUE over duplicates, drop
+  var tcol: string[1] = ["title"];
+  var ucol: string[1] = ["user_id"];
+  if (!step("create index posts_title_index", rc_migration_create_index(a, post_meta(), "posts_title_index", &tcol[0], 1, false))) { return 22; }
+  if (!step("create it again (no-op)", rc_migration_create_index(a, post_meta(), "posts_title_index", &tcol[0], 1, false))) { return 23; }
+  rc = rc_migration_create_index(a, post_meta(), "posts_user_unique", &ucol[0], 1, true);
+  if (rc != RC_ERR_CONFLICT) { println("  FAIL unique index over duplicates: {rc_status_name(rc)}"); return 24; }
+  println("  ok   unique index over duplicate user_id refused (RC_ERR_CONFLICT)");
+  if (!step("drop index posts_title_index", rc_migration_drop_index(a, post_meta(), "posts_title_index"))) { return 25; }
+  if (!step("drop it again (IF EXISTS)", rc_migration_drop_index(a, post_meta(), "posts_title_index"))) { return 26; }
 
   // delete_all
   var dq: RcQuery = rc_query_delete(post_meta());

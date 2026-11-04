@@ -1,7 +1,7 @@
 // flux_orm/adapter/meodb.mettle — the MeoDB adapter, over the network.
 //
-// flux_orm does not compile MeoDB in; it talks to the `meosql` server with
-// wire protocol v1 (meosql/docs/PROTOCOL.md, coded in wire.mettle). This file
+// flux_orm does not compile MeoDB in; it talks to the `meodb` server with
+// wire protocol v1 (meodb/docs/PROTOCOL.md, coded in wire.mettle). This file
 // is not in the import root, so only apps that use MeoDB pull in std/net:
 //
 //   import "flux_orm/adapter/meodb";
