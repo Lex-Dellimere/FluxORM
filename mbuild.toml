@@ -1,11 +1,13 @@
-# flux_orm — an ORM for MeoSQL.
+# flux_orm — an ORM for MeoSQL, as a library: no [bin] sections. `mbuild check`
+# and `mbuild build` type-check src/flux_orm.mettle and everything it imports;
+# `mbuild test` runs the tests' @test entries. The README shows how to build and
+# run each test as a program in debug and release.
 #
-# No [toolchain] pin on purpose: flux_orm needs the head compiler (compile-time
-# reflection, `Kind`, comptime for). Pin v0.17.0 and the build fails. Select
-# head with either:
+# No [toolchain] pin: flux_orm needs the dev compiler (compile-time reflection,
+# `Kind`, comptime for). Select it with either:
 #
 #   export METTLE=/home/nox/Projects/mettle/Mettle/bin/mettle
-#   mbuild --mettle /path/to/mettle build
+#   mbuild --mettle /path/to/mettle check
 [package]
 name = "flux_orm"
 version = "0.1.0"
@@ -15,57 +17,3 @@ targets = ["linux"]
 
 [profile.release]
 flags = ["--release"]
-
-# Each test file is also a program: `mbuild build [-r]` builds them all and
-# `mbuild run t_query` runs one. Release matters: head miscompiles have shown
-# up in release only. mbuild's library mode only sees .mettle files directly
-# in src/, and flux_orm's live in src/<layer>/, so these bins are also what
-# `mbuild check` type-checks.
-
-[bin.t_adapter]
-main = "tests/t_adapter.mettle"
-
-[bin.t_changeset]
-main = "tests/t_changeset.mettle"
-
-[bin.t_integration]
-main = "tests/t_integration.mettle"
-
-[bin.t_meosql]
-main = "tests/t_meosql.mettle"
-
-[bin.t_meta]
-main = "tests/t_meta.mettle"
-
-[bin.t_migration]
-main = "tests/t_migration.mettle"
-
-[bin.t_multi]
-main = "tests/t_multi.mettle"
-
-[bin.t_persist]
-main = "tests/t_persist.mettle"
-
-[bin.t_query]
-main = "tests/t_query.mettle"
-
-[bin.t_relation]
-main = "tests/t_relation.mettle"
-
-[bin.t_repo]
-main = "tests/t_repo.mettle"
-
-[bin.t_session]
-main = "tests/t_session.mettle"
-
-[bin.t_stmt]
-main = "tests/t_stmt.mettle"
-
-[bin.t_validate]
-main = "tests/t_validate.mettle"
-
-[bin.t_wire]
-main = "tests/t_wire.mettle"
-
-[bin.t_value]
-main = "tests/t_value.mettle"

@@ -1,0 +1,204 @@
+// tests/live_meosql.mettle — flux_orm against a real MeoSQL server.
+//
+// Not part of the normal test run, because it needs a server. Start one on
+// the default port with an empty database, then run this:
+//
+//   ../meosql/build/linux/release/meosql --db /tmp/flux_live.meo
+//   mbuild mettle -- --build tests/live_meosql.mettle -o /tmp/live && /tmp/live
+//
+// It migrates, inserts, loads, saves with a version check (and a stale save),
+// reports a duplicate key on its field, queries, preloads, counts, deletes in
+// bulk and rolls a transaction back, printing one line per step.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "../src/flux_orm";
+import "../src/adapter/meosql";
+import "models";
+
+fn up_all(a: RcAdapter*) -> int32 {
+  var rc: int32 = rc_migration_create(a, note_meta());
+  if (rc == RC_OK) { rc = rc_migration_create(a, user_meta()); }
+  if (rc == RC_OK) { rc = rc_migration_create(a, post_meta()); }
+  return rc;
+}
+
+const MIGRATIONS: RcMigration[1] = [ { version: 1, name: "create tables", up: &up_all } ];
+
+fn step(name: string, rc: int32) -> bool {
+  if (rc == RC_OK) {
+    println("  ok   {name}");
+    return true;
+  }
+  println("  FAIL {name}: {rc_status_name(rc)}");
+  return false;
+}
+
+export fn main() -> int32 {
+  rc_clock_set(&test_clock);
+  var a: RcAdapter* = rc_meosql_adapter("");
+  var rc: int32 = RC_ERR_CLOSED;
+  var tries: int32 = 0;
+  while (rc != RC_OK && tries < 50) {
+    rc = rc_adapter_open(a, "127.0.0.1:5490");
+    if (rc != RC_OK) { Sleep(100); }
+    tries = tries + 1;
+  }
+  if (!step("connect + hello", rc)) { return 1; }
+  println("  caps {rc_meosql_caps(a)}");
+
+  var set: RcMigrationSet = rc_migration_set(&MIGRATIONS[0], 1);
+  var rep: RcMigrationReport;
+  rc_migration_set_clock(1700000000000000);
+  if (!step("migrate (3 CREATE TABLE + ledger)", rc_migration_run(a, &set, &rep))) { return 2; }
+
+  var s: RcSession = rc_session_new(a);
+
+  // insert a note through a changeset
+  var n: Note;
+  memset((rawptr)&n, 0, (int64)sizeof(Note));
+  var e: RcEntity = rc_entity_new(note_meta(), (rawptr)&n);
+  var cs: RcChangeset = rc_changeset_new(note_meta());
+  rc_changeset_cast(&cs, "text", "draft");
+  rc_validate_length(&cs, "text", 1, 200);
+  if (!step("insert note", rc_repo_insert(&s, &cs, &e))) { return 3; }
+  println("  note id {n.id} version {n.version}");
+  rc_changeset_free(&cs);
+
+  // load it twice, save one copy, the other is now stale
+  var a1: Note;
+  var e1: RcEntity;
+  var a2: Note;
+  var e2: RcEntity;
+  if (!step("get by id", rc_repo_get(&s, note_meta(), RcInt(n.id), (rawptr)&a1, &e1))) { return 4; }
+  rc_repo_get(&s, note_meta(), RcInt(n.id), (rawptr)&a2, &e2);
+  println("  loaded text={a1.text} version={a1.version}");
+  var c1: RcChangeset = rc_changeset_new(note_meta());
+  rc_changeset_bind(&c1, (rawptr)&a1, e1.nulls);
+  rc_changeset_cast(&c1, "text", "final");
+  if (!step("update (version 1 -> 2)", rc_repo_update(&s, &c1, &e1))) { return 5; }
+  var c2: RcChangeset = rc_changeset_new(note_meta());
+  rc_changeset_bind(&c2, (rawptr)&a2, e2.nulls);
+  rc_changeset_cast(&c2, "text", "mine");
+  rc = rc_repo_update(&s, &c2, &e2);
+  if (rc == RC_ERR_CONFLICT) { println("  ok   stale update refused (RC_ERR_CONFLICT)"); }
+  else { println("  FAIL stale update gave {rc_status_name(rc)}"); return 6; }
+
+  // users and posts
+  var names: string[2];
+  names[0] = "Ada";
+  names[1] = "Grace";
+  var uid: int64[2];
+  var i: int32 = 0;
+  while (i < 2) {
+    var u: User;
+    memset((rawptr)&u, 0, (int64)sizeof(User));
+    var ue: RcEntity = rc_entity_new(user_meta(), (rawptr)&u);
+    var ucs: RcChangeset = rc_changeset_new(user_meta());
+    if (i == 0) { rc_changeset_put(&ucs, "email", RcText("ada@example.com")); }
+    else { rc_changeset_put(&ucs, "email", RcText("grace@example.com")); }
+    rc_changeset_put(&ucs, "name", RcText(names[i]));
+    rc_changeset_put(&ucs, "active", RcBool(true));
+    rc_changeset_put(&ucs, "created_at", RcTime(1700000000000000));
+    rc_changeset_put(&ucs, "role", RcInt(2));
+    rc_changeset_unique(&ucs, "email");
+    if (!step("insert user", rc_repo_insert(&s, &ucs, &ue))) { return 7; }
+    uid[i] = u.id;
+    rc_changeset_free(&ucs);
+    i = i + 1;
+  }
+  // a duplicate email lands on the field
+  var dup: User;
+  memset((rawptr)&dup, 0, (int64)sizeof(User));
+  var de: RcEntity = rc_entity_new(user_meta(), (rawptr)&dup);
+  var dcs: RcChangeset = rc_changeset_new(user_meta());
+  rc_changeset_put(&dcs, "email", RcText("ada@example.com"));
+  rc_changeset_put(&dcs, "name", RcText("Again"));
+  rc_changeset_put(&dcs, "active", RcBool(true));
+  rc_changeset_put(&dcs, "created_at", RcTime(1));
+  rc_changeset_put(&dcs, "role", RcInt(2));
+  rc_changeset_unique(&dcs, "email");
+  rc = rc_repo_insert(&s, &dcs, &de);
+  if (rc == RC_ERR_CONFLICT && rc_changeset_has_error(&dcs, "email")) {
+    println("  ok   duplicate email reported on \"email\"");
+  } else { println("  FAIL duplicate email: {rc_status_name(rc)}"); return 8; }
+
+  var titles: string[3];
+  titles[0] = "a";
+  titles[1] = "b";
+  titles[2] = "c";
+  i = 0;
+  while (i < 3) {
+    var p: Post;
+    memset((rawptr)&p, 0, (int64)sizeof(Post));
+    var pe: RcEntity = rc_entity_new(post_meta(), (rawptr)&p);
+    var owner: int64 = uid[0];
+    if (i == 2) { owner = uid[1]; }
+    rc_entity_set(&pe, "user_id", RcInt(owner));
+    rc_entity_set(&pe, "title", RcText(titles[i]));
+    var none: RcChangeset* = 0;
+    if (!step("insert post", rc_repo_insert(&s, none, &pe))) { return 9; }
+    i = i + 1;
+  }
+
+  // query: filter + order
+  var q: RcQuery = rc_query_select(user_meta());
+  rc_query_where(&q, "active", RC_CMP_EQ, RcBool(true));
+  rc_query_order_by(&q, "name", RC_DESC);
+  var rows: RcRows;
+  if (!step("select users WHERE active ORDER BY name DESC", rc_repo_all(&s, &q, &rows))) { return 10; }
+  var first: User;
+  var fe: RcEntity;
+  if (!step("read row 0 into a model", rc_rows_get(&rows, 0, (rawptr)&first, &fe))) { return 14; }
+  println("  {rows.n} rows, first {first.name}");
+
+  // preload posts for both users
+  var rel: RcRelation = rc_relation_has_many("posts", user_meta(), "id", post_meta(), "user_id");
+  var pre: RcPreload;
+  if (!step("preload posts", rc_repo_preload(&s, &rows, &rel, &pre))) { return 11; }
+  var second: User;
+  var se: RcEntity;
+  if (!step("read row 1 into a model", rc_rows_get(&rows, 1, (rawptr)&second, &se))) { return 15; }
+  var nf: int32 = rc_preload_count(&pre, &fe);
+  var ns: int32 = rc_preload_count(&pre, &se);
+  println("  {first.name}: {nf} posts, {second.name}: {ns} posts");
+
+  // count and comparisons
+  var cq: RcQuery = rc_query_count(post_meta());
+  rc_query_where(&cq, "id", RC_CMP_GE, RcInt(1));
+  var cnt: int64 = 0;
+  rc = rc_repo_count(&s, &cq, &cnt);
+  if (rc == RC_OK) { println("  ok   count posts with id >= 1: {cnt}"); }
+  else { println("  FAIL count: {rc_status_name(rc)}"); }
+
+  // delete_all
+  var dq: RcQuery = rc_query_delete(post_meta());
+  rc_query_where(&dq, "title", RC_CMP_EQ, RcText("c"));
+  var gone: int32 = 0;
+  if (!step("delete_all posts WHERE title = c", rc_repo_delete_all(&s, &dq, &gone))) { return 12; }
+  println("  deleted {gone}");
+
+  // transaction rolled back leaves nothing
+  rc_session_begin(&s, RC_TX_DEFAULT);
+  var tmp: Note;
+  memset((rawptr)&tmp, 0, (int64)sizeof(Note));
+  var te: RcEntity = rc_entity_new(note_meta(), (rawptr)&tmp);
+  rc_entity_set(&te, "text", RcText("rolled back"));
+  var nocs: RcChangeset* = 0;
+  rc_repo_insert(&s, nocs, &te);
+  rc_session_rollback(&s);
+  var nq: RcQuery = rc_query_count(note_meta());
+  rc_query_where(&nq, "id", RC_CMP_GE, RcInt(0));
+  var nn: int64 = 0;
+  rc = rc_repo_count(&s, &nq, &nn);
+  if (rc == RC_OK && nn == 1) { println("  ok   rollback left 1 note"); }
+  else { println("  FAIL rollback check: {rc_status_name(rc)} n={nn}"); }
+
+  if (!step("delete note", rc_repo_delete(&s, &e1))) { return 13; }
+  rc_session_free(&s);
+  rc_adapter_close(a);
+  rc_meosql_adapter_free(a);
+  println("done");
+  return 0;
+}
