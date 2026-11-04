@@ -95,7 +95,10 @@ export fn rc_migration_add_column_field(a: RcAdapter*, m: RcMeta, field: int32) 
 //   unique  true for a UNIQUE index
 // Returns RC_OK, or RC_ERR_USAGE when a or fields is 0, n <= 0, name is
 // empty, m is malformed or a field index is out of range (rc_meta_check's
-// RC_ERR_UNSUPPORTED also passes through).
+// RC_ERR_UNSUPPORTED also passes through); otherwise the adapter's code. On
+// MeoSQL: an existing name is an OK no-op; RC_ERR_CONFLICT when a UNIQUE index
+// meets duplicate values; RC_ERR_UNSUPPORTED for n > 1; RC_ERR_USAGE when the
+// column already has an index (its UNIQUE or PK one included).
 export fn rc_migration_create_index_field(a: RcAdapter*, m: RcMeta, name: string,
                                           fields: int32*, n: int32,
                                           unique: bool) -> int32 {
@@ -136,7 +139,9 @@ export fn rc_migration_create_index_field(a: RcAdapter*, m: RcMeta, name: string
 //   a     the adapter; borrowed
 //   m     the meta of the table the index belongs to; only m.table is used
 //   name  index name; borrowed, must be non-empty
-// Returns RC_OK, or RC_ERR_USAGE when a is 0 or name is empty.
+// Returns RC_OK, or RC_ERR_USAGE when a is 0 or name is empty; otherwise the
+// adapter's code. A missing name is an OK no-op (IF EXISTS). The unnamed
+// indexes behind UNIQUE and PK columns cannot be dropped.
 export fn rc_migration_drop_index(a: RcAdapter*, m: RcMeta, name: string) -> int32 {
   if (a == 0 || name.length == (uint64)0) { return RC_ERR_USAGE; }
   var b: RcBuf = rc_buf_new(64);
