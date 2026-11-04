@@ -15,6 +15,7 @@ import "std/mem";
 import "std/thread";
 import "../src/flux_orm";
 import "../src/adapter/meodb";
+import "../src/repo/pool";
 import "models";
 
 fn up_all(a: RcAdapter*) -> int32 {
@@ -210,6 +211,17 @@ export fn main() -> int32 {
   if (!step("get it back", rc_repo_get(&s, note_meta(), RcInt(bn.id), (rawptr)&bb, &bbe))) { return 28; }
   if (bb.text != big) { println("  FAIL big note: {bb.text.length} bytes back"); return 29; }
   if (!step("delete it", rc_repo_delete(&s, &bbe))) { return 30; }
+
+  // a pool of two connections: count through a checked-out session
+  var pool: RcPool;
+  if (!step("open a pool of 2", rc_meodb_pool(&pool, 2, "", "127.0.0.1:5490"))) { return 31; }
+  var ps: RcSession* = 0;
+  if (!step("checkout", rc_pool_checkout(&pool, 1000, &ps))) { return 32; }
+  var pc: int64 = 0;
+  if (!step("count posts on it", rc_repo_count(ps, &cq, &pc))) { return 33; }
+  if (pc != cnt + 2) { println("  FAIL pooled count {pc}"); return 34; }
+  if (!step("checkin", rc_pool_checkin(&pool, ps))) { return 35; }
+  rc_pool_free(&pool);
 
   // index ops: create (twice: IF NOT EXISTS), UNIQUE over duplicates, drop
   var tcol: string[1] = ["title"];

@@ -202,6 +202,23 @@ Every call returns an `RC_*` code (`src/core/status.mettle`). `rc_repo_one`
 expects exactly one row. Wrap related writes in
 `rc_session_begin`/`rc_session_commit`, or `rc_session_transaction`.
 
+A connection is not thread-safe. A server with worker threads keeps a pool and
+checks out one session per request. Checkin rolls back an open transaction and
+clears the session:
+
+```
+import "flux_orm/repo/pool";
+
+var pool: RcPool;
+rc_meodb_pool(&pool, 8, "token", "127.0.0.1:5490");
+var s: RcSession* = 0;
+if (rc_pool_checkout(&pool, 1000, &s) == RC_OK) {   // RC_ERR_BUSY after 1 s
+  rc_repo_get(s, user_meta(), RcInt(7), (rawptr)&u, &e);
+  rc_pool_checkin(&pool, s);
+}
+rc_pool_free(&pool);
+```
+
 ## Reference
 
 Every exported function has a comment above it in `src/` with its inputs,
@@ -229,6 +246,7 @@ Conventions:
 | Multi | `rc_multi_new`, `rc_multi_insert`, `rc_multi_update`, `rc_multi_delete`, `rc_multi_update_all`, `rc_multi_delete_all`, `rc_multi_run`, `rc_multi_failed_name`, `rc_multi_free` |
 | Relations | `rc_relation_has_many`, `rc_relation_belongs_to`, `rc_relation_has_many_through`, `rc_relation_load`, `rc_relation_group`, `rc_relation_count`, `rc_relation_hydrate`, `rc_relation_free` |
 | Migrations | `rc_migration_set`, `rc_migration_run`, `rc_migration_down`, `rc_migration_create`, `rc_migration_drop`, `rc_migration_add_column`, `rc_migration_create_index`, `rc_migration_drop_index` |
+| Pool | `rc_pool_new`, `rc_meodb_pool`, `rc_pool_checkout`, `rc_pool_checkin`, `rc_pool_idle`, `rc_pool_free` |
 | Adapters | `rc_meodb_adapter`, `rc_meodb_timeout`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
 | Clock | `rc_clock_set`, `rc_clock_realtime_us` |
 

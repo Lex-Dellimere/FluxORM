@@ -1,0 +1,115 @@
+// tests/t_pool.mettle — the session pool over the mem adapter.
+//
+// The interpreter has no threads, so the @test entry runs the single-thread
+// checks; the built binary also hammers the pool from four threads.
+
+import "std/mem";
+import "std/thread";
+
+import "../src/flux_orm";
+import "../src/adapter/mem";
+import "../src/repo/pool";
+import "harness";
+
+fn make_mem(ctx: rawptr) -> RcAdapter* { return rc_mem_adapter(); }
+fn make_none(ctx: rawptr) -> RcAdapter* { return 0; }
+fn release_mem(a: RcAdapter*) { rc_mem_free(a); }
+
+// --- 1. checkout, checkin and cleanup ----------------------------------------------
+
+fn check_basic() -> int32 {
+  var p: RcPool;
+  if (rc_pool_new(&p, 0, &make_mem, 0, "mem://pool", &release_mem) != RC_ERR_USAGE) { return 1; }
+  if (rc_pool_new(&p, 2, &make_none, 0, "mem://pool", &release_mem) != RC_ERR_NOMEM) { return 2; }
+  if (rc_pool_new(&p, 2, &make_mem, 0, "mem://pool", &release_mem) != RC_OK) { return 3; }
+  defer rc_pool_free(&p);
+  if (rc_pool_idle(&p) != 2) { return 4; }
+
+  var s1: RcSession* = 0;
+  var s2: RcSession* = 0;
+  var s3: RcSession* = 0;
+  if (rc_pool_checkout(&p, 0, &s1) != RC_OK || rc_pool_checkout(&p, 0, &s2) != RC_OK) { return 5; }
+  if (s1 == s2 || rc_pool_idle(&p) != 0) { return 6; }
+  if (rc_pool_checkout(&p, 0, &s3) != RC_ERR_BUSY || s3 != 0) { return 7; }
+  if (rc_pool_checkout(&p, 5, &s3) != RC_ERR_BUSY) { return 8; }
+
+  // Checkin rolls back an open (nested) transaction.
+  if (rc_session_begin(s1, RC_TX_DEFAULT) != RC_OK || rc_session_begin(s1, RC_TX_DEFAULT) != RC_OK) { return 9; }
+  var a1: RcAdapter* = rc_session_adapter(s1);
+  if (rc_pool_checkin(&p, s1) != RC_OK) { return 10; }
+  if (rc_session_in_tx(s1) || rc_mem_rollbacks(a1) != 1 || rc_mem_tx_depth(a1) != 0) { return 11; }
+  if (rc_pool_idle(&p) != 1) { return 12; }
+
+  // Bad checkins change nothing.
+  if (rc_pool_checkin(&p, s1) != RC_ERR_USAGE) { return 13; }
+  var other: RcSession = rc_session_new(a1);
+  if (rc_pool_checkin(&p, &other) != RC_ERR_USAGE) { return 14; }
+  if (rc_pool_checkin(&p, 0) != RC_ERR_USAGE) { return 15; }
+
+  if (rc_pool_checkout(&p, 0, &s3) != RC_OK || s3 != s1) { return 16; }
+  if (rc_pool_checkin(&p, s3) != RC_OK || rc_pool_checkin(&p, s2) != RC_OK) { return 17; }
+  if (rc_pool_idle(&p) != 2) { return 18; }
+  rc_pool_free(&p);
+  if (rc_pool_checkout(&p, 0, &s3) != RC_ERR_USAGE) { return 19; }
+  return 0;
+}
+
+// --- 2. four threads, two sessions ---------------------------------------------------
+
+var POOL: RcPool;
+var IN_USE: int32[2];
+var BAD: int32 = 0;
+var DONE: int32 = 0;
+
+fn worker(arg: cstring) -> uint32 {
+  var k: int32 = 0;
+  while (k < 2000) {
+    var s: RcSession* = 0;
+    if (rc_pool_checkout(&POOL, -1, &s) != RC_OK) {
+      atomic_inc_i32(&BAD);
+      return 1;
+    }
+    var i: int64 = ((int64)s - (int64)POOL.sessions) / sizeof(RcSession);
+    if (atomic_inc_i32(&IN_USE[i]) != 1) { atomic_inc_i32(&BAD); }   // handed out twice
+    atomic_dec_i32(&IN_USE[i]);
+    if (rc_pool_checkin(&POOL, s) != RC_OK) { atomic_inc_i32(&BAD); }
+    atomic_inc_i32(&DONE);
+    k = k + 1;
+  }
+  return 0;
+}
+
+fn check_threads() -> int32 {
+  if (rc_pool_new(&POOL, 2, &make_mem, 0, "mem://pool", &release_mem) != RC_OK) { return 1; }
+  defer rc_pool_free(&POOL);
+  IN_USE[0] = 0;
+  IN_USE[1] = 0;
+  var th: int64[4];
+  var t: int32 = 0;
+  while (t < 4) {
+    th[t] = CreateThread((cstring)0, 0, &worker, (cstring)0, 0, (uint32*)0);
+    t = t + 1;
+  }
+  t = 0;
+  while (t < 4) {
+    thread_join_infinite(th[t]);
+    CloseHandle(th[t]);
+    t = t + 1;
+  }
+  if (BAD != 0) { return 2; }
+  if (DONE != 8000) { return 3; }
+  if (rc_pool_idle(&POOL) != 2) { return 4; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("pool: checkout, checkin and cleanup", check_basic())) { failures = failures + 1; }
+  if (!rc_report("pool: four threads, two sessions", check_threads())) { failures = failures + 1; }
+  return rc_summary(failures, 2);
+}
+
+@test fn t_pool() -> int32 {
+  if (check_basic() != 0) { return 1; }
+  return 0;
+}

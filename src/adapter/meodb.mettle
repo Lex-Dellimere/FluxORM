@@ -39,6 +39,7 @@ import "../core/value";
 import "adapter";
 import "stmt";
 import "wire";
+import "../repo/pool";
 
 export const RC_MEODB_PORT: int32 = 5490;  // used when the dsn has no port
 const RC_MEODB_MAX_FRAME: int64 = 16777216;  // largest reply we accept
@@ -464,4 +465,20 @@ export fn rc_meodb_adapter_free(a: RcAdapter*) {
     free((rawptr)m);
   }
   free(a);
+}
+
+fn rc_meodb_pool_make(ctx: rawptr) -> RcAdapter* {
+  return rc_meodb_adapter(*(string*)ctx);
+}
+
+// Opens a pool of n MeoDB connections, e.g. one per worker thread:
+// rc_meodb_pool(&pool, 8, "token", "127.0.0.1:5490").
+//   p      receives the pool; free it with rc_pool_free
+//   n      connections, at least 1
+//   token  passed to rc_meodb_adapter; borrowed
+//   dsn    passed to rc_adapter_open; borrowed
+// Returns the codes of rc_pool_new.
+export fn rc_meodb_pool(p: RcPool*, n: int32, token: string, dsn: string) -> int32 {
+  var t: string = token;
+  return rc_pool_new(p, n, &rc_meodb_pool_make, (rawptr)&t, dsn, &rc_meodb_adapter_free);
 }

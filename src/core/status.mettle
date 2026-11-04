@@ -21,6 +21,7 @@ export const RC_ERR_TX: int32 = -10;         // transaction state machine refuse
 export const RC_ERR_NOMEM: int32 = -11;
 export const RC_ERR_ADAPTER: int32 = -12;    // adapter reported a failure
 export const RC_ERR_SCRIPT: int32 = -13;     // reserved for test doubles
+export const RC_ERR_BUSY: int32 = -14;       // nothing free in time (rc_pool_checkout)
 
 // Short lowercase name of a status code, for logs and test output.
 //   code   any int32; need not be an RC_* code
@@ -41,6 +42,7 @@ export fn rc_status_name(code: int32) -> string {
   if (code == RC_ERR_NOMEM) { return "nomem"; }
   if (code == RC_ERR_ADAPTER) { return "adapter"; }
   if (code == RC_ERR_SCRIPT) { return "script"; }
+  if (code == RC_ERR_BUSY) { return "busy"; }
   return "unknown";
 }
 
