@@ -16,7 +16,8 @@ that records statements.
 src/flux_orm.mettle  the import root
 src/core/            values, status codes, model metadata, entities, sessions,
                      clock, single-row insert/load/delete
-src/adapter/         the adapter interface, the in-memory test adapter, MeoSQL
+src/adapter/         the adapter interface (SQL text, or statements as data),
+                     the in-memory test adapter, MeoSQL
 src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
 src/changeset/       casting user input, dirty fields, validations, save
 src/relation/        has-many / belongs-to / through, loaded in batches

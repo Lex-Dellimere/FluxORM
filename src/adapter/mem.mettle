@@ -212,6 +212,7 @@ export fn rc_mem_adapter() -> RcAdapter* {
   a.commit = &rc_mem_commit;
   a.rollback = &rc_mem_rollback;
   a.ping = &rc_mem_ping;
+  a.query = 0;  // records SQL text; the RcStmt path is tested with fakes
   return a;
 }
 

@@ -95,6 +95,7 @@ import "../core/meta";
 import "../core/buf";
 import "../core/clock";
 import "../adapter/adapter";
+import "../adapter/stmt";
 import "dialect";
 
 // JOIN flavours. Exported because relation/ names them at its call sites.
@@ -144,6 +145,7 @@ export struct RcQuery {
   n_rows: int32;   // batch INSERT: rows; UPDATE: 1; SELECT: 0
   n_cols: int32;   // batch INSERT: columns per row; UPDATE: SET columns
   err: int32;      // sticky construction failure; RC_OK when the query is usable
+  st: RcStmt;      // the same statement as data, for adapters with `query`
 }
 
 // --- internal helpers --------------------------------------------------------
@@ -217,6 +219,12 @@ fn rc_query_init(m: RcMeta, kind: int32) -> RcQuery {
   q.n_rows = 0;
   q.n_cols = 0;
   q.err = RC_OK;
+  var op: int32 = RC_OP_SELECT;
+  if (kind == Q_KIND_INSERT) { op = RC_OP_INSERT; }
+  if (kind == Q_KIND_UPDATE) { op = RC_OP_UPDATE; }
+  if (kind == Q_KIND_DELETE) { op = RC_OP_DELETE; }
+  if (kind == Q_KIND_COUNT) { op = RC_OP_COUNT; }
+  q.st = rc_stmt_new(op, m.table);
   if (q.buf.data == 0) {
     q.err = RC_ERR_NOMEM;
     return q;
@@ -342,6 +350,12 @@ export fn rc_query_select(m: RcMeta) -> RcQuery {
   if (rc != RC_OK) { return rc_query_fail(&q, rc); }
   rc = rc_query_put_ident(&q, m.table);
   if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var c: int32 = 0;
+  while (c < m.n_fields) {
+    rc = rc_stmt_col(&q.st, m.fields[c].column, m.fields[c].ty, m.fields[c].flags);
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    c = c + 1;
+  }
   // JOIN clauses are spliced in here, in call order.
   q.tail = q.buf.len;
   return q;
@@ -376,6 +390,7 @@ export fn rc_query_insert_batch(m: RcMeta, n_rows: int32) -> RcQuery {
         if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       }
       rc = rc_query_put_ident(&q, m.fields[i].column);
+      if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
       if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       first = false;
     }
@@ -407,6 +422,7 @@ export fn rc_query_insert_batch(m: RcMeta, n_rows: int32) -> RcQuery {
   }
   q.n_rows = n_rows;
   q.n_cols = n_cols;
+  q.st.n_rows = n_rows;
   q.tail = q.buf.len;
   return q;
 }
@@ -523,6 +539,7 @@ fn rc_query_update_build(m: RcMeta, mask: uint64, all: bool) -> RcQuery {
       rc = rc_query_put_ident(&q, m.fields[i].column);
       if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
       if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+      if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
       if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       n_cols = n_cols + 1;
     }
@@ -535,6 +552,7 @@ fn rc_query_update_build(m: RcMeta, mask: uint64, all: bool) -> RcQuery {
       if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.fields[i].column); }
       if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
       if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+      if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
       if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       n_cols = n_cols + 1;
     }
@@ -546,6 +564,7 @@ fn rc_query_update_build(m: RcMeta, mask: uint64, all: bool) -> RcQuery {
     if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.fields[vf].column); }
     if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
     if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+    if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[vf].column, m.fields[vf].ty, m.fields[vf].flags); }
     if (rc != RC_OK) { return rc_query_fail(&q, rc); }
     n_cols = n_cols + 1;
   }
@@ -600,6 +619,8 @@ export fn rc_query_where_cmp(q: RcQuery*, field: int32, op: int32,
   // the text is rolled back to its exact previous length and no arg was taken.
   rc = rc_query_args_reserve(q, 1);
   if (rc != RC_OK) { return rc; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, op, q->n_args, 1);
+  if (rc != RC_OK) { return rc; }
   var mark: int64 = q->buf.len;
   rc = rc_query_begin_where(q);
   if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
@@ -607,14 +628,10 @@ export fn rc_query_where_cmp(q: RcQuery*, field: int32, op: int32,
   if (rc == RC_OK) { rc = rc_query_put_question(q); }
   if (rc != RC_OK) {
     q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
     return rc;
   }
-  var take: int32 = rc_query_take_arg(q, v);
-  if (take != RC_OK) {
-    q->buf.len = mark;
-    return take;
-  }
-  return RC_OK;
+  return rc_query_take_arg(q, v);  // reserved above, so it cannot fail
 }
 
 export fn rc_query_where_eq(q: RcQuery*, field: int32, v: RcValue) -> int32 {
@@ -625,12 +642,15 @@ export fn rc_query_where_null(q: RcQuery*, field: int32) -> int32 {
   var rc: int32 = rc_query_ready_where(q);
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, RC_W_NULL, q->n_args, 0);
+  if (rc != RC_OK) { return rc; }
   var mark: int64 = q->buf.len;
   rc = rc_query_begin_where(q);
   if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
   if (rc == RC_OK) { rc = rc_query_put(q, " IS NULL"); }
   if (rc != RC_OK) {
     q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
     return rc;
   }
   return RC_OK;
@@ -640,12 +660,15 @@ export fn rc_query_where_not_null(q: RcQuery*, field: int32) -> int32 {
   var rc: int32 = rc_query_ready_where(q);
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, RC_W_NOT_NULL, q->n_args, 0);
+  if (rc != RC_OK) { return rc; }
   var mark: int64 = q->buf.len;
   rc = rc_query_begin_where(q);
   if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
   if (rc == RC_OK) { rc = rc_query_put(q, " IS NOT NULL"); }
   if (rc != RC_OK) {
     q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
     return rc;
   }
   return RC_OK;
@@ -665,6 +688,8 @@ export fn rc_query_where_in(q: RcQuery*, field: int32, vals: RcValue*,
 
   rc = rc_query_args_reserve(q, n);
   if (rc != RC_OK) { return rc; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, RC_W_IN, q->n_args, n);
+  if (rc != RC_OK) { return rc; }
   var mark: int64 = q->buf.len;
   rc = rc_query_begin_where(q);
   if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
@@ -678,6 +703,7 @@ export fn rc_query_where_in(q: RcQuery*, field: int32, vals: RcValue*,
   if (rc == RC_OK) { rc = rc_query_put(q, ")"); }
   if (rc != RC_OK) {
     q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
     return rc;
   }
   i = 0;
@@ -715,6 +741,11 @@ export fn rc_query_order_by(q: RcQuery*, field: int32, asc: bool) -> int32 {
     q->buf.len = mark;
     return rc;
   }
+  rc = rc_stmt_order(&q->st, q->meta.fields[field].column, !asc);
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
   q->n_order = q->n_order + 1;
   q->phase = Q_PHASE_ORDER;
   return RC_OK;
@@ -737,6 +768,7 @@ export fn rc_query_limit(q: RcQuery*, n: int64) -> int32 {
     return rc;
   }
   q->phase = Q_PHASE_LIMIT;
+  q->st.limit = n;
   return RC_OK;
 }
 
@@ -753,6 +785,7 @@ export fn rc_query_offset(q: RcQuery*, n: int64) -> int32 {
     return rc;
   }
   q->phase = Q_PHASE_OFFSET;
+  q->st.offset = n;
   return RC_OK;
 }
 
@@ -808,6 +841,7 @@ export fn rc_query_join(q: RcQuery*, target: RcMeta, local_field: int32,
     rc_query_rotate_left(q->buf.data + at, la + jlen, la);
   }
   q->tail = at + jlen;
+  q->st.n_joins = q->st.n_joins + 1;
   return RC_OK;
 }
 
@@ -849,14 +883,23 @@ export fn rc_query_exec(q: RcQuery*, a: RcAdapter*, out: RcResult*) -> int32 {
     if (q->phase != Q_PHASE_WHERE) { return RC_ERR_USAGE; }
   }
   if (q->kind == Q_KIND_DELETE && q->phase != Q_PHASE_WHERE) { return RC_ERR_USAGE; }
-  return rc_adapter_exec(a, rc_buf_text(&q->buf), q->args, q->n_args, out);
+  return rc_adapter_run(a, rc_buf_text(&q->buf), &q->st, q->args, q->n_args, out);
 }
 
 // Frees the text buffer and the argv array. It does NOT release the cells: they
 // are borrowed, and freeing them here would double-free the caller's text.
+// The statement as data, with its argv; valid until the next mutation or free.
+export fn rc_query_stmt(q: RcQuery*) -> RcStmt* {
+  if (q == 0) { return 0; }
+  q->st.args = q->args;
+  q->st.n_args = q->n_args;
+  return &q->st;
+}
+
 export fn rc_query_free(q: RcQuery*) {
   if (q == 0) { return; }
   rc_buf_free(&q->buf);
+  rc_stmt_free(&q->st);
   if (q->args != 0) {
     free(q->args);
     q->args = 0;

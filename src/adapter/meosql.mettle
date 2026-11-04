@@ -5,60 +5,34 @@
 // (MeoSQL roadmap M7) once it exists. Until then every entry point returns
 // RC_ERR_UNSUPPORTED and rc_meosql_supported() is false.
 //
-// The calls below are MeoSQL's embedded API (meosql/.apex/DECISIONS.md D8).
-// The server's protocol carries the same prepare/bind/step/finalize and
-// begin/commit steps, so the mapping and the status table still apply:
+// MeoSQL has no SQL language. It takes statements as data, which is what the
+// `query` slot carries (adapter/stmt.mettle); the server's request frame is
+// the same RcStmt. So this adapter sets `query` and leaves `exec` empty.
 //
-//   open      meo_db_open(dsn, flags, RC_MEOSQL_N_FRAMES, &db)
-//   close     meo_db_close(db)
-//   begin     meo_db_begin(db, mode)          RC_TX_* == MEO_TX_*; nested -> TX
-//   commit    meo_db_commit(db)
-//   rollback  meo_db_rollback(db)
-//   ping      meo_db_ping(db)
-//   exec      meo_sql_prepare(db, sql, &st, &err_off), bind every arg,
-//             meo_sql_step until MEO_DONE copying each row into RcResult,
-//             affected = meo_sql_changes(st),
-//             last_id = meo_sql_last_insert_rowid(st), meo_sql_finalize(st)
+// Values, RcValue -> MeoValue: RcNull -> NULL; RcInt, RcTime -> INT; RcBool ->
+// INT 0/1; RcUint -> INT, or RC_ERR_RANGE above INT64_MAX; RcFloat -> REAL;
+// RcText -> TEXT; RcBlob -> BLOB. Results come back as cells and are copied
+// into RcResult, so nothing MeoSQL owns outlives a call.
 //
-// Binding, RcValue -> meo_sql_bind_* (indexes are 1-based, columns 0-based):
-//   RcNull -> bind_null; RcInt, RcTime -> int64; RcBool -> int64 0/1;
-//   RcUint -> int64, or RC_ERR_RANGE above INT64_MAX; RcFloat -> double;
-//   RcText -> text; RcBlob -> blob. MeoSQL copies bound text and blob.
+// Status. MeoSQL returns -MEO_ERR_* (negative) on failure and >= 0 on success
+// (MEO_ROW 100 and MEO_DONE 101 included). The codes collapse into RC_* here
+// and only here:
+//   CONFLICT 13 (duplicate PK/UNIQUE)  -> RC_ERR_CONFLICT
+//   CONSTRAINT 14 (NOT NULL)           -> RC_ERR_CONSTRAINT
+//   TX 15                              -> RC_ERR_TX
+//   SCHEMA 16 (unknown table, column)  -> RC_ERR_USAGE
+//   TOOBIG 17                          -> RC_ERR_UNSUPPORTED
+//   MISMATCH 18                        -> RC_ERR_CAST
+//   NOMEM 2                            -> RC_ERR_NOMEM
+//   USAGE 10                           -> RC_ERR_USAGE
+//   UNSUPPORTED 11                     -> RC_ERR_UNSUPPORTED
+//   BUSY 7 (lock timeout)              -> RC_ERR_ADAPTER, retryable
+//   CORRUPT 4, NOT_A_DB 5, VERSION 6   -> RC_ERR_ADAPTER, and the connection
+//                                         is discarded, not reused
+//   IO, NOSPC, FULL, RANGE, READONLY   -> RC_ERR_ADAPTER
 //
-// The three bridge obligations that are design, not plumbing:
-//
-// 1. Materialise. step() until MEO_DONE inside exec, copy into RcResult, then
-//    finalize. Column text and blob pointers are valid only until the next
-//    step, reset or finalize, so every cell is copied before the next step,
-//    and no MeoStmt ever leaves this file.
-//
-// 2. Map status. MeoSQL returns -MEO_ERR_* (negative) on failure and >= 0 on
-//    success (MEO_ROW 100 and MEO_DONE 101 included). The codes collapse into
-//    RC_* here and only here:
-//      CONFLICT 13 (duplicate PK/UNIQUE)  -> RC_ERR_CONFLICT
-//      CONSTRAINT 14 (NOT NULL)           -> RC_ERR_CONSTRAINT
-//      TX 15                              -> RC_ERR_TX
-//      SQL 16 (bad SQL, unknown name)     -> RC_ERR_USAGE
-//      TOOBIG 17                          -> RC_ERR_UNSUPPORTED
-//      MISMATCH 18                        -> RC_ERR_CAST
-//      NOMEM 2                            -> RC_ERR_NOMEM
-//      USAGE 10                           -> RC_ERR_USAGE
-//      UNSUPPORTED 11 (JOIN in SQL v1)    -> RC_ERR_UNSUPPORTED
-//      BUSY 7 (lock timeout)              -> RC_ERR_ADAPTER, retryable
-//      CORRUPT 4, NOT_A_DB 5, VERSION 6   -> RC_ERR_ADAPTER, and the
-//                                            connection is discarded, not reused
-//      IO, NOSPC, FULL, RANGE, READONLY   -> RC_ERR_ADAPTER
-//
-// 3. Never encode. MeoSQL owns its record codec. The ORM passes typed RcValue
-//    arguments and reads typed columns; it must not build row bytes. That is
-//    the one place where an ORM normally duplicates the storage engine by
-//    accident.
-//
-// What MeoSQL's SQL v1 does not parse yet, though flux_orm emits it:
-// JOIN / LEFT JOIN (-> RC_ERR_UNSUPPORTED), planned for MeoSQL M3. The
-// rc_query_where_cmp operators parse since MeoSQL 351a1e8.
-// MeoSQL also has no nested transactions; core/session flattens nesting
-// before it reaches the adapter.
+// Not supported by MeoSQL yet: joins (RcStmt.n_joins > 0 -> RC_ERR_UNSUPPORTED)
+// and nested transactions (core/session flattens nesting first).
 
 import "std/mem";
 
@@ -105,6 +79,9 @@ fn rc_meosql_begin(ud: rawptr, mode: int32) -> int32 { return RC_ERR_UNSUPPORTED
 fn rc_meosql_commit(ud: rawptr) -> int32 { return RC_ERR_UNSUPPORTED; }
 fn rc_meosql_rollback(ud: rawptr) -> int32 { return RC_ERR_UNSUPPORTED; }
 fn rc_meosql_ping(ud: rawptr) -> int32 { return RC_ERR_UNSUPPORTED; }
+fn rc_meosql_query(ud: rawptr, st: RcStmt*, out: RcResult*) -> int32 {
+  return RC_ERR_UNSUPPORTED;
+}
 
 export fn rc_meosql_supported() -> bool { return false; }
 
@@ -129,6 +106,7 @@ export fn rc_meosql_adapter(path: string, flags: int32) -> RcAdapter* {
   a.commit = &rc_meosql_commit;
   a.rollback = &rc_meosql_rollback;
   a.ping = &rc_meosql_ping;
+  a.query = &rc_meosql_query;
   return a;
 }
 

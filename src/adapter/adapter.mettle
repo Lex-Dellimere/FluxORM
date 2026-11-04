@@ -22,6 +22,7 @@ import "std/mem";
 
 import "../core/status";
 import "../core/value";
+import "stmt";
 
 // Mettle has no async and no exceptions. Every call returns an RC_* code and
 // writes results through out-parameters.
@@ -49,6 +50,7 @@ export struct RcAdapter {
   commit: fn(rawptr) -> int32;
   rollback: fn(rawptr) -> int32;
   ping: fn(rawptr) -> int32;
+  query: fn(rawptr, RcStmt*, RcResult*) -> int32;     // typed stores; 0 = text only
 }
 
 // A vtable with no capabilities. Every wrapper above answers
@@ -71,6 +73,7 @@ export struct RcAdapter {
   a.commit = 0;
   a.rollback = 0;
   a.ping = 0;
+  a.query = 0;
   return a;
 }
 
@@ -255,4 +258,27 @@ export fn rc_adapter_ping(a: RcAdapter*) -> int32 {
   if (a == 0) { return RC_ERR_USAGE; }
   if (a.ping == 0) { return RC_ERR_UNSUPPORTED; }
   return a.ping(a.ud);
+}
+
+// Runs a statement as data. The adapter must have a `query` slot.
+export fn rc_adapter_query(a: RcAdapter*, st: RcStmt*, out: RcResult*) -> int32 {
+  if (a == 0 || st == 0 || out == 0) { return RC_ERR_USAGE; }
+  rc_result_init(out);
+  if (a.query == 0) { return RC_ERR_UNSUPPORTED; }
+  if (st->n_args < 0) { return RC_ERR_USAGE; }
+  if (st->n_args > 0 && st->args == 0) { return RC_ERR_USAGE; }
+  return a.query(a.ud, st, out);
+}
+
+// One statement, whichever way the adapter takes it: the RcStmt when it has a
+// `query` slot, the SQL text otherwise. `args` is the argv of both.
+export fn rc_adapter_run(a: RcAdapter*, sql: string, st: RcStmt*, args: RcValue*,
+                         n_args: int32, out: RcResult*) -> int32 {
+  if (a == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (a.query != 0 && st != 0) {
+    st->args = args;
+    st->n_args = n_args;
+    return rc_adapter_query(a, st, out);
+  }
+  return rc_adapter_exec(a, sql, args, n_args, out);
 }

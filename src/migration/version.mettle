@@ -23,15 +23,22 @@ import "std/mem";
 
 import "../core/status";
 import "../core/value";
+import "../core/meta";
 import "../core/buf";
 import "../adapter/adapter";
+import "../adapter/stmt";
+import "ddl";
 
 export const RC_MIG_LEDGER: string = "_flux_orm_migrations";
 
+// A migration is SQL text for text stores, or an `up` callback for stores
+// without SQL (MeoSQL): `up` runs inside the migration's transaction, usually
+// rc_migration_create for each table. When `up` is set, `up_sql` may be empty.
 export struct RcMigration {
   version: int64;
   name: string;
   up_sql: string;
+  up: fn(RcAdapter*) -> int32;
 }
 
 export struct RcMigrationSet {
@@ -97,7 +104,7 @@ export fn rc_migration_check(s: RcMigrationSet) -> int32 {
     var m: RcMigration = s.items[i];
     if (m.version <= 0) { return RC_ERR_USAGE; }
     if (m.name.length == (uint64)0) { return RC_ERR_USAGE; }
-    if (m.up_sql.length == (uint64)0) { return RC_ERR_USAGE; }
+    if (m.up_sql.length == (uint64)0 && m.up == 0) { return RC_ERR_USAGE; }
     if (i > 0) {
       if (m.version <= s.items[i - 1].version) { return RC_ERR_USAGE; }
     }
@@ -170,6 +177,56 @@ export fn rc_migration_ledger_insert(b: RcBuf*) -> int32 {
   return rc_buf_put(b, ") VALUES (?, ?, ?)");
 }
 
+// The ledger statements as data, for adapters with `query`. `*out` is
+// replaced; free it with rc_stmt_free.
+export fn rc_migration_ledger_ddl_stmt(out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_CREATE, RC_MIG_LEDGER);
+  out->if_not_exists = true;
+  var rc: int32 = rc_stmt_col(out, "version", RC_T_I64, RC_F_PK | RC_F_NOT_NULL);
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "name", RC_T_TEXT, RC_F_NOT_NULL); }
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "applied_at", RC_T_TIME, RC_F_NOT_NULL); }
+  return rc;
+}
+
+export fn rc_migration_ledger_select_stmt(out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_SELECT, RC_MIG_LEDGER);
+  var rc: int32 = rc_stmt_col(out, "version", RC_T_I64, 0);
+  if (rc == RC_OK) { rc = rc_stmt_order(out, "version", false); }
+  return rc;
+}
+
+export fn rc_migration_ledger_insert_stmt(out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_INSERT, RC_MIG_LEDGER);
+  out->n_rows = 1;
+  var rc: int32 = rc_stmt_col(out, "version", RC_T_I64, 0);
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "name", RC_T_TEXT, 0); }
+  if (rc == RC_OK) { rc = rc_stmt_col(out, "applied_at", RC_T_TIME, 0); }
+  return rc;
+}
+
+// Creates m's table if it does not exist, through whichever path the adapter
+// takes. This is what an `up` callback calls.
+export fn rc_migration_create(a: RcAdapter*, m: RcMeta) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  var buf: RcBuf = rc_buf_new(256);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+  var rc: int32 = rc_migration_create_table(m, &buf);
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt;
+  rc = rc_migration_create_stmt(m, &st);
+  defer rc_stmt_free(&st);
+  if (rc != RC_OK) { return rc; }
+  var res: RcResult;
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, (RcValue*)0, 0, &res);
+  if (rc != RC_OK) { return rc; }
+  rc_result_free(&res);
+  return RC_OK;
+}
+
 // --- internals ---------------------------------------------------------------
 
 fn rc_mig_index_of(s: RcMigrationSet, version: int64) -> int32 {
@@ -198,7 +255,12 @@ fn rc_mig_apply(a: RcAdapter*, m: RcMigration, at: int64, buf: RcBuf*) -> int32 
   if (rc != RC_OK) { return rc; }
 
   var res: RcResult;
-  rc = rc_adapter_exec(a, m.up_sql, (RcValue*)0, 0, &res);
+  if (m.up != 0) {
+    rc_result_init(&res);
+    rc = m.up(a);
+  } else {
+    rc = rc_adapter_exec(a, m.up_sql, (RcValue*)0, 0, &res);
+  }
   if (rc != RC_OK) {
     rc_result_free(&res);
     rc_adapter_rollback(a);
@@ -216,7 +278,14 @@ fn rc_mig_apply(a: RcAdapter*, m: RcMigration, at: int64, buf: RcBuf*) -> int32 
   args[0] = RcInt(m.version);
   args[1] = RcText(m.name);
   args[2] = RcTime(at);
-  rc = rc_adapter_exec(a, rc_buf_text(buf), &args[0], 3, &res);
+  var st: RcStmt;
+  rc = rc_migration_ledger_insert_stmt(&st);
+  defer rc_stmt_free(&st);
+  if (rc != RC_OK) {
+    rc_adapter_rollback(a);
+    return rc;
+  }
+  rc = rc_adapter_run(a, rc_buf_text(buf), &st, &args[0], 3, &res);
   if (rc != RC_OK) {
     rc_result_free(&res);
     rc_adapter_rollback(a);
@@ -273,7 +342,11 @@ export fn rc_migration_run(a: RcAdapter*, s: RcMigrationSet*,
   //    does) would reject the begin that follows.
   rc = rc_migration_ledger_ddl(&buf);
   if (rc != RC_OK) { out->code = rc; return rc; }
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), (RcValue*)0, 0, &res);
+  var dst: RcStmt;
+  rc = rc_migration_ledger_ddl_stmt(&dst);
+  defer rc_stmt_free(&dst);
+  if (rc != RC_OK) { out->code = rc; return rc; }
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &dst, (RcValue*)0, 0, &res);
   if (rc != RC_OK) { out->code = rc; return rc; }
   rc_result_free(&res);
 
@@ -281,7 +354,11 @@ export fn rc_migration_run(a: RcAdapter*, s: RcMigrationSet*,
   rc_buf_clear(&buf);
   rc = rc_migration_ledger_select(&buf);
   if (rc != RC_OK) { out->code = rc; return rc; }
-  rc = rc_adapter_exec(a, rc_buf_text(&buf), (RcValue*)0, 0, &res);
+  var sst: RcStmt;
+  rc = rc_migration_ledger_select_stmt(&sst);
+  defer rc_stmt_free(&sst);
+  if (rc != RC_OK) { out->code = rc; return rc; }
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &sst, (RcValue*)0, 0, &res);
   if (rc != RC_OK) { out->code = rc; return rc; }
   // A SELECT with no rows reports no columns; only a non-empty result has to
   // be exactly the one column this reader knows how to read.

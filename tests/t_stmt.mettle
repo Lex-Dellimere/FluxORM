@@ -1,0 +1,259 @@
+// tests/t_stmt.mettle — the RcStmt each statement shape produces, and the
+// typed path end to end: an adapter with a `query` slot and no `exec` gets
+// every statement as data, never as text.
+//
+// User fields: id 0, email 1, name 2, age 3, active 4, score 5, created_at 6,
+// role 7.
+
+import "std/mem";
+
+import "../src/flux_orm";
+import "../src/adapter/mem";
+import "models";
+import "harness";
+
+// --- a typed fake: mem for transactions, a recorder for statements ----------
+
+const FAKE_MAX: int32 = 16;
+var FAKE_OPS: int32[16];
+var FAKE_N: int32 = 0;
+var FAKE_LAST: RcStmt;          // shallow copy; arrays point into the caller's stmt
+var FAKE_CELLS: RcValue[8];     // the row a SELECT answers with
+var FAKE_ROWS: RcValue* = 0;
+var FAKE_ROW_N: int32 = 0;
+var FAKE_COL_N: int32 = 0;
+var FAKE_LAST_ID: int64 = 0;
+
+fn fake_query(ud: rawptr, st: RcStmt*, out: RcResult*) -> int32 {
+  if (FAKE_N < FAKE_MAX) { FAKE_OPS[FAKE_N] = st->op; }
+  FAKE_N = FAKE_N + 1;
+  FAKE_LAST = *st;
+  if (st->op == RC_OP_SELECT && FAKE_ROWS != 0) {
+    var rc: int32 = rc_result_copy(out, FAKE_ROWS, FAKE_ROW_N, FAKE_COL_N, 0, 0);
+    FAKE_ROWS = 0;
+    return rc;
+  }
+  out->affected = 1;
+  out->last_id = FAKE_LAST_ID;
+  return RC_OK;
+}
+
+fn fake_reset() {
+  FAKE_N = 0;
+  FAKE_ROWS = 0;
+  FAKE_LAST_ID = 0;
+}
+
+// The mem adapter with its text path removed and the recorder as `query`.
+fn typed(mem: RcAdapter*) -> RcAdapter {
+  var a: RcAdapter = *mem;
+  a.exec = 0;
+  a.query = &fake_query;
+  fake_reset();
+  return a;
+}
+
+fn new_mem(out: RcAdapter**) -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return RC_ERR_NOMEM; }
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
+    rc_mem_free(a);
+    return RC_ERR_ADAPTER;
+  }
+  *out = a;
+  return RC_OK;
+}
+
+fn term_is(st: RcStmt*, i: int32, col: string, op: int32, arg0: int32, n: int32) -> bool {
+  if (i >= st->n_terms) { return false; }
+  var t: RcStmtTerm = st->terms[i];
+  return t.col == col && t.op == op && t.arg0 == arg0 && t.n_args == n;
+}
+
+// --- 1. SELECT: columns, terms with their argv positions, order, paging -------
+
+fn check_select() -> int32 {
+  var q: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&q);
+  var ages: RcValue[2];
+  ages[0] = RcInt(30);
+  ages[1] = RcInt(31);
+  if (rc_query_where_cmp(&q, 1, RC_CMP_EQ, RcText("a@b.c")) != RC_OK) { return 1; }
+  if (rc_query_where_in(&q, 3, &ages[0], 2) != RC_OK) { return 2; }
+  if (rc_query_where_null(&q, 5) != RC_OK) { return 3; }
+  if (rc_query_where_cmp(&q, 7, RC_CMP_GE, RcInt(1)) != RC_OK) { return 4; }
+  if (rc_query_where_cmp(&q, 4, RC_CMP_NE, RcNull) != RC_OK) { return 5; }
+  if (rc_query_order_by(&q, 2, false) != RC_OK) { return 6; }
+  if (rc_query_limit(&q, 10) != RC_OK) { return 7; }
+  if (rc_query_offset(&q, 20) != RC_OK) { return 8; }
+  // A refused term adds nothing.
+  if (rc_query_where_cmp(&q, 3, RC_CMP_LT, RcNull) != RC_ERR_USAGE) { return 9; }
+
+  var st: RcStmt* = rc_query_stmt(&q);
+  if (st->op != RC_OP_SELECT || st->table != "users") { return 10; }
+  if (st->n_cols != 8 || st->cols[1].name != "email" || st->cols[1].ty != RC_T_TEXT) { return 11; }
+  if (st->n_terms != 5) { return 12; }
+  if (!term_is(st, 0, "email", RC_W_EQ, 0, 1)) { return 13; }
+  if (!term_is(st, 1, "age", RC_W_IN, 1, 2)) { return 14; }
+  if (!term_is(st, 2, "score", RC_W_NULL, 3, 0)) { return 15; }
+  if (!term_is(st, 3, "role", RC_W_GE, 3, 1)) { return 16; }
+  if (!term_is(st, 4, "active", RC_W_NOT_NULL, 4, 0)) { return 17; }
+  if (st->n_order != 1 || st->order[0].col != "name" || !st->order[0].desc) { return 18; }
+  if (st->limit != 10 || st->offset != 20) { return 19; }
+  // The argv is the text's argv.
+  if (st->n_args != 4 || st->args != rc_query_args(&q)) { return 20; }
+  if (!rc_value_same(st->args[2], RcInt(31))) { return 21; }
+
+  // A join is counted, so a store without joins can refuse it.
+  var jq: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&jq);
+  if (rc_query_join(&jq, post_meta(), 0, 1, RC_JOIN_INNER) != RC_OK) { return 22; }
+  if (rc_query_stmt(&jq)->n_joins != 1) { return 23; }
+  return 0;
+}
+
+// --- 2. INSERT, UPDATE, update_all, DELETE, COUNT ----------------------------
+
+fn check_write_shapes() -> int32 {
+  var ins: RcQuery = rc_query_insert_batch(user_meta(), 2);
+  defer rc_query_free(&ins);
+  var st: RcStmt* = rc_query_stmt(&ins);
+  if (st->op != RC_OP_INSERT || st->n_rows != 2 || st->n_cols != 7) { return 1; }
+  if (st->cols[0].name != "email") { return 2; }  // the AUTO key is left out
+
+  var up: RcQuery = rc_query_update(note_meta(), rc_nulls_set((uint64)0, 1));
+  defer rc_query_free(&up);
+  if (rc_query_push_arg(&up, RcText("x")) != RC_OK) { return 3; }
+  if (rc_query_push_arg(&up, RcInt(4)) != RC_OK) { return 4; }
+  if (rc_query_where_eq(&up, 0, RcInt(5)) != RC_OK) { return 5; }
+  if (rc_query_where_eq(&up, 2, RcInt(3)) != RC_OK) { return 6; }
+  st = rc_query_stmt(&up);
+  if (st->op != RC_OP_UPDATE || st->n_cols != 2) { return 7; }
+  if (st->cols[0].name != "text" || st->cols[1].name != "version") { return 8; }
+  if (!term_is(st, 0, "id", RC_W_EQ, 2, 1) || !term_is(st, 1, "version", RC_W_EQ, 3, 1)) { return 9; }
+
+  var vals: RcValue[8];
+  vals[4] = RcBool(false);
+  var ua: RcQuery = rc_query_update_all(user_meta(), rc_nulls_set((uint64)0, 4), &vals[0]);
+  defer rc_query_free(&ua);
+  if (rc_query_where_cmp(&ua, 6, RC_CMP_LT, RcTime(5)) != RC_OK) { return 10; }
+  st = rc_query_stmt(&ua);
+  if (st->op != RC_OP_UPDATE || st->n_cols != 1 || !term_is(st, 0, "created_at", RC_W_LT, 1, 1)) { return 11; }
+
+  var del: RcQuery = rc_query_delete(user_meta());
+  defer rc_query_free(&del);
+  if (rc_query_where_eq(&del, 4, RcBool(false)) != RC_OK) { return 12; }
+  st = rc_query_stmt(&del);
+  if (st->op != RC_OP_DELETE || st->n_cols != 0 || !term_is(st, 0, "active", RC_W_EQ, 0, 1)) { return 13; }
+
+  var cnt: RcQuery = rc_query_count(user_meta());
+  defer rc_query_free(&cnt);
+  if (rc_query_stmt(&cnt)->op != RC_OP_COUNT) { return 14; }
+  return 0;
+}
+
+// --- 3. the repo through a typed adapter -------------------------------------
+
+fn check_typed_repo() -> int32 {
+  var mem: RcAdapter* = 0;
+  if (new_mem(&mem) != RC_OK) { return 1; }
+  defer rc_mem_free(mem);
+  var a: RcAdapter = typed(mem);
+  var s: RcSession = rc_session_new(&a);
+  defer rc_session_free(&s);
+  var m: RcMeta = user_meta();
+
+  FAKE_CELLS[0] = RcInt(1);
+  FAKE_CELLS[1] = RcText("ada@example.com");
+  FAKE_CELLS[2] = RcText("Ada");
+  FAKE_CELLS[3] = RcInt(36);
+  FAKE_CELLS[4] = RcBool(true);
+  FAKE_CELLS[5] = RcNull;
+  FAKE_CELLS[6] = RcTime(7);
+  FAKE_CELLS[7] = RcInt(1);
+  FAKE_ROWS = &FAKE_CELLS[0];
+  FAKE_ROW_N = 1;
+  FAKE_COL_N = 8;
+  var u: User;
+  var e: RcEntity;
+  if (rc_repo_get(&s, m, RcInt(1), (rawptr)&u, &e) != RC_OK) { return 2; }
+  if (u.name != "Ada") { return 3; }
+  if (FAKE_LAST.op != RC_OP_SELECT || FAKE_LAST.limit != 1) { return 4; }
+  if (FAKE_LAST.n_terms != 1 || FAKE_LAST.n_args != 1) { return 5; }
+  if (rc_mem_call_count(mem) != 0) { return 6; }  // no text was sent
+
+  var p: Post;
+  memset((rawptr)&p, 0, (int64)sizeof(Post));
+  var pe: RcEntity = rc_entity_new(post_meta(), (rawptr)&p);
+  if (rc_entity_set(&pe, 1, RcInt(1)) != RC_OK) { return 7; }
+  if (rc_entity_set(&pe, 2, RcText("Hi")) != RC_OK) { return 8; }
+  FAKE_LAST_ID = 77;
+  var none: RcChangeset* = 0;
+  if (rc_repo_insert(&s, none, &pe) != RC_OK) { return 9; }
+  if (p.id != 77) { return 10; }
+  if (FAKE_LAST.op != RC_OP_INSERT || FAKE_LAST.n_rows != 1 || FAKE_LAST.n_cols != 4) { return 11; }
+
+  if (rc_repo_delete(&s, &e) != RC_OK) { return 12; }
+  if (FAKE_LAST.op != RC_OP_DELETE || FAKE_LAST.n_terms != 1) { return 13; }
+  if (FAKE_N != 3) { return 14; }
+  return 0;
+}
+
+// --- 4. migrations through a typed adapter ----------------------------------
+
+fn up_users(a: RcAdapter*) -> int32 { return rc_migration_create(a, user_meta()); }
+
+fn check_typed_migrations() -> int32 {
+  var mem: RcAdapter* = 0;
+  if (new_mem(&mem) != RC_OK) { return 1; }
+  defer rc_mem_free(mem);
+  var a: RcAdapter = typed(mem);
+  rc_migration_set_clock(TEST_NOW);
+
+  var items: RcMigration[1];
+  items[0] = { version: 1, name: "create users", up_sql: "" };
+  items[0].up = &up_users;
+  var set: RcMigrationSet = rc_migration_set(&items[0], 1);
+  var rep: RcMigrationReport;
+  if (rc_migration_run(&a, &set, &rep) != RC_OK) { return 2; }
+  if (rep.applied != 1) { return 3; }
+  // ledger CREATE, ledger SELECT, the users CREATE, the ledger INSERT.
+  if (FAKE_N != 4) { return 4; }
+  if (FAKE_OPS[0] != RC_OP_CREATE || FAKE_OPS[1] != RC_OP_SELECT) { return 5; }
+  if (FAKE_OPS[2] != RC_OP_CREATE || FAKE_OPS[3] != RC_OP_INSERT) { return 6; }
+  if (rc_mem_commits(mem) != 1) { return 7; }
+
+  // The users table as data.
+  var st: RcStmt;
+  if (rc_migration_create_stmt(user_meta(), &st) != RC_OK) { return 8; }
+  defer rc_stmt_free(&st);
+  if (st.op != RC_OP_CREATE || !st.if_not_exists || st.n_cols != 8) { return 9; }
+  if ((st.cols[0].flags & RC_F_PK) == 0 || (st.cols[1].flags & RC_F_UNIQUE) == 0) { return 10; }
+  if ((st.cols[3].flags & RC_F_NOT_NULL) != 0) { return 11; }
+
+  // A text-only migration on a store without text is refused and rolled back.
+  fake_reset();
+  var text: RcMigration[1];
+  text[0] = { version: 2, name: "text", up_sql: "CREATE TABLE x (y INTEGER)" };
+  var tset: RcMigrationSet = rc_migration_set(&text[0], 1);
+  if (rc_migration_run(&a, &tset, &rep) != RC_ERR_UNSUPPORTED) { return 12; }
+  if (rc_mem_rollbacks(mem) != 1) { return 13; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("stmt: select shape", check_select())) { failures = failures + 1; }
+  if (!rc_report("stmt: write shapes", check_write_shapes())) { failures = failures + 1; }
+  if (!rc_report("stmt: the repo through a typed adapter", check_typed_repo())) { failures = failures + 1; }
+  if (!rc_report("stmt: migrations through a typed adapter", check_typed_migrations())) { failures = failures + 1; }
+  return rc_summary(failures, 4);
+}
+
+@test fn t_stmt() -> int32 {
+  if (check_select() != 0) { return 1; }
+  if (check_write_shapes() != 0) { return 2; }
+  if (check_typed_repo() != 0) { return 3; }
+  if (check_typed_migrations() != 0) { return 4; }
+  return 0;
+}

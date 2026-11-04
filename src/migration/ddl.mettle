@@ -17,6 +17,7 @@ import "../core/status";
 import "../core/value";
 import "../core/meta";
 import "../core/buf";
+import "../adapter/stmt";
 
 // Wire type -> column affinity. RC_T_UNSUPPORTED, and any wire type a later
 // phase adds without teaching this table about it, returns the empty string;
@@ -102,4 +103,23 @@ export fn rc_migration_create_table(m: RcMeta, b: RcBuf*) -> int32 {
     i = i + 1;
   }
   return rc_buf_put(b, ")");
+}
+
+// The same CREATE TABLE IF NOT EXISTS as data, for adapters with `query`.
+// `*out` is replaced; free it with rc_stmt_free.
+export fn rc_migration_create_stmt(m: RcMeta, out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_CREATE, m.table);
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+  out->if_not_exists = true;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var f: RcField = m.fields[i];
+    if (rc_migration_affinity(f.ty).length == (uint64)0) { return RC_ERR_UNSUPPORTED; }
+    rc = rc_stmt_col(out, f.column, f.ty, f.flags & (RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE));
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
 }
