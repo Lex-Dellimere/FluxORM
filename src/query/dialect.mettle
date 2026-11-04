@@ -18,6 +18,8 @@
 import "../core/status";
 import "../core/buf";
 
+// How a store spells identifiers, placeholders and LIMIT. Get one from
+// rc_dialect_default; the strings are borrowed (static literals there).
 export struct RcDialect {
   name: string;        // "meosql"
   quote: string;       // "\""
@@ -25,6 +27,9 @@ export struct RcDialect {
   has_limit: bool;     // true — the store understands literal LIMIT n
 }
 
+// The one shipped dialect, "meosql": double-quoted identifiers, `?`
+// placeholders, literal LIMIT. Every query starts with it.
+// Returns the dialect by value; it owns nothing and needs no free.
 export fn rc_dialect_default() -> RcDialect {
   var d: RcDialect;
   d.name = "meosql";
@@ -34,6 +39,9 @@ export fn rc_dialect_default() -> RcDialect {
   return d;
 }
 
+// The dialect's name, e.g. "meosql".
+//   d   the dialect
+// Returns d.name, a borrowed view with d's lifetime.
 export fn rc_dialect_name(d: RcDialect) -> string { return d.name; }
 
 // The opening delimiter byte. A dialect with an empty `quote` falls back to the
@@ -45,6 +53,15 @@ fn rc_dialect_quote_char(d: RcDialect) -> uint8 {
   return d.quote.chars[0];
 }
 
+// Appends `name` to b as a quoted identifier: the quote byte, the name with
+// each embedded quote byte doubled, the quote byte. With the default dialect
+// the bytes equal rc_buf_ident's. An empty name gives `""`.
+//   d     the dialect; only the first byte of d.quote is used, '"' when empty
+//   b     the buffer to append to; borrowed
+//   name  the identifier; borrowed, copied into b
+// Returns RC_OK. RC_ERR_USAGE when b is 0 or name has a length but no bytes.
+// RC_ERR_NOMEM when b cannot grow; b then holds a partial identifier, so the
+// caller rolls back its length (the builder does).
 export fn rc_dialect_ident(d: RcDialect, b: RcBuf*, name: string) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   if (name.length > (uint64)0 && name.chars == 0) { return RC_ERR_USAGE; }
@@ -66,6 +83,11 @@ export fn rc_dialect_ident(d: RcDialect, b: RcBuf*, name: string) -> int32 {
   return rc_buf_putc(b, q);
 }
 
+// Appends the dialect's placeholder (`?` for meosql) to b.
+//   d   the dialect
+//   b   the buffer to append to; borrowed
+// Returns RC_OK. RC_ERR_USAGE when b is 0 or d.placeholder is empty.
+// RC_ERR_NOMEM when b cannot grow.
 export fn rc_dialect_placeholder(d: RcDialect, b: RcBuf*) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   if (d.placeholder.length == (uint64)0) { return RC_ERR_USAGE; }

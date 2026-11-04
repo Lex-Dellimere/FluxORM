@@ -248,7 +248,7 @@ fn check_startup() -> int32 {
   text_meta.fields = &text_fields[0];
   text_meta.n_fields = 2;
   text_meta.pk = -1;
-  if (rc_relation_check(&ok3, um, pm, &text_meta) != RC_ERR_USAGE) { return 23; }
+  if (rc_relation_check(&ok3, um, pm, &text_meta) != RC_ERR_CAST) { return 23; }
 
   // A mapping table declared on a two-table relation: the author believes the
   // through table is used, the loader would ignore it.

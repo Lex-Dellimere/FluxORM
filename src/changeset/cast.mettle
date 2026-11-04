@@ -1,28 +1,24 @@
-// flux_orm/changeset/cast.mettle — user text -> RcValue, and the one place that
-// is allowed to coerce.
+// flux_orm/changeset/cast.mettle — user text to RcValue, the one place that
+// may coerce.
 //
-// Casting is split three ways: the adapter produces the canonical arm for a
-// column, core/meta narrows with a range check and refuses a mismatched arm,
-// and this file parses the text a form or a CLI hands us. Nothing else may turn "42" into
-// 42, and core/meta still does the final range check when the value is written
-// into a model.
+// The adapter produces the canonical arm for a column, core/meta narrows with
+// a range check and refuses a mismatched arm, and this file parses the text a
+// form or a CLI hands in. Nothing else turns "42" into 42.
 //
-// Everything here is deliberately strict:
+// Parsing is strict:
 //
 //   - no trimming: " 42" and "42 " are RC_ERR_CAST, not 42;
 //   - no float -> int: "4.5" into RC_T_I64 is RC_ERR_CAST;
 //   - no exponent syntax: "1e5" is RC_ERR_CAST (write "100000.0");
 //   - booleans are exactly "1", "0", "true", "false" (lowercase);
-//   - an empty string is "absent" (RcNull) and is therefore only accepted on
-//     a nullable column: on RC_F_NOT_NULL it is RC_ERR_CONSTRAINT;
-//   - a source longer than RC_CS_MAX_TEXT is RC_ERR_RANGE rather than a
-//     multi-megabyte parse.
+//   - a time is integer unix microseconds, UTC;
+//   - an empty string is "absent" (RcNull), so it is only accepted on a
+//     nullable column: on RC_F_NOT_NULL it is RC_ERR_CONSTRAINT;
+//   - a source longer than RC_CS_MAX_TEXT is RC_ERR_RANGE.
 //
-// Ownership: RcText / RcBlob are borrowed views (see core/value). RcText(s)
-// below keeps the caller's bytes; this module never clones and never frees.
-//
-// Every refusal carries a *static* reason string in `why` (optional), so the
-// changeset can report "not a decimal integer" without owning a buffer.
+// Ownership: RcText and RcBlob are borrowed views (see core/value). A text
+// result keeps the caller's bytes; this module never clones and never frees.
+// Every reason string it hands back is static.
 
 import "std/conv";
 
@@ -30,9 +26,8 @@ import "../core/status";
 import "../core/value";
 import "../core/meta";
 
-// Policy limit for one text input: 1 MiB. Above it the changeset refuses with
-// RC_ERR_RANGE. This is a policy constant, not a status code — the error codes
-// stay in core/status.
+// Longest text rc_cast_text will parse, in bytes (1 MiB). Longer text is
+// RC_ERR_RANGE.
 export const RC_CS_MAX_TEXT: int64 = 1048576;
 
 // The field's coercion family. RC_T_I64 and RC_T_U64 stay apart (a negative
@@ -182,13 +177,16 @@ fn rc_cast_parse_bool(s: string, out: bool*, why: string*) -> int32 {
 
 // --- the seam ----------------------------------------------------------------
 
-// May a caller hand this RcValue arm straight to rc_changeset_put for this
-// field? This is *not* a cast: it answers "does the arm belong to the field's
-// declared wire type", so RcText into RC_T_I64 and RcFloat into RC_T_I64 are
-// refused and the caller is told to go through rc_changeset_put_text instead.
-// RcInt <-> RcUint is allowed because both are the same INTEGER wire family and
-// core/meta range-checks the narrowing; RcNull is always allowed (nullability
-// is a RC_F_NOT_NULL question, answered by the changeset, not by the arm).
+// Checks that a value's arm belongs to a field's declared type, so it may go
+// straight into rc_changeset_put. Not a cast: RcText or RcFloat into an
+// RC_T_I64 field is refused (parse text with rc_changeset_cast). RcInt and
+// RcUint are accepted for each other, since core/meta range-checks the
+// narrowing later. RcNull is always accepted; NOT NULL is the changeset's
+// check.
+//   f   the field (from rc_meta_field)
+//   v   the value; only its arm is looked at
+// Returns RC_OK when it fits; RC_ERR_CAST when the arm is wrong;
+// RC_ERR_UNSUPPORTED when the field's type cannot be written.
 export fn rc_cast_fits(f: RcField, v: RcValue) -> int32 {
   var fam: int32 = rc_cast_family(f);
   if (fam == RC_T_UNSUPPORTED) { return RC_ERR_UNSUPPORTED; }
@@ -200,13 +198,23 @@ export fn rc_cast_fits(f: RcField, v: RcValue) -> int32 {
   return RC_ERR_CAST;
 }
 
-// The single parsing entry point: text -> RcValue for the field's declared
-// wire type. On success *out holds a borrowed value (RcText keeps `s`) and
-// `why` is untouched. On failure the code is RC_ERR_CAST (the text is not that
-// kind of number/boolean), RC_ERR_RANGE (it is, but it does not fit),
-// RC_ERR_CONSTRAINT (empty text on a NOT NULL column) or RC_ERR_UNSUPPORTED
-// (the column has no castable wire type), and `why` (when non-zero) holds a
-// static reason.
+// Parses text into the RcValue for a field's declared type, by the rules in
+// the header. rc_changeset_cast calls this and records the result.
+//   f    the field (from rc_meta_field)
+//   s    the text; borrowed. An RC_T_TEXT result is RcText(s), a view of it
+//   out  receives the value (RcNull on failure); must not be 0
+//   why  optional (may be 0); on failure receives a static reason such as
+//        "not a decimal integer", and is untouched on success
+// Returns RC_OK, or:
+//   RC_ERR_USAGE        out is 0
+//   RC_ERR_CAST         the text is not that kind of value, or the field is
+//                       a blob (blobs have no text form)
+//   RC_ERR_RANGE        the right kind, but it does not fit: outside int64
+//                       (also for RC_T_U64), negative for RC_T_U64, more
+//                       than 18 digits for RC_T_F64; or s is over
+//                       RC_CS_MAX_TEXT bytes
+//   RC_ERR_CONSTRAINT   empty text on an RC_F_NOT_NULL field
+//   RC_ERR_UNSUPPORTED  the field's type has no castable form
 export fn rc_cast_text(f: RcField, s: string, out: RcValue*, why: string*) -> int32 {
   if (out == 0) { return RC_ERR_USAGE; }
   *out = RcNull;

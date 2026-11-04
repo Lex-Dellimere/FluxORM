@@ -4,17 +4,22 @@
 // gives every field's name, offset, size and type kind while compiling, and
 // leaves no descriptor table behind. So the ORM does not hand-write a field
 // list and does not memcpy a model. Each model module runs one `comptime for`
-// over its own struct (see tests/models.mettle for the shape) and gets an
-// RcField[] where the offsets came from the compiler.
+// over its own struct (core/schema shows the shape) and gets an RcField[]
+// where the offsets came from the compiler.
 //
 // Access is therefore a typed load/store at a compiler-reported offset, chosen
-// by the field's *kind*. That is safe: we never assume a layout, we ask for it.
+// by the field's *kind*: we never assume a layout, we ask for it.
 
 import "std/mem";
 
 import "status";
 import "value";
 
+// Field flags, OR-ed into RcField.flags (usually through RcColumn.flags).
+// RC_F_PK marks the primary key (at most one, and it must be NOT NULL);
+// RC_F_NOT_NULL refuses NULL; RC_F_UNIQUE asks the store for a unique column.
+// RC_F_TIMESTAMP is a marker only: nothing reads it, so a time column also
+// needs `ty: RC_T_TIME` in its RcColumn.
 export const RC_F_PK: int32 = 1;
 export const RC_F_AUTO: int32 = 2;      // integer primary key assigned by the store
 export const RC_F_NOT_NULL: int32 = 4;
@@ -34,6 +39,7 @@ export const RC_F_UPDATED: int32 = 256;
 
 export const RC_MAX_FIELDS: int32 = 64;  // one uint64 null bitmap
 
+// One field of a model, filled by rc_schema_field and rc_meta_apply.
 export struct RcField {
   name: string;   // Mettle field name
   column: string; // database column name (defaults to name)
@@ -44,11 +50,16 @@ export struct RcField {
   flags: int32;   // RC_F_*
 }
 
+// A model's metadata. Copied by value; `fields` is borrowed from the schema
+// that built it (core/schema) and must outlive every copy.
 export struct RcMeta {
+  // table name in the store
   table: string;
   name: string;      // model name, for diagnostics
   size: int32;       // sizeof(Model)
+  // the field array, in struct order; borrowed
   fields: RcField*;
+  // number of entries in `fields`
   n_fields: int32;
   pk: int32;         // index of the primary key field, -1 if none
 }
@@ -56,9 +67,13 @@ export struct RcMeta {
 // A hand-written override applied after generation. `ty` of 0 keeps the
 // generated wire type; an empty column keeps the field name.
 export struct RcColumn {
+  // field index to change (0-based, RcMeta order)
   index: int32;
+  // new column name; empty keeps the current one
   column: string;
+  // new wire type RC_T_*; RC_T_NULL (0) keeps the current one
   ty: int32;
+  // RC_F_* flags to add; existing flags are never cleared
   flags: int32;
 }
 
@@ -66,6 +81,11 @@ export struct RcColumn {
 // The single place where the compiler's Kind enum is translated. Everything
 // else stores RC_T_* and never looks at Kind again.
 
+// The default wire type for a compiler type kind.
+//   k   f.type.kind from `typeof(T).fields`
+// Returns RC_T_BOOL, RC_T_I64 (signed ints, uint8..uint32, enums), RC_T_U64,
+// RC_T_F64 or RC_T_TEXT; RC_T_UNSUPPORTED for any other kind, which
+// rc_meta_check then refuses. Never returns RC_T_TIME: that needs an override.
 export fn rc_kind_type(k: Kind) -> int32 {
   if (k == Kind.Bool) { return RC_T_BOOL; }
   if (k == Kind.Int8 || k == Kind.Int16 || k == Kind.Int32 || k == Kind.Int64) {
@@ -83,6 +103,8 @@ export fn rc_kind_type(k: Kind) -> int32 {
 // Mettle has no null for a scalar, so nullability lives beside the struct as a
 // bit per field. The struct holds a zero; the bit is the truth.
 
+// True when bit `i` of `mask` is set (field i is NULL). False for an `i`
+// outside 0..63.
 export fn rc_nulls_has(mask: uint64, i: int32) -> bool {
   if (i < 0 || i >= RC_MAX_FIELDS) { return false; }
   var bit: uint64 = (uint64)1 << (uint64)i;
@@ -90,11 +112,15 @@ export fn rc_nulls_has(mask: uint64, i: int32) -> bool {
   return false;
 }
 
+// Returns `mask` with bit `i` set (field i NULL). An `i` outside 0..63 returns
+// `mask` unchanged.
 export fn rc_nulls_set(mask: uint64, i: int32) -> uint64 {
   if (i < 0 || i >= RC_MAX_FIELDS) { return mask; }
   return mask | ((uint64)1 << (uint64)i);
 }
 
+// Returns `mask` with bit `i` cleared (field i not NULL). An `i` outside 0..63
+// returns `mask` unchanged.
 export fn rc_nulls_clear(mask: uint64, i: int32) -> uint64 {
   if (i < 0 || i >= RC_MAX_FIELDS) { return mask; }
   return mask & ~((uint64)1 << (uint64)i);
@@ -102,6 +128,11 @@ export fn rc_nulls_clear(mask: uint64, i: int32) -> uint64 {
 
 // --- lookup ------------------------------------------------------------------
 
+// A copy of field `i` (0-based, RcMeta order).
+//   m   the metadata
+//   i   field index
+// Returns the field. An out-of-range `i` returns a blank field: empty name and
+// column, Kind.Void, ty RC_T_UNSUPPORTED, zero offset, size and flags.
 export fn rc_meta_field(m: RcMeta, i: int32) -> RcField {
   if (i < 0 || i >= m.n_fields) {
     var bad: RcField;
@@ -117,7 +148,10 @@ export fn rc_meta_field(m: RcMeta, i: int32) -> RcField {
   return m.fields[i];
 }
 
-// Finds by field name first, then by column name. -1 when absent.
+// Finds a field by name.
+//   m      the metadata
+//   name   Mettle field name, tried first; then column name
+// Returns the field index, or -1 when no field or column has that name.
 export fn rc_meta_find(m: RcMeta, name: string) -> int32 {
   var i: int32 = 0;
   while (i < m.n_fields) {
@@ -132,9 +166,11 @@ export fn rc_meta_find(m: RcMeta, name: string) -> int32 {
   return -1;
 }
 
+// Index of the primary key field, or -1 when the table has none. Valid only
+// after rc_meta_finalize.
 export fn rc_meta_pk(m: RcMeta) -> int32 { return m.pk; }
 
-// True when any field carries one of `flags`.
+// True when any field carries at least one of `flags` (an RC_F_* mask).
 export fn rc_meta_any(m: RcMeta, flags: int32) -> bool {
   var i: int32 = 0;
   while (i < m.n_fields) {
@@ -144,7 +180,7 @@ export fn rc_meta_any(m: RcMeta, flags: int32) -> bool {
   return false;
 }
 
-// Index of the RC_F_VERSION field, -1 when the table has none.
+// Index of the first RC_F_VERSION field, -1 when the table has none.
 export fn rc_meta_version(m: RcMeta) -> int32 {
   var i: int32 = 0;
   while (i < m.n_fields) {
@@ -154,6 +190,7 @@ export fn rc_meta_version(m: RcMeta) -> int32 {
   return -1;
 }
 
+// True when the table has a primary key and it carries RC_F_AUTO.
 export fn rc_meta_is_auto(m: RcMeta) -> bool {
   if (m.pk < 0 || m.pk >= m.n_fields) { return false; }
   if ((m.fields[m.pk].flags & RC_F_AUTO) != 0) { return true; }
@@ -162,6 +199,11 @@ export fn rc_meta_is_auto(m: RcMeta) -> bool {
 
 // --- finalize ----------------------------------------------------------------
 
+// Applies one RcColumn override to `m->fields` (see RcColumn for each part).
+//   m   the metadata; its field array is modified in place
+//   c   the override
+// Returns RC_OK; RC_ERR_USAGE when `m` is 0 or `c.index` is out of range.
+// Does not validate the result; rc_meta_finalize does.
 export fn rc_meta_apply(m: RcMeta*, c: RcColumn) -> int32 {
   if (m == 0) { return RC_ERR_USAGE; }
   if (c.index < 0 || c.index >= m->n_fields) { return RC_ERR_USAGE; }
@@ -173,8 +215,15 @@ export fn rc_meta_apply(m: RcMeta*, c: RcColumn) -> int32 {
 
 // Applies the hand-written column overrides, resolves the primary key and
 // validates the table. Takes a pointer because it writes m->pk.
+//   m        the metadata; fields and pk are modified in place
+//   cols     overrides, applied in order; may be 0 when `n_cols` is 0
+//   n_cols   number of entries in `cols`
+// Returns RC_OK; RC_ERR_USAGE when `m` is 0, an override's index is out of
+// range (earlier overrides stay applied), or two fields carry RC_F_PK;
+// otherwise whatever rc_meta_check returns.
 export fn rc_meta_finalize(m: RcMeta*, cols: RcColumn*, n_cols: int32) -> int32 {
   if (m == 0) { return RC_ERR_USAGE; }
+  if (n_cols > 0 && cols == 0) { return RC_ERR_USAGE; }
   var i: int32 = 0;
   while (i < n_cols) {
     var rc: int32 = rc_meta_apply(m, cols[i]);
@@ -193,9 +242,25 @@ export fn rc_meta_finalize(m: RcMeta*, cols: RcColumn*, n_cols: int32) -> int32 
   return rc_meta_check(*m, 0);
 }
 
-// Validates the table. `bad` (optional) receives the offending field index.
-// Every failure here is a programming error caught at startup, not at query
-// time: this is the ORM's equivalent of a build check.
+// Validates the table. Every failure here is a programming error caught at
+// startup, not at query time: this is the ORM's equivalent of a build check.
+//   m     the metadata, after rc_meta_finalize
+//   bad   may be 0; receives the offending field index for a per-field
+//         failure and -1 on success. For the table-wide checks it is -1, or
+//         the last field for the PK checks, so do not rely on it there.
+// Returns RC_OK, or:
+//   RC_ERR_UNSUPPORTED  more than 64 fields; a field with an unsupported wire
+//                       type; RC_F_AUTO on a non-RC_T_I64 field; CREATED or
+//                       UPDATED on a non-RC_T_TIME field; RC_F_VERSION on a
+//                       non-RC_T_I64 field
+//   RC_ERR_USAGE        no fields; size <= 0; empty table name; a field with
+//                       an empty name or column, negative offset, size <= 0,
+//                       or reaching past `size`; RC_F_AUTO without RC_F_PK;
+//                       both CREATED and UPDATED, or either on a PK or VERSION
+//                       field; a VERSION field that is nullable or the PK; two
+//                       fields with one column name; more than one PK, a
+//                       nullable PK, or `pk` not pointing at the PK field;
+//                       more than one VERSION field
 export fn rc_meta_check(m: RcMeta, bad: int32*) -> int32 {
   if (bad != 0) { *bad = -1; }
   if (m.fields == 0 || m.n_fields <= 0) { return RC_ERR_USAGE; }
@@ -271,6 +336,19 @@ export fn rc_meta_check(m: RcMeta, bad: int32*) -> int32 {
 
 // --- field access ------------------------------------------------------------
 
+// Reads field `i` (0-based, RcMeta order) out of a model struct. Used by
+// rc_entity_get_field; apps normally call rc_entity_get.
+//   m       the model's metadata
+//   model   the model struct; borrowed
+//   nulls   the model's null bitmap
+//   i       field index
+//   out     receives RcNull when bit `i` of `nulls` is set; otherwise RcBool,
+//           RcInt (signed ints, enums, and unsigned ints up to 32 bits),
+//           RcUint (uint64), RcFloat, RcText (borrows the model's string),
+//           or RcTime for an int64 field
+//           whose wire type is RC_T_TIME
+// Returns RC_OK; RC_ERR_USAGE when `out` or `model` is 0 or `i` is out of
+// range; RC_ERR_UNSUPPORTED for a kind with no mapping.
 export fn rc_meta_get(m: RcMeta, model: rawptr, nulls: uint64, i: int32,
                      out: RcValue*) -> int32 {
   if (out == 0 || model == 0) { return RC_ERR_USAGE; }
@@ -311,17 +389,17 @@ export fn rc_meta_get(m: RcMeta, model: rawptr, nulls: uint64, i: int32,
     }
     case Kind.Uint8: {
       var p: uint8* = (uint8*)at;
-      *out = RcUint((uint64)*p);
+      *out = RcInt((int64)*p);   // fits, and matches its RC_T_I64 wire type
       return RC_OK;
     }
     case Kind.Uint16: {
       var p: uint16* = (uint16*)at;
-      *out = RcUint((uint64)*p);
+      *out = RcInt((int64)*p);   // fits, and matches its RC_T_I64 wire type
       return RC_OK;
     }
     case Kind.Uint32: {
       var p: uint32* = (uint32*)at;
-      *out = RcUint((uint64)*p);
+      *out = RcInt((int64)*p);   // fits, and matches its RC_T_I64 wire type
       return RC_OK;
     }
     case Kind.Uint64: {
@@ -375,6 +453,21 @@ fn rc_range_ok(v: int64, lo: int64, hi: int64) -> bool {
   return true;
 }
 
+// Writes field `i` (0-based, RcMeta order) of a model struct and updates its
+// null bit. Used by rc_entity_set_field and the loaders; apps normally call
+// rc_entity_set. Does not check RC_F_READ_ONLY.
+//   m       the model's metadata
+//   model   the model struct; written in place
+//   nulls   the model's null bitmap; bit `i` is set for RcNull, cleared
+//           otherwise
+//   i       field index
+//   v       the value. RcNull zeroes the field's bytes. Text is stored as a
+//           view, so its bytes must outlive the model.
+// Returns RC_OK; RC_ERR_USAGE when `model` or `nulls` is 0 or `i` is out of
+// range; RC_ERR_CONSTRAINT for RcNull on a NOT NULL field; RC_ERR_CAST when
+// `v`'s arm does not convert (rules of rc_value_as_*); RC_ERR_RANGE when the
+// number does not fit the field (enums must be >= 0); RC_ERR_UNSUPPORTED for a
+// kind with no mapping. On error the model and `nulls` are unchanged.
 export fn rc_meta_set(m: RcMeta, model: rawptr, nulls: uint64*, i: int32,
                       v: RcValue) -> int32 {
   if (model == 0 || nulls == 0) { return RC_ERR_USAGE; }

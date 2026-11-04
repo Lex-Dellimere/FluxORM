@@ -11,14 +11,24 @@
 // Steps run in the order added. The first failure rolls the transaction back
 // and returns that step's code. A failed commit is reported as step "commit".
 //
+// A Multi only holds pointers: step names, changesets, entities, queries and
+// contexts are borrowed and must stay alive until rc_repo_multi returns (the
+// names until rc_multi_free). rc_multi_free releases the step array only.
+//
 // Models are changed in place, so after a rollback the steps that had run are
 // put back as far as the ORM can: an inserted entity is NEW again with no
 // auto key, an updated one gets its old version back and is DIRTY (its model
 // keeps the new values, the store does not), and a deleted one gets its old
-// state back. Running the same Multi again then retries every step.
+// state back. Row counts go back to 0. The failed step itself is left as its
+// call left it, and an rc_multi_run body must undo its own in-memory effects.
+// Running the same Multi again retries every step, but a changeset that
+// recorded an error (a duplicate key, say) refuses to apply until it is reset
+// and filled again.
 //
-// Inside an open transaction a Multi nests like any begin; its failure dooms
-// the outer transaction.
+// Inside an open transaction a Multi nests like any begin: its failure dooms
+// the outer transaction, and its success is only durable when the outer one
+// commits. If the outer one later rolls back, the Multi's entities are not
+// put back.
 
 import "std/mem";
 
@@ -38,27 +48,34 @@ const RC_MS_UPDATE_ALL: int32 = 4;
 const RC_MS_DELETE_ALL: int32 = 5;
 const RC_MS_RUN: int32 = 6;
 
+// One step of a Multi. Filled by the rc_multi_* builders; read it through
+// rc_multi_rows and rc_multi_failed_* rather than directly.
 export struct RcMultiStep {
-  name: string;
-  kind: int32;
-  cs: RcChangeset*;
-  e: RcEntity*;
-  q: RcQuery*;
-  body: fn(rawptr, RcSession*) -> int32;
-  ctx: rawptr;
+  name: string;        // unique, non-empty; borrowed
+  kind: int32;         // which builder added it (RC_MS_*)
+  cs: RcChangeset*;    // insert / update: the changes (insert: may be 0)
+  e: RcEntity*;        // insert / update / delete: the entity
+  q: RcQuery*;         // update_all / delete_all: the query
+  body: fn(rawptr, RcSession*) -> int32; // run: your step
+  ctx: rawptr;         // run: passed to body
   n: int32;            // rows changed, for update_all / delete_all
   prior_state: int32;  // entity state before the step ran
-  prior_version: int64;
+  prior_version: int64; // entity version before the step ran, 0 if none
 }
 
+// Named steps to run in one transaction. Make it with rc_multi_new, add steps
+// with the rc_multi_* builders, run it with rc_repo_multi, release it with
+// rc_multi_free.
 export struct RcMulti {
-  steps: RcMultiStep*;
-  n_steps: int32;
-  cap: int32;
+  steps: RcMultiStep*; // the steps, in order (owned)
+  n_steps: int32;      // steps added
+  cap: int32;          // steps allocated
   failed: int32;  // index of the failed step, n_steps for the commit, -1 none
-  code: int32;
+  code: int32;    // code of the failure, RC_OK when none
 }
 
+// Makes an empty Multi. Nothing is allocated until the first step is added.
+// Returns it by value; free it with rc_multi_free.
 export fn rc_multi_new() -> RcMulti {
   var m: RcMulti;
   m.steps = 0;
@@ -69,6 +86,9 @@ export fn rc_multi_new() -> RcMulti {
   return m;
 }
 
+// Frees the step array. Steps' changesets, entities and queries are borrowed
+// and are not freed. Afterwards m is empty and can take new steps.
+//   m   the Multi; 0 does nothing
 export fn rc_multi_free(m: RcMulti*) {
   if (m == 0) { return; }
   if (m->steps != 0) {
@@ -110,6 +130,13 @@ fn rc_multi_add(m: RcMulti*, name: string, kind: int32) -> RcMultiStep* {
   return st;
 }
 
+// Adds a step that inserts an entity: rc_repo_insert(s, cs, e) when run.
+//   m     the Multi
+//   name  the step's name; non-empty, unique in m, borrowed
+//   cs    changes to apply first, or 0; borrowed
+//   e     the NEW entity; borrowed
+// Returns RC_OK; RC_ERR_USAGE when m or e is 0, the name is empty or taken,
+// or the step array cannot grow.
 export fn rc_multi_insert(m: RcMulti*, name: string, cs: RcChangeset*, e: RcEntity*) -> int32 {
   if (e == 0) { return RC_ERR_USAGE; }
   var st: RcMultiStep* = rc_multi_add(m, name, RC_MS_INSERT);
@@ -119,6 +146,13 @@ export fn rc_multi_insert(m: RcMulti*, name: string, cs: RcChangeset*, e: RcEnti
   return RC_OK;
 }
 
+// Adds a step that saves a changeset: rc_repo_update(s, cs, e) when run.
+//   m     the Multi
+//   name  the step's name; non-empty, unique in m, borrowed
+//   cs    the changes; must not be 0; borrowed
+//   e     the loaded entity; borrowed
+// Returns RC_OK; RC_ERR_USAGE when m, cs or e is 0, the name is empty or
+// taken, or the step array cannot grow.
 export fn rc_multi_update(m: RcMulti*, name: string, cs: RcChangeset*, e: RcEntity*) -> int32 {
   if (cs == 0 || e == 0) { return RC_ERR_USAGE; }
   var st: RcMultiStep* = rc_multi_add(m, name, RC_MS_UPDATE);
@@ -128,6 +162,12 @@ export fn rc_multi_update(m: RcMulti*, name: string, cs: RcChangeset*, e: RcEnti
   return RC_OK;
 }
 
+// Adds a step that deletes an entity: rc_repo_delete(s, e) when run.
+//   m     the Multi
+//   name  the step's name; non-empty, unique in m, borrowed
+//   e     the entity; borrowed
+// Returns RC_OK; RC_ERR_USAGE when m or e is 0, the name is empty or taken,
+// or the step array cannot grow.
 export fn rc_multi_delete(m: RcMulti*, name: string, e: RcEntity*) -> int32 {
   if (e == 0) { return RC_ERR_USAGE; }
   var st: RcMultiStep* = rc_multi_add(m, name, RC_MS_DELETE);
@@ -136,6 +176,13 @@ export fn rc_multi_delete(m: RcMulti*, name: string, e: RcEntity*) -> int32 {
   return RC_OK;
 }
 
+// Adds a step that runs rc_repo_update_all(s, q, ...) when run; read its row
+// count afterwards with rc_multi_rows(m, name).
+//   m     the Multi
+//   name  the step's name; non-empty, unique in m, borrowed
+//   q     from rc_query_update_all, with SET and WHERE terms; borrowed
+// Returns RC_OK; RC_ERR_USAGE when m or q is 0, the name is empty or taken,
+// or the step array cannot grow.
 export fn rc_multi_update_all(m: RcMulti*, name: string, q: RcQuery*) -> int32 {
   if (q == 0) { return RC_ERR_USAGE; }
   var st: RcMultiStep* = rc_multi_add(m, name, RC_MS_UPDATE_ALL);
@@ -144,6 +191,13 @@ export fn rc_multi_update_all(m: RcMulti*, name: string, q: RcQuery*) -> int32 {
   return RC_OK;
 }
 
+// Adds a step that runs rc_repo_delete_all(s, q, ...) when run; read its row
+// count afterwards with rc_multi_rows(m, name).
+//   m     the Multi
+//   name  the step's name; non-empty, unique in m, borrowed
+//   q     from rc_query_delete, with a WHERE term; borrowed
+// Returns RC_OK; RC_ERR_USAGE when m or q is 0, the name is empty or taken,
+// or the step array cannot grow.
 export fn rc_multi_delete_all(m: RcMulti*, name: string, q: RcQuery*) -> int32 {
   if (q == 0) { return RC_ERR_USAGE; }
   var st: RcMultiStep* = rc_multi_add(m, name, RC_MS_DELETE_ALL);
@@ -152,7 +206,15 @@ export fn rc_multi_delete_all(m: RcMulti*, name: string, q: RcQuery*) -> int32 {
   return RC_OK;
 }
 
-// A step of your own: `body(ctx, s)` returns RC_OK to go on.
+// Adds a step of your own, like Ecto.Multi.run: body(ctx, s) is called in
+// the transaction and returns RC_OK to go on, or a code to fail the Multi
+// with. It is not undone on rollback beyond the store's own rollback.
+//   m     the Multi
+//   name  the step's name; non-empty, unique in m, borrowed
+//   body  the step; must not be 0
+//   ctx   passed to body; borrowed, may be 0
+// Returns RC_OK; RC_ERR_USAGE when m or body is 0, the name is empty or
+// taken, or the step array cannot grow.
 export fn rc_multi_run(m: RcMulti*, name: string, body: fn(rawptr, RcSession*) -> int32,
                        ctx: rawptr) -> int32 {
   if (body == 0) { return RC_ERR_USAGE; }
@@ -163,19 +225,31 @@ export fn rc_multi_run(m: RcMulti*, name: string, body: fn(rawptr, RcSession*) -
   return RC_OK;
 }
 
-// The failed step's name: "" when nothing failed, "commit" for the commit.
+// The name of the step that failed the last rc_repo_multi.
+//   m   the Multi; may be 0
+// Returns the step's name (borrowed), "commit" when the commit failed, or ""
+// when nothing failed or m is 0.
 export fn rc_multi_failed_name(m: RcMulti*) -> string {
   if (m == 0 || m->failed < 0) { return ""; }
   if (m->failed >= m->n_steps) { return "commit"; }
   return m->steps[m->failed].name;
 }
 
+// The index of the step that failed the last rc_repo_multi.
+//   m   the Multi; may be 0
+// Returns the 0-based index in the order added, the step count when the
+// commit failed, or -1 when nothing failed or m is 0.
 export fn rc_multi_failed_step(m: RcMulti*) -> int32 {
   if (m == 0) { return -1; }
   return m->failed;
 }
 
-// Rows changed by the update_all / delete_all step called `name`, or -1.
+// Rows changed by the update_all or delete_all step called `name` in the last
+// rc_repo_multi.
+//   m     the Multi; may be 0
+//   name  the step's name
+// Returns the count: 0 for other kinds of step, for a step that did not run,
+// and after a rollback; -1 when m is 0 or no step has that name.
 export fn rc_multi_rows(m: RcMulti*, name: string) -> int32 {
   if (m == 0) { return -1; }
   var i: int32 = 0;
@@ -233,7 +307,22 @@ fn rc_multi_undo(st: RcMultiStep*) {
   if (st->kind == RC_MS_DELETE) { e->state = st->prior_state; }
 }
 
-// Runs every step of m inside one transaction (see the header).
+// Runs every step of a Multi, in order, inside one transaction, like Ecto's
+// Repo.transaction(multi). On the first failure it rolls back, puts back the
+// entities of the steps that had run (see the header) and stops.
+//   s     the session
+//   m     the Multi; its failed and code fields are set by this call
+//   mode  RC_TX_DEFAULT, RC_TX_DEFERRED or RC_TX_IMMEDIATE (ignored when s
+//         is already in a transaction)
+// Returns RC_OK when every step ran and the commit succeeded. Otherwise:
+//   RC_ERR_USAGE  s or m is 0; or, from the begin, a bad mode or no adapter
+//   RC_ERR_TX     the begin was refused (nesting too deep), or the commit
+//                 found the transaction doomed
+//   the failed step's code (rc_multi_failed_name gives its name)
+//   the commit's code (rc_multi_failed_name is "commit"); every step is put
+//   back
+//   the adapter's code when it cannot begin
+// A failed begin runs no step and leaves failed at -1.
 export fn rc_repo_multi(s: RcSession*, m: RcMulti*, mode: int32) -> int32 {
   if (s == 0 || m == 0) { return RC_ERR_USAGE; }
   m->failed = -1;

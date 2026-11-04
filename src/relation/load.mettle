@@ -29,6 +29,12 @@
 // `rc_query_exec`) for every relation kind, including the through one: this
 // file never spells SQL itself and never touches core/buf.
 //
+// Reading a result: owner key -> group -> rows.
+//
+//   g = rc_relation_group(&out, user.id);        // -1: key not loaded
+//   n = rc_relation_count(&out, g);              // rows in that group
+//   for i in 0..n: rc_relation_hydrate(&out, g, i, &post, &nulls);
+//
 // Lifetime: `out->res` (and `out->through`) are owned results. `idx` holds row
 // *indices* into `res`, so a hydrated model's string fields are borrowed views
 // into `res`; the borrow ends at `rc_relation_free`.
@@ -43,10 +49,12 @@ import "../adapter/adapter";
 import "../query/builder";
 import "relation";
 
+// The result of one rc_relation_load. Read it through rc_relation_group /
+// count / hydrate; free it with rc_relation_free.
 export struct RcRelationResult {
-  kind: int32;
+  kind: int32;         // RC_REL_* of the relation that was loaded
   keys: int64*;        // deduped owner keys, first-seen order
-  n_keys: int32;
+  n_keys: int32;       // entries in keys; also the number of groups
   res: RcResult;       // ALL target rows, one statement
   idx: int32*;         // row indices into res, grouped
   off: int32*;         // n_keys + 1 prefix offsets; group g = idx[off[g]..off[g+1])
@@ -54,7 +62,7 @@ export struct RcRelationResult {
   through: RcResult;   // THROUGH only: the mapping rows
   // Target metadata, carried so `rc_relation_hydrate` can write a model
   // without a meta argument.
-  meta: RcMeta;
+  meta: RcMeta;        // the target_meta passed to rc_relation_load
 }
 
 fn rc_relation_result_init(out: RcRelationResult*) {
@@ -91,6 +99,10 @@ fn rc_relation_drop(out: RcRelationResult*) {
   }
 }
 
+// Frees everything a load allocated (rows, groups, keys) and resets the
+// counts. Call it once per rc_relation_load, on success or failure.
+//   out  the result; 0 is a no-op. Safe to call twice.
+// Models hydrated from it hold views into its rows: stop using them first.
 export fn rc_relation_free(out: RcRelationResult*) {
   if (out == 0) { return; }
   rc_relation_drop(out);
@@ -395,15 +407,32 @@ fn rc_relation_load_through(a: RcAdapter*, rel: RcRelation*, target_meta: RcMeta
 
 // --- public loader -----------------------------------------------------------
 
-// One explicit call, one load. `keys` are RcValue cells (owner key values):
-// NULL keys are skipped, anything that is not RC_T_I64 is RC_ERR_CAST *before*
-// any statement, and exact duplicates are collapsed with first-seen order kept.
-// An empty key set runs zero statements and leaves the caller's adapter
-// untouched — that is the `IN ()` rule, not an optimisation.
-//
-// The result is one statement per relation kind regardless of how many owners
-// arrive; `out->n_execs` records how many actually ran, so a test (or a log) can
-// assert the count rather than trusting the comment.
+// Loads the targets of `rel` for a batch of owners: one statement for
+// HAS_MANY / BELONGS_TO, two for THROUGH, however many owners there are.
+//   a             the adapter; borrowed
+//   rel           the relation; borrowed. Checked with rc_relation_check first
+//   owner_meta    the owner model's meta
+//   target_meta   the target model's meta; copied into out->meta
+//   through_meta  the join table's meta for THROUGH, else may be 0
+//   keys          owner key values (the owner's local_field), n_keys of them;
+//                 borrowed, may be 0 when n_keys is 0. NULL keys are skipped,
+//                 duplicates collapse (first-seen order kept)
+//   n_keys        number of keys, >= 0
+//   out           the result; overwritten (not freed) on entry
+// Returns RC_OK, or:
+//   RC_ERR_USAGE    rel or out is 0 (out untouched), a is 0, n_keys < 0, or
+//                   keys is 0 with n_keys > 0; or any rc_relation_check code
+//                   (RC_ERR_USAGE / RC_ERR_UNSUPPORTED / RC_ERR_CAST)
+//   RC_ERR_CAST     a non-NULL key is not RC_T_I64; checked before any
+//                   statement runs
+//   RC_ERR_NOMEM    an allocation failed
+//   RC_ERR_ADAPTER  the store returned rows of the wrong shape (column count,
+//                   or a key cell that is not an integer)
+//   any code from the adapter or the query builder for a failed statement
+// An empty key set (or only NULLs) runs no statement and returns RC_OK with
+// zero groups. out->n_execs counts statements that succeeded. On failure no
+// group is readable, but keys / n_keys / n_execs are kept so you can see what
+// ran. Always call rc_relation_free(out) afterwards, success or not.
 export fn rc_relation_load(a: RcAdapter*, rel: RcRelation*, owner_meta: RcMeta,
                           target_meta: RcMeta, through_meta: RcMeta*,
                           keys: RcValue*, n_keys: int32,
@@ -510,14 +539,22 @@ export fn rc_relation_load(a: RcAdapter*, rel: RcRelation*, owner_meta: RcMeta,
 
 // --- reading a result --------------------------------------------------------
 
-// Group index for an owner key, or -1 when that key was not in the key set.
+// Finds the group for one owner key.
+//   out  a loaded result; may be 0
+//   key  an owner key value, as passed to rc_relation_load
+// Returns the group index (0 .. n_keys-1, in first-seen key order), or -1
+// when out is 0 or the key was not in the loaded key set.
 export fn rc_relation_group(out: RcRelationResult*, key: int64) -> int32 {
   if (out == 0) { return -1; }
   return rc_relation_group_of_key(out, key);
 }
 
-// Rows in a group. -1 for an out-of-range group (or before a successful load,
-// when off is 0).
+// Counts the target rows in a group.
+//   out    a loaded result; may be 0
+//   group  a group index from rc_relation_group
+// Returns the row count (0 for an owner with no targets, at most 1 for
+// BELONGS_TO), or -1 when out is 0, the load failed or loaded no keys, or
+// group is out of range.
 export fn rc_relation_count(out: RcRelationResult*, group: int32) -> int32 {
   if (out == 0) { return -1; }
   if (out->off == 0) { return -1; }
@@ -525,15 +562,21 @@ export fn rc_relation_count(out: RcRelationResult*, group: int32) -> int32 {
   return out->off[group + 1] - out->off[group];
 }
 
-// Fills `model` from group `group`, entry `i`. `*nulls` is zeroed first, then
-// every target field is written through rc_meta_set with a *borrowed* cell from
-// `out->res` — the model's string fields point into the result, the borrow ends
-// at rc_relation_free. No copy per field: the owner list that a copy would need
-// is the session arena, which this phase does not have.
-//
-// rc_meta_set's own range/constraint checks are not bypassed; a target value
-// that does not fit the model field is that code (RC_ERR_RANGE, RC_ERR_CAST,
-// RC_ERR_CONSTRAINT), raised after `*nulls` was zeroed.
+// Fills a target model from row `i` of group `group`.
+//   out    a loaded result; borrowed, must outlive the model
+//   group  a group index from rc_relation_group
+//   i      0 .. rc_relation_count(out, group) - 1
+//   model  pointer to a target model struct (target_meta's layout)
+//   nulls  receives the model's null bitmap; zeroed first
+// Returns RC_OK, or:
+//   RC_ERR_USAGE    a pointer is 0, the load failed or the group is empty,
+//                   or group / i is out of range
+//   RC_ERR_ADAPTER  the row's column count does not match the target meta
+//   RC_ERR_RANGE / RC_ERR_CAST / RC_ERR_CONSTRAINT  a value does not fit its
+//                   field (from rc_meta_set; fields before it are written)
+// Nothing is copied: string and blob fields borrow from `out->res` and are
+// valid until rc_relation_free(out). No copy per field because the owner list
+// a copy would need is the session arena, which this phase does not have.
 export fn rc_relation_hydrate(out: RcRelationResult*, group: int32, i: int32,
                              model: rawptr, nulls: uint64*) -> int32 {
   if (out == 0 || model == 0 || nulls == 0) { return RC_ERR_USAGE; }

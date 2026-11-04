@@ -1,39 +1,41 @@
-// flux_orm/changeset/changeset.mettle — what the caller wants to write, and which
-// columns that actually touches.
+// flux_orm/changeset/changeset.mettle — what the caller wants to write, and
+// which columns that touches. After Ecto's changesets.
 //
-// RcEntity.state answers "does this row differ from the store". An UPDATE needs
-// the stronger answer "which fields", which is the same shape as the null
-// bitmap: one bit per field in a uint64, so a changeset is 64 fields wide. That
-// ceiling is rc_meta_check's (RC_MAX_FIELDS); a meta with more fields is
-// refused here rather than truncated, because a silently dropped column is a
-// lost write.
+// A changeset holds one value cell per field of an RcMeta and one "changed"
+// bit per field, in a uint64. A meta with more than RC_MAX_FIELDS (64) fields
+// is refused, never truncated: a dropped column would be a lost write.
 //
-// Why the per-field bit matters, in one sentence: if a caller loads a row, sets
-// one field and saves, an UPDATE that rewrites every column clobbers whatever a
-// concurrent writer changed in the meantime. So `put` compares against a bound
-// baseline row (rc_changeset_bind) and *clears* the bit when the value is
-// identical to what the row already holds — the "identical value is not dirty"
-// test pins that.
+//   var cs: RcChangeset = rc_changeset_new(m);
+//   rc_changeset_bind(&cs, (rawptr)&u, e.nulls);   // u, e from rc_repo_get
+//   rc_changeset_cast(&cs, "age", form_age);       // user text
+//   rc_validate_int(&cs, "age", 0, 150);
+//   rc = rc_repo_update(&s, &cs, &e);              // UPDATE ... SET "age" = ?
+//   rc_changeset_free(&cs);
 //
-// Ownership, same rule as RcEntity: text inputs are BORROWED. `RcText` is a
-// 16-byte view with no owner, so rc_changeset_put / rc_changeset_put_text keep
-// the caller's bytes and rc_changeset_free does NOT release the cells (they
-// were never owned). A caller that keeps a changeset alive past the buffer it
-// read the text from must keep that buffer alive too; a caller that needs the
-// value to outlive it must rc_value_clone into its own storage. The
-// "borrowed text is not copied" test asserts `.chars` pointer identity.
+// An UPDATE writes only the changed columns, so it does not clobber what a
+// concurrent writer changed in another column. Once a row is bound, a put
+// that leaves a field equal to the bound row's value clears its bit.
 //
-// Errors are collected, as in Ecto: a refused put records an error for its
-// field and leaves the field unchanged, and later puts on other fields still
-// work. Validations (validate.mettle) add more. rc_changeset_error_count and
-// rc_changeset_error_at list them; rc_changeset_error_field/code/reason give
-// the first. A changeset with any error is invalid, and apply and save refuse
-// it with RC_ERR_USAGE before they write anything. reset and bind clear the
-// errors.
+// Ownership: text and blob values are BORROWED views. The changeset keeps the
+// caller's bytes and rc_changeset_free never frees them, so the buffer behind
+// any text you put must outlive the changeset (or rc_value_clone it first).
+// Reason strings are static and never owned.
 //
-// The SQL itself is query/'s: rc_changeset_save hands the mask to
-// rc_query_update, so an UPDATE names exactly the dirty columns and nothing
-// else.
+// Errors are collected per field, as in Ecto: a refused put records an
+// RcFieldError and leaves the field unchanged; puts on other fields still
+// work, and validations (validate.mettle) add more. rc_changeset_error_count
+// and rc_changeset_error_at list them; rc_changeset_error_field/code/reason
+// give the first. A changeset with any error is invalid: apply and save
+// refuse it with RC_ERR_USAGE before writing anything. reset and bind clear
+// the errors.
+//
+// A changeset whose meta failed rc_meta_check, or whose cells could not be
+// allocated, is dead (values == 0): it records nothing and most calls just
+// return its err_code.
+//
+// Name-based calls (rc_changeset_put, _cast, ...) are what an app uses. Each
+// has a `_field` twin that takes a 0-based field index in RcMeta order, for
+// generated code.
 
 import "std/mem";
 
@@ -46,7 +48,8 @@ import "../adapter/adapter";
 import "../query/builder";
 import "cast";
 
-// One recorded error. `reason` is a static string, never owned.
+// One recorded error. `name` and `reason` are borrowed (the meta's name and a
+// static or caller string); nothing here is owned.
 export struct RcFieldError {
   field: int32;   // field index, -1 when the error is not about one field
   name: string;   // field name, "" when field is -1
@@ -54,19 +57,22 @@ export struct RcFieldError {
   reason: string; // e.g. "can't be blank", "is too long"
 }
 
+// The pending write for one table. Make it with rc_changeset_new, release it
+// with rc_changeset_free. Read it through the rc_changeset_* calls rather than
+// the fields.
 export struct RcChangeset {
   meta: RcMeta;         // the table this changeset writes
   changes: uint64;      // bit i set = field i was written by the caller
   values: RcValue*;     // meta.n_fields cells, borrowed; 0 when unusable
   n_values: int32;      // == meta.n_fields, or 0 when values == 0
   base: rawptr;         // baseline model for dirty comparison, 0 = none
-  base_nulls: uint64;
+  base_nulls: uint64;   // null bitmap of `base`
   err_field: int32;     // -1 when no error
   err_code: int32;      // RC_OK when no error
   err_reason: string;   // static string, never owned
   errors: RcFieldError*; // every error, in the order recorded
-  n_errors: int32;
-  cap_errors: int32;
+  n_errors: int32;      // entries used in `errors`
+  cap_errors: int32;    // entries allocated in `errors`
   unique: uint64;       // fields a duplicate-key CONFLICT is reported on
 }
 
@@ -115,20 +121,35 @@ fn rc_changeset_note(cs: RcChangeset*, field: int32, code: int32,
   return code;
 }
 
-// Records an error, as a validation does. Returns `code`.
+// Records an error on a field by index, as a validation does. Takes a field
+// index for generated code; apps use rc_changeset_add_error, which documents
+// the rules. `field` is -1 for an error on no field.
+// Returns `code`; RC_ERR_USAGE when cs is 0, `code` is RC_OK, or `field` is
+// outside -1 .. n_fields - 1 (nothing recorded); err_code when cs is dead.
 export fn rc_changeset_add_error_field(cs: RcChangeset*, field: int32, code: int32,
                                  why: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
+  if (code == RC_OK) { return RC_ERR_USAGE; }
+  if (field < -1 || field >= cs->meta.n_fields) { return RC_ERR_USAGE; }
   return rc_changeset_note(cs, field, code, why);
 }
 
+// How many errors are recorded on the changeset.
+//   cs   the changeset; may be 0
+// Returns the count, 0 for a 0 changeset. A dead changeset has an err_code
+// but an empty list, so this is 0 for it too.
 export fn rc_changeset_error_count(cs: RcChangeset*) -> int32 {
   if (cs == 0) { return 0; }
   return cs->n_errors;
 }
 
-// Error i, or {-1, RC_ERR_USAGE, ""} when there is none.
+// The i-th recorded error, in the order recorded.
+//   cs   the changeset; may be 0
+//   i    0-based, below rc_changeset_error_count
+// Returns a copy of the RcFieldError (its strings are borrowed), or
+// {field -1, name "", RC_ERR_USAGE, reason ""} when cs is 0 or i is out of
+// range.
 export fn rc_changeset_error_at(cs: RcChangeset*, i: int32) -> RcFieldError {
   var e: RcFieldError;
   e.field = -1;
@@ -139,7 +160,9 @@ export fn rc_changeset_error_at(cs: RcChangeset*, i: int32) -> RcFieldError {
   return cs->errors[i];
 }
 
-// True when an error is recorded for `field`.
+// True when an error is recorded for a field index. Takes a field index for
+// generated code; apps use rc_changeset_has_error. Passing -1 asks about
+// errors that are not on any field. False when cs is 0.
 export fn rc_changeset_has_error_field(cs: RcChangeset*, field: int32) -> bool {
   if (cs == 0) { return false; }
   var i: int32 = 0;
@@ -150,10 +173,10 @@ export fn rc_changeset_has_error_field(cs: RcChangeset*, field: int32) -> bool {
   return false;
 }
 
-// Like Ecto's unique_constraint: when the store answers a write with
-// RC_ERR_CONFLICT (a duplicate key), the error is recorded on `field` instead
-// of on no field. With several unique fields registered the store does not say
-// which one clashed, so the error goes on field -1.
+// Marks a field index as unique. Takes a field index for generated code; apps
+// use rc_changeset_unique, which documents the rules.
+// Returns RC_OK; RC_ERR_USAGE when cs is 0 or field is out of range (nothing
+// recorded); err_code when cs is dead.
 export fn rc_changeset_unique_field(cs: RcChangeset*, field: int32) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -162,7 +185,11 @@ export fn rc_changeset_unique_field(cs: RcChangeset*, field: int32) -> int32 {
   return RC_OK;
 }
 
-// Records the store's duplicate-key CONFLICT on the registered unique field.
+// Records a duplicate-key conflict from the store: RC_ERR_CONFLICT "has
+// already been taken" on the one field marked with rc_changeset_unique, or on
+// field -1 when none or several are marked (the store does not say which
+// clashed). rc_repo_insert and rc_changeset_save call it for you.
+//   cs   the changeset; 0 or dead does nothing
 export fn rc_changeset_conflict(cs: RcChangeset*) {
   if (cs == 0 || cs->values == 0) { return; }
   var field: int32 = -1;
@@ -190,10 +217,18 @@ fn rc_changeset_dead(cs: RcChangeset*) -> bool {
 
 // --- construction ------------------------------------------------------------
 
-// A changeset over m, all cells RcNull, no bits set, no baseline. A meta that
-// does not pass rc_meta_check (which includes n_fields > RC_MAX_FIELDS) yields
-// a changeset with values == 0 and that error recorded: the caller may inspect
-// it, and every later call keeps returning the same code. Never truncated.
+// Makes an empty changeset for a table: every cell RcNull, nothing changed,
+// no bound row, no errors.
+//   m    the table's metadata; copied, but its field array is borrowed and
+//        must outlive the changeset
+// Returns the changeset by value; free it with rc_changeset_free. It never
+// fails outright: when it cannot be used it comes back dead (values == 0,
+// error list empty) with err_code and err_reason set:
+//   - the code from rc_meta_check (RC_ERR_USAGE, or RC_ERR_UNSUPPORTED for
+//     more than RC_MAX_FIELDS fields or an unsupported type), "metadata
+//     failed rc_meta_check";
+//   - RC_ERR_NOMEM when the cells cannot be allocated.
+// Every later call on a dead changeset returns that code.
 export fn rc_changeset_new(m: RcMeta) -> RcChangeset {
   var cs: RcChangeset;
   cs.meta = m;
@@ -241,8 +276,10 @@ export fn rc_changeset_new(m: RcMeta) -> RcChangeset {
   return cs;
 }
 
-// Frees the cell array only. The cells hold borrowed text, so releasing them
-// here would free the caller's buffers; they are views, and views do not own.
+// Frees what the changeset owns: the cell array and the error list. The text
+// and blob values in the cells are borrowed and are not freed.
+//   cs   the changeset; 0 does nothing. Safe to call twice.
+// Afterwards the changeset is dead: every call on it returns RC_ERR_USAGE.
 export fn rc_changeset_free(cs: RcChangeset*) {
   if (cs == 0) { return; }
   if (cs->values != 0) {
@@ -259,10 +296,13 @@ export fn rc_changeset_free(cs: RcChangeset*) {
   cs->n_values = 0;
   cs->base = 0;
   cs->base_nulls = (uint64)0;
+  cs->err_code = RC_ERR_USAGE;   // freed: every later call refuses
 }
 
-// Back to "nothing written": bits cleared, cells RcNull, baseline dropped,
-// errors cleared. The meta, the allocation and the unique fields are kept.
+// Empties the changeset for reuse: nothing changed, every cell RcNull, no
+// bound row, no errors. The meta, the allocations and the unique marks stay.
+//   cs   the changeset
+// Returns RC_OK; RC_ERR_USAGE when cs is 0; err_code when cs is dead.
 export fn rc_changeset_reset(cs: RcChangeset*) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -281,11 +321,15 @@ export fn rc_changeset_reset(cs: RcChangeset*) -> int32 {
   return RC_OK;
 }
 
-// Records the row the changeset came from, so `put` can tell a real edit from a
-// rewrite of the same bytes. Binding starts a fresh edit (it resets), because a
-// baseline from row A must never be compared against values put for row B. The
-// model is borrowed: it must outlive the changeset, and it must be the model
-// whose `nulls` mask is passed.
+// Binds the loaded row the changeset edits, so a put that leaves a field
+// equal to that row's value does not count as a change. Binding first resets
+// the changeset (changes and errors are dropped), so values put for one row
+// are never compared against another.
+//   cs     the changeset
+//   model  the loaded model; borrowed, must outlive the changeset
+//   nulls  that model's null bitmap (e.g. e.nulls from rc_repo_get)
+// Returns RC_OK; RC_ERR_USAGE when cs is 0; err_code when cs is dead;
+// RC_ERR_USAGE when model is 0, recorded as "null baseline model" (field -1).
 export fn rc_changeset_bind(cs: RcChangeset*, model: rawptr, nulls: uint64) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -320,13 +364,10 @@ fn rc_changeset_bit(field: int32) -> uint64 {
 
 // --- writing -----------------------------------------------------------------
 
-// Puts one field. Strict: the arm must belong to the field's declared wire type
-// (rc_cast_fits), so RcText into an RC_T_I64 column is RC_ERR_CAST — parsing
-// user text is rc_changeset_put_text's job, and only its job. RcNull is allowed
-// unless the column is RC_F_NOT_NULL (RC_ERR_CONSTRAINT).
-//
-// Last wins: putting field 2 twice keeps the second value and still counts the
-// field once.
+// Puts a value into a field by index. Takes a 0-based field index for
+// generated code; apps use rc_changeset_put, which documents the rules. An
+// index out of range is recorded as RC_ERR_USAGE "field index out of range"
+// and returned.
 export fn rc_changeset_put_field(cs: RcChangeset*, field: int32, v: RcValue) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -357,9 +398,6 @@ export fn rc_changeset_put_field(cs: RcChangeset*, field: int32, v: RcValue) -> 
   return RC_OK;
 }
 
-// Puts by field *or* column name (rc_meta_find: name first, then column). An
-// unknown name is RC_ERR_USAGE with err_field == -1, because there is no field
-// index to report.
 // Resolves a field or column name; an unknown one is recorded as an error
 // (RC_ERR_USAGE, field -1, "unknown field name") and answers -1.
 fn rc_changeset_field_of(cs: RcChangeset*, name: string) -> int32 {
@@ -368,6 +406,27 @@ fn rc_changeset_field_of(cs: RcChangeset*, name: string) -> int32 {
   return field;
 }
 
+// Puts a typed value into a field, e.g.
+// rc_changeset_put(&cs, "age", RcInt(42)). The value is not parsed: its arm
+// must belong to the field's type (rc_cast_fits), so RcText into an integer
+// field is refused; use rc_changeset_cast for user text. RcInt and RcUint are
+// interchangeable here; the range is checked when the changeset is applied.
+// Last put wins. The field counts as changed unless the value equals the
+// bound row's (rc_changeset_bind).
+//   cs    the changeset
+//   name  field name, or column name if no field has it
+//   v     the value; text and blob are borrowed and must outlive cs.
+//         RcNull is allowed unless the field is RC_F_NOT_NULL
+// Returns RC_OK. A refusal records an error on the field (the field keeps
+// its old value) and returns its code:
+//   RC_ERR_USAGE        unknown name, recorded on field -1 as "unknown field
+//                       name"
+//   RC_ERR_CONSTRAINT   RcNull on a NOT NULL field, "not null"
+//   RC_ERR_CAST         wrong arm for the field, "value arm does not fit the
+//                       field type"
+//   RC_ERR_UNSUPPORTED  the field's type cannot be written, "field type is
+//                       not supported"
+// RC_ERR_USAGE when cs is 0 and err_code when cs is dead, recording nothing.
 export fn rc_changeset_put(cs: RcChangeset*, name: string, v: RcValue) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -376,6 +435,25 @@ export fn rc_changeset_put(cs: RcChangeset*, name: string, v: RcValue) -> int32 
   return rc_changeset_put_field(cs, field, v);
 }
 
+// Parses user text (a form value, a CLI argument) for a field's type and puts
+// the result, e.g. rc_changeset_cast(&cs, "age", "42") puts RcInt(42).
+// Parsing is strict (see cast.mettle and rc_cast_text): no trimming, no
+// exponents, booleans only "1" "0" "true" "false", integer text for a time
+// (unix micros), no text form for a blob. Empty text means NULL.
+//   cs    the changeset
+//   name  field name, or column name if no field has it
+//   text  the text; borrowed. A text field keeps a view of it, so it must
+//         outlive cs
+// Returns RC_OK. A refusal records an error on the field (the field keeps
+// its old value) and returns its code:
+//   RC_ERR_USAGE        unknown name, on field -1, "unknown field name"
+//   RC_ERR_CAST         not that kind of value, e.g. "not a decimal integer",
+//                       "not a boolean"; or a blob field
+//   RC_ERR_RANGE        the right kind but it does not fit, e.g. "integer out
+//                       of range"; or text over RC_CS_MAX_TEXT bytes
+//   RC_ERR_CONSTRAINT   empty text on a NOT NULL field, "not null"
+//   RC_ERR_UNSUPPORTED  the field's type has no text form
+// RC_ERR_USAGE when cs is 0 and err_code when cs is dead, recording nothing.
 export fn rc_changeset_cast(cs: RcChangeset*, name: string, text: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -384,26 +462,68 @@ export fn rc_changeset_cast(cs: RcChangeset*, name: string, text: string) -> int
   return rc_changeset_cast_field(cs, field, text);
 }
 
+// Sets a field to NULL: the same as rc_changeset_put(cs, name, RcNull).
+//   cs    the changeset
+//   name  field name, or column name if no field has it
+// Returns RC_OK; RC_ERR_CONSTRAINT recorded as "not null" when the field is
+// RC_F_NOT_NULL; RC_ERR_USAGE recorded as "unknown field name" for an
+// unknown name; RC_ERR_USAGE when cs is 0; err_code when cs is dead.
 export fn rc_changeset_put_null(cs: RcChangeset*, name: string) -> int32 {
   return rc_changeset_put(cs, name, RcNull);
 }
 
+// True when the field will be written: a put on it succeeded and the value
+// differs from the bound row. Records nothing.
+//   cs    the changeset; may be 0
+//   name  field name, or column name if no field has it
+// Returns false for a 0 or dead changeset and for an unknown name.
 export fn rc_changeset_changed(cs: RcChangeset*, name: string) -> bool {
   if (cs == 0) { return false; }
   return rc_changeset_changed_field(cs, rc_meta_find(cs->meta, name));
 }
 
+// Marks a field as unique, like Ecto's unique_constraint: when the store
+// refuses an insert or save with a duplicate key (RC_ERR_CONFLICT), the error
+// "has already been taken" is recorded on this field. With more than one
+// field marked it goes on field -1, because the store does not say which
+// clashed. Marks survive rc_changeset_reset and rc_changeset_bind.
+//   cs    the changeset
+//   name  field name, or column name if no field has it
+// Returns RC_OK; RC_ERR_USAGE when cs is 0, or the name is unknown (recorded
+// as "unknown field name"); err_code when cs is dead.
 export fn rc_changeset_unique(cs: RcChangeset*, name: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
-  return rc_changeset_unique_field(cs, rc_meta_find(cs->meta, name));
+  if (cs->values == 0) { return cs->err_code; }
+  var field: int32 = rc_changeset_field_of(cs, name);
+  if (field < 0) { return RC_ERR_USAGE; }
+  return rc_changeset_unique_field(cs, field);
 }
 
+// Records your own error on a field, like Ecto's add_error, e.g.
+// rc_changeset_add_error(&cs, "email", RC_ERR_CONSTRAINT, "is not allowed").
+// The changeset is then invalid and will not be applied or saved.
+//   cs      the changeset
+//   name    field name, or column name if no field has it. An unknown name
+//           records "unknown field name" instead and returns RC_ERR_USAGE
+//   code    an RC_ERR_* code; RC_OK is refused with RC_ERR_USAGE
+//   reason  shown to the user; borrowed and never freed, so use a literal
+//           or a string that outlives cs. "" uses a default for the code
+// Returns `code`; RC_ERR_USAGE when cs is 0; err_code (nothing recorded)
+// when cs is dead.
 export fn rc_changeset_add_error(cs: RcChangeset*, name: string, code: int32,
                                  reason: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
-  return rc_changeset_add_error_field(cs, rc_meta_find(cs->meta, name), code, reason);
+  if (cs->values == 0) { return cs->err_code; }
+  var field: int32 = rc_changeset_field_of(cs, name);
+  if (field < 0) { return RC_ERR_USAGE; }
+  return rc_changeset_add_error_field(cs, field, code, reason);
 }
 
+// True when an error is recorded on the field.
+//   cs    the changeset; may be 0
+//   name  field name, or column name if no field has it
+// Returns false for a 0 changeset and for an unknown name (errors on field
+// -1 are only visible through rc_changeset_error_at).
 export fn rc_changeset_has_error(cs: RcChangeset*, name: string) -> bool {
   if (cs == 0) { return false; }
   var field: int32 = rc_meta_find(cs->meta, name);
@@ -411,10 +531,10 @@ export fn rc_changeset_has_error(cs: RcChangeset*, name: string) -> bool {
   return rc_changeset_has_error_field(cs, field);
 }
 
-// Parses user text for the field's declared wire type and puts the result. This
-// is the single parsing entry point; there is no put_text_i64/put_text_f64
-// family, because the field's `ty` already says which arm to produce.
-// rc_cast_text documents the matrix; the text is borrowed, never copied.
+// Parses user text into a field by index. Takes a 0-based field index for
+// generated code; apps use rc_changeset_cast, which documents the rules. An
+// index out of range is recorded as RC_ERR_USAGE "field index out of range"
+// and returned.
 export fn rc_changeset_cast_field(cs: RcChangeset*, field: int32, s: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -431,12 +551,17 @@ export fn rc_changeset_cast_field(cs: RcChangeset*, field: int32, s: string) -> 
   return rc_changeset_put_field(cs, field, v);
 }
 
-// Explicit "this column becomes NULL". Same rules as put(cs, field, RcNull).
+// Sets a field to NULL by index. Takes a 0-based field index for generated
+// code; apps use rc_changeset_put_null. Same as
+// rc_changeset_put_field(cs, field, RcNull).
 export fn rc_changeset_put_null_field(cs: RcChangeset*, field: int32) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   return rc_changeset_put_field(cs, field, RcNull);
 }
 
+// True when the field at an index will be written. Takes a 0-based field
+// index for generated code; apps use rc_changeset_changed. False for a 0 or
+// dead changeset and an index out of range.
 export fn rc_changeset_changed_field(cs: RcChangeset*, field: int32) -> bool {
   if (cs == 0) { return false; }
   if (cs->values == 0) { return false; }
@@ -444,6 +569,9 @@ export fn rc_changeset_changed_field(cs: RcChangeset*, field: int32) -> bool {
   return rc_nulls_has(cs->changes, field);
 }
 
+// How many fields will be written (see rc_changeset_changed).
+//   cs   the changeset; may be 0
+// Returns the count, 0 for a 0 or dead changeset.
 export fn rc_changeset_n_changed(cs: RcChangeset*) -> int32 {
   if (cs == 0) { return 0; }
   if (cs->values == 0) { return 0; }
@@ -477,8 +605,10 @@ fn rc_changeset_missing_required(cs: RcChangeset*) -> int32 {
   return -1;
 }
 
-// True when nothing has been refused and every dirty NOT NULL field has a
-// value. Pure: it records nothing.
+// True when the changeset can be applied: no error is recorded and every
+// changed NOT NULL field has a value. Records nothing.
+//   cs   the changeset; may be 0
+// Returns false for a 0 or dead changeset.
 export fn rc_changeset_valid(cs: RcChangeset*) -> bool {
   if (cs == 0) { return false; }
   if (cs->values == 0) { return false; }
@@ -487,16 +617,28 @@ export fn rc_changeset_valid(cs: RcChangeset*) -> bool {
   return true;
 }
 
+// The field index of the first recorded error.
+//   cs   the changeset; may be 0
+// Returns the index, or -1 when there is no error, the first error is on no
+// field, or cs is 0.
 export fn rc_changeset_error_field(cs: RcChangeset*) -> int32 {
   if (cs == 0) { return -1; }
   return cs->err_field;
 }
 
+// The code of the first recorded error, or why a dead changeset is dead.
+//   cs   the changeset; may be 0
+// Returns RC_OK when there is no error, the RC_ERR_* code otherwise, and
+// RC_ERR_USAGE when cs is 0.
 export fn rc_changeset_error_code(cs: RcChangeset*) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   return cs->err_code;
 }
 
+// The reason of the first recorded error, or why a dead changeset is dead.
+//   cs   the changeset; may be 0
+// Returns a borrowed string: "" when there is no error, "null changeset"
+// when cs is 0.
 export fn rc_changeset_error_reason(cs: RcChangeset*) -> string {
   if (cs == 0) { return "null changeset"; }
   return cs->err_reason;
@@ -504,19 +646,24 @@ export fn rc_changeset_error_reason(cs: RcChangeset*) -> string {
 
 // --- apply -------------------------------------------------------------------
 
-// Writes the dirty fields into e, in field order, through rc_entity_set — so
-// the range checks, the narrowing and the null bits stay in core/meta and this
-// phase does not re-implement them. A field whose bit is clear is not touched:
-// the model keeps whatever a concurrent writer left there.
-//
-// Consequences (pinned by the tests):
-//   - a RANGE from core/meta is returned unchanged with err_field set;
-//   - e->state becomes RC_ST_DIRTY only through rc_entity_set's CLEAN -> DIRTY
-//     rule, so a NEW entity stays NEW and a DELETED entity is refused;
-//   - an invalid changeset writes nothing and returns RC_ERR_USAGE;
-//   - the mask is NOT cleared on success: the caller still needs it to build
-//     the UPDATE column list. Apply does not rebase the baseline either — bind
-//     again if editing continues against the new values.
+// Copies the changed fields into the entity's model, in field order, without
+// touching the store. core/meta does the range check and narrowing for each
+// one. Unchanged fields are left alone. rc_repo_insert and rc_repo_update
+// call this for you.
+//   cs   the changeset; not changed on success (the change bits stay, and the
+//        bound row is not moved to the new values: bind again to keep editing)
+//   e    the entity to write into; NEW stays NEW, CLEAN becomes DIRTY
+// Returns RC_OK, or:
+//   RC_ERR_USAGE  cs or e is 0, cs is dead, or cs already has an error;
+//                 nothing is written or recorded
+//   RC_ERR_USAGE  e is DELETED ("entity is deleted"), or e is for another
+//                 table ("changeset and entity metadata disagree"), recorded
+//                 on field -1
+//   RC_ERR_USAGE  a changed NOT NULL field holds NULL; recorded on that field
+//                 as RC_ERR_CONSTRAINT "not null"
+//   the core/meta code (RC_ERR_RANGE when the value does not fit the model
+//   field, or RC_ERR_CAST), recorded on the field as "core/meta refused the
+//   write". All or nothing: on any error the model is not changed.
 export fn rc_changeset_apply(cs: RcChangeset*, e: RcEntity*) -> int32 {
   if (cs == 0 || e == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return RC_ERR_USAGE; }
@@ -537,51 +684,76 @@ export fn rc_changeset_apply(cs: RcChangeset*, e: RcEntity*) -> int32 {
     rc_changeset_note(cs, missing, RC_ERR_CONSTRAINT, "not null");
     return RC_ERR_USAGE;
   }
+  // All or nothing: write into a copy of the model, and keep it only when
+  // every field was accepted.
+  var size: int64 = (int64)e->meta.size;
+  var copy: rawptr = malloc(size);
+  if (copy == 0) { return rc_changeset_note(cs, -1, RC_ERR_NOMEM, "no memory"); }
+  defer free(copy);
+  memcpy(copy, e->model, size);
+  var nulls: uint64 = e->nulls;
   var i: int32 = 0;
   while (i < cs->meta.n_fields) {
     if (rc_nulls_has(cs->changes, i)) {
-      var rc: int32 = rc_entity_set_field(e, i, cs->values[i]);
+      var rc: int32 = rc_meta_set(e->meta, copy, &nulls, i, cs->values[i]);
       if (rc != RC_OK) {
         return rc_changeset_note(cs, i, rc, "core/meta refused the write");
       }
     }
     i = i + 1;
   }
+  memcpy(e->model, copy, size);
+  e->nulls = nulls;
+  if (e->state == RC_ST_CLEAN && cs->changes != (uint64)0) { e->state = RC_ST_DIRTY; }
   return RC_OK;
 }
 
 // --- save --------------------------------------------------------------------
 
-// Writes the dirty fields to the store as one UPDATE keyed by the primary key:
-// `UPDATE "t" SET <dirty columns> = ? WHERE "pk" = ?`. The entity must already
-// be in the store (CLEAN or DIRTY, with a key); a NEW one is inserted instead,
-// so it is refused here.
+// Saves the changed fields of a stored entity as one UPDATE keyed by its
+// primary key: UPDATE "t" SET <changed columns> = ? WHERE "pk" = ?. Apps call
+// rc_repo_update, which is this on the session's adapter.
 //
-// Order matters, and it is what keeps a refusal from leaving a half-written
-// model:
-//   1. the UPDATE is built from the mask first, so a mask query/ refuses (the
-//      primary key, a read-only field) is refused before the model changes;
-//   2. rc_changeset_apply writes the values through core/meta's range checks;
-//   3. the SET values are read back from the model, so the store gets exactly
-//      the narrowed values the model holds.
+// The UPDATE is built first, so a change query/ refuses (the primary key, a
+// read-only field) is refused before the model changes. Then the changes are
+// applied to the model (rc_changeset_apply) and the SET values are read back
+// from it, so the store gets exactly the narrowed values the model holds.
 //
-// Stale writes. A table with an RC_F_VERSION field is saved as
-//   UPDATE "t" SET <dirty> = ?, "version" = ? WHERE "pk" = ? AND "version" = ?
-// binding old + 1 and old. If another writer saved the row since this model
-// was read, its version moved on, nothing matches and the answer is
-// RC_ERR_CONFLICT: the other write is kept, not overwritten. On success the
-// model's version becomes old + 1. A table without one is last-writer-wins.
+// A table with an RC_F_VERSION field also sets "version" = old + 1 and adds
+// AND "version" = old, so a row someone saved since this model was read is
+// not overwritten (RC_ERR_CONFLICT). Without one, the last writer wins.
+// RC_F_UPDATED fields are set to core/clock's time on every save that writes.
 //
-// RC_F_UPDATED fields are set to core/clock's time on every save that writes
-// something; without a clock such a save is refused before anything changes.
-//
-// An empty changeset writes nothing and does not call the adapter. An adapter
-// failure is returned unchanged and the entity stays DIRTY: the model holds
-// the new values, the store does not. Zero affected rows is RC_ERR_CONFLICT
-// for a versioned table (stale, or deleted) and RC_ERR_NOT_FOUND otherwise
-// (deleted, or its key changed, since it was loaded). On success the entity is
-// CLEAN. The changeset is not reset; bind or reset it before the next round of
-// edits.
+//   a    the adapter to run on
+//   cs   the changes; not reset afterwards, so bind or reset it before the
+//        next round of edits
+//   e    the entity; must be CLEAN or DIRTY (loaded) and have a primary key
+// Returns RC_OK: nothing changed (no adapter call, e keeps its state), or the
+// row was written and e is CLEAN with its version at old + 1 and its
+// RC_F_UPDATED fields at the new time. Otherwise:
+//   RC_ERR_USAGE     a, cs or e is 0, cs is dead or already has an error;
+//                    nothing recorded
+//   RC_ERR_USAGE     e is NEW or DELETED ("entity is not in the store") or
+//                    has no key ("entity has no primary key"), recorded on
+//                    field -1
+//   query/'s code    the UPDATE was refused, recorded as "the update was
+//                    refused"
+//   the clock's code no clock for an RC_F_UPDATED table, recorded as "no
+//                    clock for the updated timestamp"
+//   RC_ERR_USAGE     the model's version is NULL, recorded on the version
+//                    field as "version is not set"
+//   RC_ERR_RANGE     the version is at int64 max, recorded on the version
+//                    field as "version is at its maximum"
+//   any code of rc_changeset_apply, recorded as it documents
+//   RC_ERR_CONFLICT  the store reports a duplicate key, recorded as "has
+//                    already been taken" (see rc_changeset_unique)
+//   RC_ERR_CONFLICT  versioned table and no row matched: changed or deleted
+//                    since it was loaded; recorded on the version field as
+//                    "was changed since it was read"
+//   RC_ERR_NOT_FOUND unversioned table and no row matched; not recorded
+//   any other adapter code, unchanged and not recorded
+// After a failure past the apply step, e is DIRTY: the model holds the new
+// values and the store does not.
 export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> int32 {
   if (a == 0 || cs == 0 || e == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return RC_ERR_USAGE; }
@@ -663,7 +835,9 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
   var affected: int32 = res.affected;
   rc_result_free(&res);
   if (affected == 0) {
-    if (vf >= 0) { return RC_ERR_CONFLICT; }
+    if (vf >= 0) {
+      return rc_changeset_note(cs, vf, RC_ERR_CONFLICT, "was changed since it was read");
+    }
     return RC_ERR_NOT_FOUND;
   }
   if (vf >= 0) {

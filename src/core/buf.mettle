@@ -1,16 +1,25 @@
 // flux_orm/core/buf.mettle — a growable byte buffer for statement text.
 //
 // Mettle's `+` on strings allocates a new string per operator, so building a
-// statement by concatenation is one allocation per token. This is one buffer,
-// one realloc growth policy, and an exact-length result view.
+// statement by concatenation is one allocation per token. RcBuf is one heap
+// block that grows by doubling.
 
 import "std/mem";
 import "std/conv";
 
 import "status";
 
+// A growable byte buffer. Owns `data`; release it with rc_buf_free.
+//   data   heap bytes, not NUL-terminated; 0 if allocation failed
+//   len    bytes written
+//   cap    bytes allocated
 export struct RcBuf { data: uint8*; len: int64; cap: int64; }
 
+// Makes an empty buffer.
+//   cap   initial capacity in bytes; values below 16 are raised to 16
+// Returns the buffer by value. On allocation failure `data` is 0 and `cap` is
+// 0; callers check `data` before use. The caller owns the block and frees it
+// with rc_buf_free.
 export fn rc_buf_new(cap: int64) -> RcBuf {
   var b: RcBuf;
   b.len = 0;
@@ -24,6 +33,9 @@ export fn rc_buf_new(cap: int64) -> RcBuf {
   return b;
 }
 
+// Frees the buffer's block and resets it to empty. Every view from
+// rc_buf_text is invalid afterwards.
+//   b   the buffer; 0 is ignored. Safe to call twice.
 export fn rc_buf_free(b: RcBuf*) {
   if (b == 0) { return; }
   if (b.data != 0) { free(b.data); }
@@ -32,6 +44,8 @@ export fn rc_buf_free(b: RcBuf*) {
   b.cap = 0;
 }
 
+// Empties the buffer but keeps its block for reuse.
+//   b   the buffer; 0 is ignored
 export fn rc_buf_clear(b: RcBuf*) {
   if (b == 0) { return; }
   b.len = 0;
@@ -52,6 +66,11 @@ fn rc_buf_reserve(b: RcBuf*, extra: int64) -> int32 {
   return RC_OK;
 }
 
+// Appends one byte.
+//   b   the buffer
+//   c   the byte
+// Returns RC_OK; RC_ERR_USAGE when `b` is 0; RC_ERR_NOMEM when growing fails
+// (the buffer is unchanged). Growing may move `data`.
 export fn rc_buf_putc(b: RcBuf*, c: uint8) -> int32 {
   var rc: int32 = rc_buf_reserve(b, 1);
   if (rc != RC_OK) { return rc; }
@@ -60,6 +79,11 @@ export fn rc_buf_putc(b: RcBuf*, c: uint8) -> int32 {
   return RC_OK;
 }
 
+// Appends the bytes of a string. The bytes are copied; `s` is only borrowed.
+//   b   the buffer
+//   s   text to append; empty is a no-op
+// Returns RC_OK; RC_ERR_USAGE when `b` is 0 or `s` has a length but no bytes;
+// RC_ERR_NOMEM when growing fails (the buffer is unchanged).
 export fn rc_buf_put(b: RcBuf*, s: string) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   var n: int64 = (int64)s.length;
@@ -72,6 +96,12 @@ export fn rc_buf_put(b: RcBuf*, s: string) -> int32 {
   return RC_OK;
 }
 
+// Appends an integer in decimal, with a leading '-' when negative. Handles
+// the int64 minimum.
+//   b   the buffer
+//   v   the value
+// Returns RC_OK; RC_ERR_USAGE when `b` is 0; RC_ERR_NOMEM when growing fails,
+// which can leave a partial number in the buffer.
 export fn rc_buf_put_i64(b: RcBuf*, v: int64) -> int32 {
   if (b == 0) { return RC_ERR_USAGE; }
   var tmp: uint8[24];
@@ -105,9 +135,14 @@ export fn rc_buf_put_i64(b: RcBuf*, v: int64) -> int32 {
   return RC_OK;
 }
 
-// Quotes an identifier with double quotes, doubling any embedded quote. MeoSQL
+// Appends an identifier in double quotes, doubling any embedded quote. MeoSQL
 // has no reserved-word list yet; quoting everything is the only safe default.
+//   b   the buffer
+//   s   table or column name; borrowed. An empty name writes "".
+// Returns RC_OK; RC_ERR_USAGE when `b` is 0; RC_ERR_NOMEM when growing fails,
+// which can leave a partial identifier in the buffer.
 export fn rc_buf_ident(b: RcBuf*, s: string) -> int32 {
+  if (s.length > (uint64)0 && s.chars == 0) { return RC_ERR_USAGE; }
   var rc: int32 = rc_buf_putc(b, (uint8)34);
   if (rc != RC_OK) { return rc; }
   var i: int64 = 0;
@@ -125,7 +160,10 @@ export fn rc_buf_ident(b: RcBuf*, s: string) -> int32 {
   return rc_buf_putc(b, (uint8)34);
 }
 
-// Borrowed view of the buffer's bytes. Valid until the next mutation or free.
+// The buffer's contents as a string.
+//   b   the buffer; 0 gives an empty string
+// Returns a borrowed view of exactly `len` bytes. It stays valid until the
+// next put (which may move the block), clear or free. Do not free it.
 export fn rc_buf_text(b: RcBuf*) -> string {
   if (b == 0) { return str_from_bytes((cstring)0, 0); }
   return str_from_bytes((cstring)b.data, b.len);

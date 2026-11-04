@@ -191,6 +191,36 @@ Every call returns an `RC_*` code (`src/core/status.mettle`). `rc_repo_one`
 expects exactly one row. Wrap related writes in
 `rc_session_begin`/`rc_session_commit`, or `rc_session_transaction`.
 
+## Reference
+
+Every exported function has a comment above it in `src/` with its inputs,
+what it returns and who owns what. This is the map of the calls an app uses.
+
+Conventions:
+- Every call returns an `RC_*` status (`src/core/status.mettle`): `RC_OK` or
+  an `RC_ERR_*` code. Results come back through out-parameters.
+- Columns and fields are named by their field name (or the column name from
+  the override table). Each such call has a `_field` twin that takes a field
+  index instead, for generated code.
+- Values (`RcValue`) passed in are borrowed: keep text alive until the call
+  that uses them has run. Query constructors report failure in the query's
+  `err`, and `rc_query_exec` returns it.
+
+| Area | Calls |
+|---|---|
+| Models | `rc_schema_field`, `rc_schema_meta`, `rc_schema_status` |
+| Session | `rc_session_new`, `rc_session_begin`, `rc_session_commit`, `rc_session_rollback`, `rc_session_transaction`, `rc_session_clear`, `rc_session_free` |
+| Repo | `rc_repo_insert`, `rc_repo_get`, `rc_repo_one`, `rc_repo_all` + `rc_rows_get`, `rc_repo_update`, `rc_repo_delete`, `rc_repo_update_all`, `rc_repo_delete_all`, `rc_repo_count`, `rc_repo_multi` |
+| Queries | `rc_query_select`, `rc_query_where`, `rc_query_where_in`, `rc_query_where_null`, `rc_query_where_not_null`, `rc_query_order_by`, `rc_query_limit`, `rc_query_offset`, `rc_query_join`, `rc_query_update_all` + `rc_query_set`, `rc_query_delete`, `rc_query_count`, `rc_query_free` |
+| Changesets | `rc_changeset_new`, `rc_changeset_bind`, `rc_changeset_cast`, `rc_changeset_put`, `rc_changeset_put_null`, `rc_changeset_changed`, `rc_changeset_unique`, `rc_changeset_valid`, `rc_changeset_error_count`, `rc_changeset_error_at`, `rc_changeset_free` |
+| Validations | `rc_validate_required`, `rc_validate_length`, `rc_validate_int`, `rc_validate_float`, `rc_validate_inclusion`, `rc_validate_change` |
+| Entities | `rc_entity_new`, `rc_entity_get`, `rc_entity_set`, `rc_entity_pk` |
+| Multi | `rc_multi_new`, `rc_multi_insert`, `rc_multi_update`, `rc_multi_delete`, `rc_multi_update_all`, `rc_multi_delete_all`, `rc_multi_run`, `rc_multi_failed_name`, `rc_multi_free` |
+| Relations | `rc_relation_has_many`, `rc_relation_belongs_to`, `rc_relation_has_many_through`, `rc_relation_load`, `rc_relation_group`, `rc_relation_count`, `rc_relation_hydrate`, `rc_relation_free` |
+| Migrations | `rc_migration_set`, `rc_migration_run`, `rc_migration_down`, `rc_migration_create`, `rc_migration_drop`, `rc_migration_add_column`, `rc_migration_create_index`, `rc_migration_drop_index` |
+| Adapters | `rc_meosql_adapter`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
+| Clock | `rc_clock_set`, `rc_clock_realtime_us` |
+
 ## Build and test
 
 flux_orm needs the head Mettle compiler. `mbuild.toml` has no toolchain pin,

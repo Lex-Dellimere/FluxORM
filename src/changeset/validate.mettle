@@ -1,13 +1,18 @@
 // flux_orm/changeset/validate.mettle — validations, after Ecto's validate_*.
 //
+//   rc_validate_required(&cs, "email");
+//   rc_validate_length(&cs, "name", 1, 80);
+//   if (!rc_changeset_valid(&cs)) { ... show rc_changeset_error_at ... }
+//
 // Each one checks a changed field and records an error on the changeset when
-// the value fails; nothing is refused at the call, so every validation runs and
-// every error is collected. A field that was not changed (or whose put was
-// refused) is skipped, except by rc_validate_required, which also looks at the
-// bound row. A NULL change is left to rc_validate_required.
+// the value fails, so you can run them all and collect every error. A field
+// that was not changed (or whose put was refused) is skipped, except by
+// rc_validate_required, which also looks at the bound row. A NULL change is
+// left to rc_validate_required.
 //
 // Every validation returns RC_OK when the value passes or was skipped, and the
-// recorded code otherwise.
+// recorded code otherwise. Every reason string is static. Each name form has
+// a `_field` twin that takes a 0-based field index, for generated code.
 
 import "../core/status";
 import "../core/value";
@@ -43,8 +48,10 @@ fn rc_validate_chars(s: string) -> int64 {
   return n;
 }
 
-// The field must have a value that is not NULL and not empty text, either as
-// a change or in the bound row. Error: RC_ERR_CONSTRAINT "can't be blank".
+// rc_validate_required by field index. Takes a 0-based field index for
+// generated code; apps use rc_validate_required, which documents the rules.
+// An index out of range is recorded as RC_ERR_USAGE "field index out of
+// range" and returned.
 export fn rc_validate_required_field(cs: RcChangeset*, field: int32) -> int32 {
   var rc: int32 = rc_validate_field_ok(cs, field);
   if (rc != RC_OK) { return rc; }
@@ -64,8 +71,9 @@ export fn rc_validate_required_field(cs: RcChangeset*, field: int32) -> int32 {
   return RC_OK;
 }
 
-// Text length in characters within [min, max]; -1 means no bound.
-// Errors: RC_ERR_RANGE "is too short" / "is too long".
+// rc_validate_length by field index. Takes a 0-based field index for
+// generated code; apps use rc_validate_length. An index out of range is
+// recorded as RC_ERR_USAGE "field index out of range" and returned.
 export fn rc_validate_length_field(cs: RcChangeset*, field: int32, min: int64,
                              max: int64) -> int32 {
   var rc: int32 = rc_validate_field_ok(cs, field);
@@ -86,7 +94,9 @@ export fn rc_validate_length_field(cs: RcChangeset*, field: int32, min: int64,
   return RC_OK;
 }
 
-// An integer within [lo, hi]. Errors: RC_ERR_RANGE "is too small" / "is too large".
+// rc_validate_int by field index. Takes a 0-based field index for generated
+// code; apps use rc_validate_int. An index out of range is recorded as
+// RC_ERR_USAGE "field index out of range" and returned.
 export fn rc_validate_int_field(cs: RcChangeset*, field: int32, lo: int64, hi: int64) -> int32 {
   var rc: int32 = rc_validate_field_ok(cs, field);
   if (rc != RC_OK) { return rc; }
@@ -101,7 +111,9 @@ export fn rc_validate_int_field(cs: RcChangeset*, field: int32, lo: int64, hi: i
   return RC_OK;
 }
 
-// A number within [lo, hi]; integers are compared as float64.
+// rc_validate_float by field index. Takes a 0-based field index for
+// generated code; apps use rc_validate_float. An index out of range is
+// recorded as RC_ERR_USAGE "field index out of range" and returned.
 export fn rc_validate_float_field(cs: RcChangeset*, field: int32, lo: float64,
                             hi: float64) -> int32 {
   var rc: int32 = rc_validate_field_ok(cs, field);
@@ -117,7 +129,9 @@ export fn rc_validate_float_field(cs: RcChangeset*, field: int32, lo: float64,
   return RC_OK;
 }
 
-// The value must equal one of `allowed`. Error: RC_ERR_CONSTRAINT "is invalid".
+// rc_validate_inclusion by field index. Takes a 0-based field index for
+// generated code; apps use rc_validate_inclusion. An index out of range is
+// recorded as RC_ERR_USAGE "field index out of range" and returned.
 export fn rc_validate_inclusion_field(cs: RcChangeset*, field: int32, allowed: RcValue*,
                                 n: int32) -> int32 {
   var rc: int32 = rc_validate_field_ok(cs, field);
@@ -133,9 +147,9 @@ export fn rc_validate_inclusion_field(cs: RcChangeset*, field: int32, allowed: R
   return rc_changeset_add_error_field(cs, field, RC_ERR_CONSTRAINT, "is invalid");
 }
 
-// A custom check, like Ecto's validate_change: `check(ctx, value)` answers
-// true when the value is fine; otherwise `reason` is recorded with
-// RC_ERR_CONSTRAINT. Use it for formats, since Mettle has no regex.
+// rc_validate_change by field index. Takes a 0-based field index for
+// generated code; apps use rc_validate_change. An index out of range is
+// recorded as RC_ERR_USAGE "field index out of range" and returned.
 export fn rc_validate_change_field(cs: RcChangeset*, field: int32,
                              check: fn(rawptr, RcValue) -> bool, ctx: rawptr,
                              reason: string) -> int32 {
@@ -149,9 +163,13 @@ export fn rc_validate_change_field(cs: RcChangeset*, field: int32,
 }
 
 // --- by field name -------------------------------------------------------------
-// What an app calls. An unknown name is recorded as RC_ERR_USAGE
-// "unknown field name" and returned.
+// What an app calls. `name` is a field name, or a column name if no field has
+// it. In each of these, an unknown name is recorded on field -1 as
+// RC_ERR_USAGE "unknown field name" and returned; a 0 changeset returns
+// RC_ERR_USAGE and a dead one its err_code, recording nothing.
 
+// The field index for `name`; -1 (recorded) when unknown, -2 when cs is 0 or
+// dead.
 fn rc_validate_find(cs: RcChangeset*, name: string) -> int32 {
   if (cs == 0 || cs->values == 0) { return -2; }
   var field: int32 = rc_meta_find(cs->meta, name);
@@ -159,30 +177,75 @@ fn rc_validate_find(cs: RcChangeset*, name: string) -> int32 {
   return field;
 }
 
+// Requires a value, like Ecto's validate_required: the field must be neither
+// NULL nor empty text, taking its change if it has one and the bound row's
+// value otherwise. With no change and no bound row it is blank.
+//   cs    the changeset
+//   name  the field
+// Returns RC_OK when it has a value, or when the field already has an error
+// (nothing more is recorded); RC_ERR_CONSTRAINT, recorded as "can't be
+// blank", when it is blank.
 export fn rc_validate_required(cs: RcChangeset*, name: string) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
   if (f == -1) { return RC_ERR_USAGE; }
   return rc_validate_required_field(cs, f);
 }
 
+// Checks a changed text field's length in characters (UTF-8 code points, not
+// bytes: "é" is one), like Ecto's validate_length.
+//   cs    the changeset
+//   name  the field
+//   min   fewest characters allowed, or -1 for no lower bound
+//   max   most characters allowed, or -1 for no upper bound
+// Returns RC_OK when it fits or was skipped (no change, or a NULL change);
+// otherwise records and returns RC_ERR_RANGE "is too short" or "is too
+// long", or RC_ERR_CAST "is not text" when the value is not RcText.
 export fn rc_validate_length(cs: RcChangeset*, name: string, min: int64, max: int64) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
   if (f == -1) { return RC_ERR_USAGE; }
   return rc_validate_length_field(cs, f, min, max);
 }
 
+// Checks that a changed integer field is within [lo, hi], inclusive. RcInt,
+// RcUint up to int64 max, RcBool (0 or 1) and RcTime count as integers.
+//   cs    the changeset
+//   name  the field
+//   lo    smallest value allowed
+//   hi    largest value allowed
+// Returns RC_OK when it fits or was skipped (no change, or a NULL change);
+// otherwise records and returns RC_ERR_RANGE "is too small" or "is too
+// large", or RC_ERR_CAST "is not an integer" for any other value.
 export fn rc_validate_int(cs: RcChangeset*, name: string, lo: int64, hi: int64) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
   if (f == -1) { return RC_ERR_USAGE; }
   return rc_validate_int_field(cs, f, lo, hi);
 }
 
+// Checks that a changed number field is within [lo, hi], inclusive. Integers
+// up to 2^53 in size are compared as float64.
+//   cs    the changeset
+//   name  the field
+//   lo    smallest value allowed
+//   hi    largest value allowed
+// Returns RC_OK when it fits or was skipped (no change, or a NULL change);
+// otherwise records and returns RC_ERR_RANGE "is too small" or "is too
+// large", or RC_ERR_CAST "is not a number" for a value that does not convert.
 export fn rc_validate_float(cs: RcChangeset*, name: string, lo: float64, hi: float64) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
   if (f == -1) { return RC_ERR_USAGE; }
   return rc_validate_float_field(cs, f, lo, hi);
 }
 
+// Checks that a changed field equals one of a list of values, like Ecto's
+// validate_inclusion. Values compare by arm and content (rc_value_same), so
+// RcInt(1) does not match RcUint(1).
+//   cs       the changeset
+//   name     the field
+//   allowed  array of n values; borrowed, read only during the call
+//   n        how many; 0 means nothing is allowed
+// Returns RC_OK when it matches or was skipped (no change, or a NULL change);
+// RC_ERR_CONSTRAINT, recorded as "is invalid", when it matches none;
+// RC_ERR_USAGE, not recorded, when allowed is 0 and n > 0.
 export fn rc_validate_inclusion(cs: RcChangeset*, name: string, allowed: RcValue*,
                                 n: int32) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
@@ -190,6 +253,18 @@ export fn rc_validate_inclusion(cs: RcChangeset*, name: string, allowed: RcValue
   return rc_validate_inclusion_field(cs, f, allowed, n);
 }
 
+// Runs your own check on a changed field, like Ecto's validate_change. Use it
+// for formats, since Mettle has no regex.
+//   cs      the changeset
+//   name    the field
+//   check   called as check(ctx, value); answers true when the value is fine.
+//           Not called when the field was skipped (no change, or NULL)
+//   ctx     passed through to check; may be 0
+//   reason  recorded on failure; borrowed and never freed, so use a literal
+//           or a string that outlives cs
+// Returns RC_OK when check passes or the field was skipped;
+// RC_ERR_CONSTRAINT, recorded with `reason`, when it fails; RC_ERR_USAGE,
+// not recorded, when check is 0.
 export fn rc_validate_change(cs: RcChangeset*, name: string,
                              check: fn(rawptr, RcValue) -> bool, ctx: rawptr,
                              reason: string) -> int32 {

@@ -299,7 +299,7 @@ fn check_schema() -> int32 {
   var m: RcMeta = rc_schema_meta(&WIDE, &wide_fields, "wide", "Wide", 520,
                                  (RcColumn*)0, 0);
   if (rc_schema_status(&WIDE) != RC_ERR_UNSUPPORTED) { return 2; }
-  if (m.n_fields != 65) { return 3; }
+  if (m.n_fields != 0) { return 3; }   // unusable, not truncated
   // The test models built with it are valid and keep their overrides.
   if (user_meta_status() != RC_OK) { return 4; }
   var u: RcMeta = user_meta();
