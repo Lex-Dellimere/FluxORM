@@ -1,4 +1,4 @@
-// tests/store_live: the RaStore contract (raize_auth/tests/store_test.mettle)
+// tests/store_live: the RaStores contract (raize_auth/tests/store_test.mettle)
 // against a real MeoDB server, through a flux_orm pool. Needs a server on
 // 127.0.0.1:5491 with an empty database; see README.md for the commands.
 
@@ -82,7 +82,7 @@ fn key_of(out: CrSha256*, secret: string) {
 
 // ---- threads ----
 
-var g_st: RaStore;
+var g_st: RaStores;
 var g_ids: int32[4];
 var g_bad: int32 = 0;
 
@@ -95,9 +95,9 @@ fn worker(arg: cstring) -> uint32 {
     make_token(&t, "rat_thr{id}_{k}", owner);
     t.created = (int64)k;
     ra_token_set_label(&t, "thread {id}");
-    if (ra_store_tok_put(&g_st, &t) != RA_OK) { atomic_inc_i32(&g_bad); }
+    if (ra_store_tok_put(g_st.tokens, &t) != RA_OK) { atomic_inc_i32(&g_bad); }
     var got: RaToken;
-    if (ra_store_tok_get(&g_st, &t.key[0], &got) != RA_OK) {
+    if (ra_store_tok_get(g_st.tokens, &t.key[0], &got) != RA_OK) {
       atomic_inc_i32(&g_bad);
     } else if (got.owner != owner || got.created != (int64)k) {
       atomic_inc_i32(&g_bad);
@@ -105,7 +105,7 @@ fn worker(arg: cstring) -> uint32 {
     k = k + 1;
   }
   var page: RaToken[32];
-  if (ra_store_tok_list(&g_st, owner, 0, &page[0], 32) != 25) { atomic_inc_i32(&g_bad); }
+  if (ra_store_tok_list(g_st.tokens, owner, 0, &page[0], 32) != 25) { atomic_inc_i32(&g_bad); }
   return 0;
 }
 
@@ -154,9 +154,10 @@ export fn main() -> int32 {
   ctx.users.owner = "id";
   ctx.users.hash = "pw_hash";
   ctx.users.disabled = "disabled";
-  var st: RaStore;
-  rfa_store_bind(&st, &ctx);
-  check("complete after bind", ra_store_complete(&st));
+  var st: RaStores;
+  rfa_stores_bind(&st, &ctx);
+  check("complete after bind", ra_store_cred_complete(st.creds) && ra_store_ctr_complete(st.counters)
+        && ra_store_tok_complete(st.tokens));
 
   // ---- tokens ----
   var t1: RaToken;
@@ -175,12 +176,12 @@ export fn main() -> int32 {
   check("label t2", ra_token_set_label(&t2, "laptop") == RA_OK);
   check("scope t3", ra_token_set_scope(&t3, "admin") == RA_OK);
   check("label t3", ra_token_set_label(&t3, "bob token") == RA_OK);
-  check("put t1", ra_store_tok_put(&st, &t1) == RA_OK);
-  check("put t2", ra_store_tok_put(&st, &t2) == RA_OK);
-  check("put t3", ra_store_tok_put(&st, &t3) == RA_OK);
+  check("put t1", ra_store_tok_put(st.tokens, &t1) == RA_OK);
+  check("put t2", ra_store_tok_put(st.tokens, &t2) == RA_OK);
+  check("put t3", ra_store_tok_put(st.tokens, &t3) == RA_OK);
 
   var got: RaToken;
-  check("get t1", ra_store_tok_get(&st, &t1.key[0], &got) == RA_OK);
+  check("get t1", ra_store_tok_get(st.tokens, &t1.key[0], &got) == RA_OK);
   check("get t1 key", memcmp((rawptr)&got.key[0], (rawptr)&t1.key[0], 32) == 0);
   check("get t1 owner", got.owner == 1);
   check("get t1 times", got.created == 10 && got.expires == 5000 && got.last_used == 11);
@@ -188,20 +189,20 @@ export fn main() -> int32 {
   check("get t1 scope", ra_token_scope(&got) == "publish yank");
   check("get t1 label", ra_token_label(&got) == "CI publish");
   var got3: RaToken;
-  check("get t3", ra_store_tok_get(&st, &t3.key[0], &got3) == RA_OK);
+  check("get t3", ra_store_tok_get(st.tokens, &t3.key[0], &got3) == RA_OK);
   check("get t3 owner", got3.owner == 2);
   check("get t3 scope", ra_token_scope(&got3) == "admin");
 
   var unknown: CrSha256;
   key_of(&unknown, "rat_unknown");
   var miss: RaToken;
-  check("get unknown", ra_store_tok_get(&st, &unknown.b[0], &miss) == RA_E_NOT_FOUND);
+  check("get unknown", ra_store_tok_get(st.tokens, &unknown.b[0], &miss) == RA_E_NOT_FOUND);
 
   var page: RaToken[4];
-  check("list owner 1 count", ra_store_tok_list(&st, 1, 0, &page[0], 4) == 2);
+  check("list owner 1 count", ra_store_tok_list(st.tokens, 1, 0, &page[0], 4) == 2);
   check("list owner 1 order", page[0].created == 10 && page[1].created == 20);
-  check("list owner 2 count", ra_store_tok_list(&st, 2, 0, &page[0], 4) == 1);
-  check("list unknown owner", ra_store_tok_list(&st, 77, 0, &page[0], 4) == 0);
+  check("list owner 2 count", ra_store_tok_list(st.tokens, 2, 0, &page[0], 4) == 1);
+  check("list unknown owner", ra_store_tok_list(st.tokens, 77, 0, &page[0], 4) == 0);
 
   // put of the same key replaces; count stays the same.
   var t1b: RaToken;
@@ -210,29 +211,29 @@ export fn main() -> int32 {
   t1b.revoked = 1;
   check("scope t1b", ra_token_set_scope(&t1b, "publish") == RA_OK);
   check("label t1b", ra_token_set_label(&t1b, "renamed") == RA_OK);
-  check("put t1 again", ra_store_tok_put(&st, &t1b) == RA_OK);
-  check("list after replace", ra_store_tok_list(&st, 1, 0, &page[0], 4) == 2);
+  check("put t1 again", ra_store_tok_put(st.tokens, &t1b) == RA_OK);
+  check("list after replace", ra_store_tok_list(st.tokens, 1, 0, &page[0], 4) == 2);
   var got1b: RaToken;
-  check("get replaced", ra_store_tok_get(&st, &t1.key[0], &got1b) == RA_OK);
+  check("get replaced", ra_store_tok_get(st.tokens, &t1.key[0], &got1b) == RA_OK);
   check("replaced scope", ra_token_scope(&got1b) == "publish");
   check("replaced label", ra_token_label(&got1b) == "renamed");
   check("replaced revoked", got1b.revoked == 1 && got1b.expires == 0);
 
   // ---- tok_list paging ----
   var one: RaToken[1];
-  check("page cap1 skip0", ra_store_tok_list(&st, 1, 0, &one[0], 1) == 1);
+  check("page cap1 skip0", ra_store_tok_list(st.tokens, 1, 0, &one[0], 1) == 1);
   check("page skip0 is t1", one[0].created == 10);
-  check("page cap1 skip1", ra_store_tok_list(&st, 1, 1, &one[0], 1) == 1);
+  check("page cap1 skip1", ra_store_tok_list(st.tokens, 1, 1, &one[0], 1) == 1);
   check("page skip1 is t2", one[0].created == 20);
-  check("page cap1 skip2", ra_store_tok_list(&st, 1, 2, &one[0], 1) == 0);
-  check("list cap 0 is USAGE", ra_store_tok_list(&st, 1, 0, &one[0], 0) == RA_E_USAGE);
-  check("list skip -1 is USAGE", ra_store_tok_list(&st, 1, -1, &one[0], 1) == RA_E_USAGE);
+  check("page cap1 skip2", ra_store_tok_list(st.tokens, 1, 2, &one[0], 1) == 0);
+  check("list cap 0 is USAGE", ra_store_tok_list(st.tokens, 1, 0, &one[0], 0) == RA_E_USAGE);
+  check("list skip -1 is USAGE", ra_store_tok_list(st.tokens, 1, -1, &one[0], 1) == RA_E_USAGE);
 
   // ---- delete ----
-  check("del t2", ra_store_tok_del(&st, &t2.key[0]) == RA_OK);
-  check("get after del", ra_store_tok_get(&st, &t2.key[0], &miss) == RA_E_NOT_FOUND);
-  check("del again", ra_store_tok_del(&st, &t2.key[0]) == RA_E_NOT_FOUND);
-  check("list after del", ra_store_tok_list(&st, 1, 0, &page[0], 4) == 1);
+  check("del t2", ra_store_tok_del(st.tokens, &t2.key[0]) == RA_OK);
+  check("get after del", ra_store_tok_get(st.tokens, &t2.key[0], &miss) == RA_E_NOT_FOUND);
+  check("del again", ra_store_tok_del(st.tokens, &t2.key[0]) == RA_E_NOT_FOUND);
+  check("list after del", ra_store_tok_list(st.tokens, 1, 0, &page[0], 4) == 1);
 
   // ---- counters ----
   var ck: CrSha256;
@@ -242,68 +243,68 @@ export fn main() -> int32 {
   c.failures = 3;
   c.window_start = 1000;
   c.locked_until = 2000;
-  check("ctr put", ra_store_ctr_put(&st, &c) == RA_OK);
+  check("ctr put", ra_store_ctr_put(st.counters, &c) == RA_OK);
   var cg: RaCounter;
-  check("ctr get", ra_store_ctr_get(&st, &ck.b[0], &cg) == RA_OK);
+  check("ctr get", ra_store_ctr_get(st.counters, &ck.b[0], &cg) == RA_OK);
   check("ctr key", memcmp((rawptr)&cg.key[0], (rawptr)&ck.b[0], 32) == 0);
   check("ctr failures", cg.failures == 3);
   check("ctr window_start", cg.window_start == 1000);
   check("ctr locked_until", cg.locked_until == 2000);
   c.failures = 4;
-  check("ctr put replace", ra_store_ctr_put(&st, &c) == RA_OK);
-  check("ctr get replaced", ra_store_ctr_get(&st, &ck.b[0], &cg) == RA_OK && cg.failures == 4);
-  check("ctr del", ra_store_ctr_del(&st, &ck.b[0]) == RA_OK);
-  check("ctr get after del", ra_store_ctr_get(&st, &ck.b[0], &cg) == RA_E_NOT_FOUND);
-  check("ctr del again", ra_store_ctr_del(&st, &ck.b[0]) == RA_E_NOT_FOUND);
+  check("ctr put replace", ra_store_ctr_put(st.counters, &c) == RA_OK);
+  check("ctr get replaced", ra_store_ctr_get(st.counters, &ck.b[0], &cg) == RA_OK && cg.failures == 4);
+  check("ctr del", ra_store_ctr_del(st.counters, &ck.b[0]) == RA_OK);
+  check("ctr get after del", ra_store_ctr_get(st.counters, &ck.b[0], &cg) == RA_E_NOT_FOUND);
+  check("ctr del again", ra_store_ctr_del(st.counters, &ck.b[0]) == RA_E_NOT_FOUND);
 
   // ---- credentials ----
   var cred: RaCredential;
-  check("cred ada", ra_store_cred_get(&st, "ada", &cred) == RA_OK);
+  check("cred ada", ra_store_cred_get(st.creds, "ada", &cred) == RA_OK);
   check("cred ada owner", cred.owner == ada_id);
   check("cred ada enabled", cred.disabled == 0);
   check("cred ada no password", !ra_password_verify(&cred.hash, "correct horse"));
   var cred_bob: RaCredential;
-  check("cred bob", ra_store_cred_get(&st, "bob", &cred_bob) == RA_OK);
+  check("cred bob", ra_store_cred_get(st.creds, "bob", &cred_bob) == RA_OK);
   check("cred bob owner", cred_bob.owner == bob_id);
   check("cred bob disabled", cred_bob.disabled == 1);
-  check("cred nobody", ra_store_cred_get(&st, "nobody", &cred) == RA_E_NOT_FOUND);
-  check("cred empty login", ra_store_cred_get(&st, "", &cred) == RA_E_USAGE);
+  check("cred nobody", ra_store_cred_get(st.creds, "nobody", &cred) == RA_E_NOT_FOUND);
+  check("cred empty login", ra_store_cred_get(st.creds, "", &cred) == RA_E_USAGE);
 
   var h: CrPwHash;
   check("hash pw", ra_password_hash(&h, "correct horse", CR_PW_INTERACTIVE) == RA_OK);
-  check("set_hash ada", ra_store_cred_set_hash(&st, ada_id, &h) == RA_OK);
+  check("set_hash ada", ra_store_cred_set_hash(st.creds, ada_id, &h) == RA_OK);
   var cred2: RaCredential;
-  check("cred ada again", ra_store_cred_get(&st, "ada", &cred2) == RA_OK);
+  check("cred ada again", ra_store_cred_get(st.creds, "ada", &cred2) == RA_OK);
   check("cred owner kept", cred2.owner == ada_id);
   check("hash round-trips", memcmp((rawptr)&cred2.hash, (rawptr)&h, (int64)sizeof(CrPwHash)) == 0);
   check("stored hash verifies", ra_password_verify(&cred2.hash, "correct horse"));
   check("stored hash rejects wrong", !ra_password_verify(&cred2.hash, "correct horsf"));
-  check("set_hash owner 99", ra_store_cred_set_hash(&st, 99, &h) == RA_E_NOT_FOUND);
+  check("set_hash owner 99", ra_store_cred_set_hash(st.creds, 99, &h) == RA_E_NOT_FOUND);
 
   // ---- prune: clear tokens first so the count is exact ----
-  check("del t1", ra_store_tok_del(&st, &t1.key[0]) == RA_OK);
-  check("del t3", ra_store_tok_del(&st, &t3.key[0]) == RA_OK);
+  check("del t1", ra_store_tok_del(st.tokens, &t1.key[0]) == RA_OK);
+  check("del t3", ra_store_tok_del(st.tokens, &t3.key[0]) == RA_OK);
   var now: int64 = 1000000;
   var pr: RaToken;
   make_token(&pr, "rat_revoked", 1);
   pr.revoked = 1;
-  check("prune put revoked", ra_store_tok_put(&st, &pr) == RA_OK);
+  check("prune put revoked", ra_store_tok_put(st.tokens, &pr) == RA_OK);
   var pe: RaToken;
   make_token(&pe, "rat_expired", 1);
   pe.expires = now - 1;
-  check("prune put expired", ra_store_tok_put(&st, &pe) == RA_OK);
+  check("prune put expired", ra_store_tok_put(st.tokens, &pe) == RA_OK);
   var pn: RaToken;
   make_token(&pn, "rat_expires_now", 1);
   pn.expires = now;
-  check("prune put expires now", ra_store_tok_put(&st, &pn) == RA_OK);
+  check("prune put expires now", ra_store_tok_put(st.tokens, &pn) == RA_OK);
   var pl: RaToken;
   make_token(&pl, "rat_live", 1);
   pl.expires = 0;
-  check("prune put live", ra_store_tok_put(&st, &pl) == RA_OK);
+  check("prune put live", ra_store_tok_put(st.tokens, &pl) == RA_OK);
   var pf: RaToken;
   make_token(&pf, "rat_future", 1);
   pf.expires = now + 1;
-  check("prune put future", ra_store_tok_put(&st, &pf) == RA_OK);
+  check("prune put future", ra_store_tok_put(st.tokens, &pf) == RA_OK);
 
   var sk: CrSha256;
   key_of(&sk, "stale");
@@ -312,7 +313,7 @@ export fn main() -> int32 {
   cs.failures = 2;
   cs.window_start = now - 5000;
   cs.locked_until = 0;
-  check("prune put stale ctr", ra_store_ctr_put(&st, &cs) == RA_OK);
+  check("prune put stale ctr", ra_store_ctr_put(st.counters, &cs) == RA_OK);
   var lk: CrSha256;
   key_of(&lk, "locked");
   var cl: RaCounter;
@@ -320,27 +321,27 @@ export fn main() -> int32 {
   cl.failures = 9;
   cl.window_start = now - 5000;
   cl.locked_until = now + 100;
-  check("prune put locked ctr", ra_store_ctr_put(&st, &cl) == RA_OK);
+  check("prune put locked ctr", ra_store_ctr_put(st.counters, &cl) == RA_OK);
   var fk: CrSha256;
   key_of(&fk, "fresh");
   var cf: RaCounter;
   memcpy((rawptr)&cf.key[0], (rawptr)&fk.b[0], 32);
   cf.failures = 1;
   cf.window_start = now;
-  check("prune put fresh ctr", ra_store_ctr_put(&st, &cf) == RA_OK);
+  check("prune put fresh ctr", ra_store_ctr_put(st.counters, &cf) == RA_OK);
 
-  check("prune removes exactly 4", ra_store_prune(&st, now, now) == 4);
+  check("prune removes exactly 4", ra_store_tok_prune(st.tokens, now) + ra_store_ctr_prune(st.counters, now, now) == 4);
   var chk: RaToken;
-  check("prune keeps live token", ra_store_tok_get(&st, &pl.key[0], &chk) == RA_OK);
-  check("prune keeps future token", ra_store_tok_get(&st, &pf.key[0], &chk) == RA_OK);
-  check("prune dropped revoked", ra_store_tok_get(&st, &pr.key[0], &chk) == RA_E_NOT_FOUND);
-  check("prune dropped expired", ra_store_tok_get(&st, &pe.key[0], &chk) == RA_E_NOT_FOUND);
-  check("prune dropped expires now", ra_store_tok_get(&st, &pn.key[0], &chk) == RA_E_NOT_FOUND);
+  check("prune keeps live token", ra_store_tok_get(st.tokens, &pl.key[0], &chk) == RA_OK);
+  check("prune keeps future token", ra_store_tok_get(st.tokens, &pf.key[0], &chk) == RA_OK);
+  check("prune dropped revoked", ra_store_tok_get(st.tokens, &pr.key[0], &chk) == RA_E_NOT_FOUND);
+  check("prune dropped expired", ra_store_tok_get(st.tokens, &pe.key[0], &chk) == RA_E_NOT_FOUND);
+  check("prune dropped expires now", ra_store_tok_get(st.tokens, &pn.key[0], &chk) == RA_E_NOT_FOUND);
   var cchk: RaCounter;
-  check("prune keeps locked ctr", ra_store_ctr_get(&st, &lk.b[0], &cchk) == RA_OK);
-  check("prune keeps fresh ctr", ra_store_ctr_get(&st, &fk.b[0], &cchk) == RA_OK);
-  check("prune dropped stale ctr", ra_store_ctr_get(&st, &sk.b[0], &cchk) == RA_E_NOT_FOUND);
-  check("prune again removes none", ra_store_prune(&st, now, now) == 0);
+  check("prune keeps locked ctr", ra_store_ctr_get(st.counters, &lk.b[0], &cchk) == RA_OK);
+  check("prune keeps fresh ctr", ra_store_ctr_get(st.counters, &fk.b[0], &cchk) == RA_OK);
+  check("prune dropped stale ctr", ra_store_ctr_get(st.counters, &sk.b[0], &cchk) == RA_E_NOT_FOUND);
+  check("prune again removes none", ra_store_tok_prune(st.tokens, now) + ra_store_ctr_prune(st.counters, now, now) == 0);
 
   // ---- four threads, two sessions ----
   g_st = st;

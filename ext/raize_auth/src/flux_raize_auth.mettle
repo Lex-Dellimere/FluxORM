@@ -1,4 +1,4 @@
-// flux_raize_auth: raize_auth's storage contract (RaStore) on flux_orm.
+// flux_raize_auth: raize_auth's storage contract (RaStores: credentials, counters, tokens) on flux_orm.
 //
 // Tokens and lockout counters live in two tables of their own, ra_tokens and
 // ra_counters (rfa_migration creates them). Credentials stay in the app's user
@@ -15,8 +15,8 @@
 //   ctx.users.owner = "id";
 //   ctx.users.hash = "password_hash";
 //   ctx.users.disabled = "";
-//   var st: RaStore;
-//   rfa_store_bind(&st, &ctx);
+//   var stores: RaStores;
+//   rfa_stores_bind(&stores, &ctx);           // then ra_auth_init(&a, &cfg, &stores)
 //
 // Rows are read cell by cell from RcResult, never into a model: a flux model
 // cannot hold the 32-byte BLOB keys.
@@ -42,11 +42,15 @@ export struct RfaUsers {
   disabled: string;
 }
 
-// The store's context: what RaStore.ctx points at. The app owns it and the
-// pool, and keeps both alive while the store is in use.
+// The backend's context: what each store's ctx points at. It also holds the
+// three stores rfa_stores_bind fills. The app owns it and the pool, and keeps
+// both alive (and in place) while the stores are in use.
 export struct RfaStore {
-  pool: RcPool*;   // borrowed
+  pool: RcPool*;              // borrowed
   users: RfaUsers;
+  creds: RaCredStore;         // filled by rfa_stores_bind
+  counters: RaCounterStore;
+  tokens: RaTokenStore;
 }
 
 // --- tables ------------------------------------------------------------------
@@ -438,9 +442,31 @@ fn rfa_cred_set_hash(ctx: rawptr, owner: int64, h: CrPwHash*) -> int32 {
 
 // --- prune -------------------------------------------------------------------
 
-fn rfa_prune_all(s: RcSession*, now: int64, counter_before: int64, total: int32*) -> int32 {
+// Runs body(s, now, before, &total) in one IMMEDIATE transaction on a pooled
+// session. Returns rows removed, or an RA_E_* code.
+fn rfa_prune_tx(ctx: rawptr, now: int64, before: int64,
+                body: fn(RcSession*, int64, int64, int32*) -> int32 with alloc, syscall) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var total: int32 = 0;
+  rc = rc_session_begin(s, RC_TX_IMMEDIATE);
+  if (rc == RC_OK) {
+    rc = body(s, now, before, &total);
+    if (rc == RC_OK) {
+      rc = rc_session_commit(s);
+    } else {
+      rc_session_rollback(s);
+    }
+  }
+  rfa_checkin(ctx, s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  return total;
+}
+
+// Deletes revoked tokens and tokens with 0 < expires <= now.
+fn rfa_tok_prune_in(s: RcSession*, now: int64, before: int64, total: int32*) -> int32 {
   var tf: RcField[8];
-  var cf: RcField[4];
   var n: int32 = 0;
   var q1: RcQuery = rc_query_delete(rfa_tok_meta(&tf[0]));
   rc_query_where(&q1, "revoked", RC_CMP_EQ, RcInt(1));
@@ -457,63 +483,63 @@ fn rfa_prune_all(s: RcSession*, now: int64, counter_before: int64, total: int32*
   rc_query_free(&q2);
   if (rc != RC_OK) { return rc; }
   *total = *total + n;
-
-  n = 0;
-  var q3: RcQuery = rc_query_delete(rfa_ctr_meta(&cf[0]));
-  rc_query_where(&q3, "locked_until", RC_CMP_LE, RcInt(now));
-  rc_query_where(&q3, "window_start", RC_CMP_LT, RcInt(counter_before));
-  rc = rfa_run(&q3, s, &n);
-  rc_query_free(&q3);
-  if (rc != RC_OK) { return rc; }
-  *total = *total + n;
   return RC_OK;
 }
 
-fn rfa_prune(ctx: rawptr, now: int64, counter_before: int64) -> int32 {
-  var s: RcSession* = 0;
-  var rc: int32 = rfa_checkout(ctx, &s);
-  if (rc != RC_OK) { return rfa_code(rc); }
-  var total: int32 = 0;
-  rc = rc_session_begin(s, RC_TX_IMMEDIATE);
-  if (rc == RC_OK) {
-    rc = rfa_prune_all(s, now, counter_before, &total);
-    if (rc == RC_OK) {
-      rc = rc_session_commit(s);
-    } else {
-      rc_session_rollback(s);
-    }
-  }
-  rfa_checkin(ctx, s);
-  if (rc != RC_OK) { return rfa_code(rc); }
-  return total;
+// Deletes counters with locked_until <= now and window_start < before.
+fn rfa_ctr_prune_in(s: RcSession*, now: int64, before: int64, total: int32*) -> int32 {
+  var cf: RcField[4];
+  var n: int32 = 0;
+  var q: RcQuery = rc_query_delete(rfa_ctr_meta(&cf[0]));
+  rc_query_where(&q, "locked_until", RC_CMP_LE, RcInt(now));
+  rc_query_where(&q, "window_start", RC_CMP_LT, RcInt(before));
+  var rc: int32 = rfa_run(&q, s, &n);
+  rc_query_free(&q);
+  if (rc == RC_OK) { *total = *total + n; }
+  return rc;
+}
+
+fn rfa_tok_prune(ctx: rawptr, now: int64) -> int32 {
+  return rfa_prune_tx(ctx, now, 0, &rfa_tok_prune_in);
+}
+
+fn rfa_ctr_prune(ctx: rawptr, now: int64, before: int64) -> int32 {
+  return rfa_prune_tx(ctx, now, before, &rfa_ctr_prune_in);
 }
 
 // --- public ------------------------------------------------------------------
 
-// Points a raize_auth store at this backend: sets st.ctx and all ten
-// functions. Each function checks a session out of ctx.pool (waiting up to
-// 5 s), so the store is safe from any thread.
-//   st   the store to fill
-//   ctx  the context; borrowed, must outlive every call through st
-// Returns nothing; a 0 st or ctx is ignored.
+// Points raize_auth at this backend: fills ctx's three stores (credentials,
+// counters, tokens) and sets stores to them, ready for ra_auth_init. Each
+// function checks a session out of ctx.pool (waiting up to 5 s), so the
+// stores are safe from any thread.
+//   stores  the bundle to fill
+//   ctx     the context; borrowed, must outlive every call and stay in place
+// Returns nothing; a 0 stores or ctx is ignored.
 // The functions return RA_OK, RA_E_NOT_FOUND, RA_E_NOMEM, or RA_E_STORE for
-// anything else (a busy pool included). cred_set_hash writes the hash with
+// anything else (a busy pool included). cred set_hash writes the hash with
 // flux's update_all: a user table with an RC_F_VERSION column is refused
 // (RA_E_STORE), and RC_F_UPDATED columns are stamped from rc_clock_set's
 // clock, which must then be installed.
-export fn rfa_store_bind(st: RaStore*, ctx: RfaStore*) {
-  if (st == 0 || ctx == 0) { return; }
-  st->ctx = (rawptr)ctx;
-  st->tok_put = &rfa_tok_put;
-  st->tok_get = &rfa_tok_get;
-  st->tok_del = &rfa_tok_del;
-  st->tok_list = &rfa_tok_list;
-  st->ctr_get = &rfa_ctr_get;
-  st->ctr_put = &rfa_ctr_put;
-  st->ctr_del = &rfa_ctr_del;
-  st->cred_get = &rfa_cred_get;
-  st->cred_set_hash = &rfa_cred_set_hash;
-  st->prune = &rfa_prune;
+export fn rfa_stores_bind(stores: RaStores*, ctx: RfaStore*) {
+  if (stores == 0 || ctx == 0) { return; }
+  ctx->creds.ctx = (rawptr)ctx;
+  ctx->creds.get = &rfa_cred_get;
+  ctx->creds.set_hash = &rfa_cred_set_hash;
+  ctx->counters.ctx = (rawptr)ctx;
+  ctx->counters.get = &rfa_ctr_get;
+  ctx->counters.put = &rfa_ctr_put;
+  ctx->counters.del = &rfa_ctr_del;
+  ctx->counters.prune = &rfa_ctr_prune;
+  ctx->tokens.ctx = (rawptr)ctx;
+  ctx->tokens.put = &rfa_tok_put;
+  ctx->tokens.get = &rfa_tok_get;
+  ctx->tokens.del = &rfa_tok_del;
+  ctx->tokens.list = &rfa_tok_list;
+  ctx->tokens.prune = &rfa_tok_prune;
+  stores->creds = &ctx->creds;
+  stores->counters = &ctx->counters;
+  stores->tokens = &ctx->tokens;
 }
 
 fn rfa_up(a: RcAdapter*) -> int32 {

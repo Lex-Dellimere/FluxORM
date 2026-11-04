@@ -1,6 +1,6 @@
 # flux_raize_auth
 
-A [raize_auth](../../../raize_auth) store (`RaStore`) on flux_orm and MeoDB.
+A [raize_auth](../../../raize_auth) storage backend (`RaStores`: credentials, counters, tokens) on flux_orm and MeoDB.
 API tokens and lockout counters get two tables of their own; passwords stay
 in the app's user table.
 
@@ -42,11 +42,11 @@ ctx.users.login = "email";     // looked up by cred_get
 ctx.users.owner = "id";        // the user id raize_auth sees
 ctx.users.hash = "password_hash";
 ctx.users.disabled = "";       // or a bool/int column
-var st: RaStore;
-rfa_store_bind(&st, &ctx);
+var stores: RaStores;
+rfa_stores_bind(&stores, &ctx);   // then ra_auth_init(&a, &cfg, &stores)
 ```
 
-`ctx` and the pool must outlive every call through `st`. Each call checks a
+`ctx` and the pool must outlive every call through `stores`. Each call checks a
 session out of the pool (waiting up to 5 s) and back in, so one store can be
 shared by all threads.
 
@@ -78,7 +78,7 @@ Every function answers `RA_OK`, `RA_E_NOT_FOUND`, `RA_E_NOMEM` or
 
 ## Test
 
-`tests/store_live.mettle` runs the RaStore contract and a four-thread smoke
+`tests/store_live.mettle` runs the RaStores contract and a four-thread smoke
 test against a real server. It is a test program (`mb_test_bin`), so mbuild
 links libsodium for it; with no server on 127.0.0.1:5491 it prints SKIP and
 passes. From this directory:
