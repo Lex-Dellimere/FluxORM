@@ -27,12 +27,18 @@ import "../adapter/adapter";
 
 // One connection's session. Make it with rc_session_new and release it with
 // rc_session_free.
+// Something the session owns until rc_session_clear: `release(p)` frees it.
+export struct RcHeld {
+  p: rawptr;
+  release: fn(rawptr) -> void;
+}
+
 export struct RcSession {
   adapter: RcAdapter*;
   depth: int32;   // 0 = no transaction open; 1 = the adapter's transaction
   doomed: bool;   // an inner level rolled back: the outer commit rolls back
   mode: int32;    // RC_TX_* of the outermost begin
-  kept: RcResult**; // results loaded models point into, owned
+  kept: RcHeld*;   // results loaded models point into, owned
   // number of entries in `kept`
   n_kept: int32;
   // allocated length of `kept`
@@ -56,6 +62,36 @@ export fn rc_session_new(a: RcAdapter*) -> RcSession {
   return s;
 }
 
+// Hands the session an object to free at rc_session_clear: anything that
+// loaded models point into (results, preloaded relations).
+//   s        the session
+//   p        the owned object; the session calls release(p) once
+//   release  frees p, including p itself
+// Returns RC_OK; RC_ERR_USAGE when s, p or release is 0; RC_ERR_NOMEM when
+// the session cannot grow, in which case p is still yours.
+export fn rc_session_hold(s: RcSession*, p: rawptr,
+                          release: fn(rawptr) -> void) -> int32 {
+  if (s == 0 || p == 0 || release == 0) { return RC_ERR_USAGE; }
+  if (s->n_kept == s->cap_kept) {
+    var cap: int32 = s->cap_kept * 2;
+    if (cap < 8) { cap = 8; }
+    var q: rawptr = realloc((rawptr)s->kept, (int64)cap * (int64)sizeof(RcHeld));
+    if (q == 0) { return RC_ERR_NOMEM; }
+    s->kept = (RcHeld*)q;
+    s->cap_kept = cap;
+  }
+  s->kept[s->n_kept].p = p;
+  s->kept[s->n_kept].release = release;
+  s->n_kept = s->n_kept + 1;
+  return RC_OK;
+}
+
+fn rc_session_release_result(p: rawptr) {
+  var r: RcResult* = (RcResult*)p;
+  rc_result_free(r);
+  free(p);
+}
+
 // Moves a result into the session so models loaded from it stay valid.
 //   s     the session
 //   res   an owned result; on success it is left empty (nothing to free)
@@ -65,33 +101,27 @@ export fn rc_session_new(a: RcAdapter*) -> RcSession {
 // session cannot grow, in which case `*res` is untouched and still yours.
 export fn rc_session_keep(s: RcSession*, res: RcResult*, out: RcResult**) -> int32 {
   if (s == 0 || res == 0 || out == 0) { return RC_ERR_USAGE; }
-  if (s->n_kept == s->cap_kept) {
-    var cap: int32 = s->cap_kept * 2;
-    if (cap < 8) { cap = 8; }
-    var p: rawptr = realloc((rawptr)s->kept, (int64)cap * (int64)sizeof(RcResult*));
-    if (p == 0) { return RC_ERR_NOMEM; }
-    s->kept = (RcResult**)p;
-    s->cap_kept = cap;
-  }
   var r: RcResult* = malloc(sizeof(RcResult));
   if (r == 0) { return RC_ERR_NOMEM; }
   *r = *res;
+  var rc: int32 = rc_session_hold(s, (rawptr)r, &rc_session_release_result);
+  if (rc != RC_OK) {
+    free((rawptr)r);
+    return rc;
+  }
   rc_result_init(res);
-  s->kept[s->n_kept] = r;
-  s->n_kept = s->n_kept + 1;
   *out = r;
   return RC_OK;
 }
 
-// Frees every kept result. Models loaded through this session are invalid
-// afterwards; the session itself stays usable.
+// Frees everything the session holds. Models loaded through this session are
+// invalid afterwards; the session itself stays usable.
 //   s   the session; 0 is ignored
 export fn rc_session_clear(s: RcSession*) {
   if (s == 0) { return; }
   var i: int32 = 0;
   while (i < s->n_kept) {
-    rc_result_free(s->kept[i]);
-    free(s->kept[i]);
+    s->kept[i].release(s->kept[i].p);
     i = i + 1;
   }
   s->n_kept = 0;
@@ -110,7 +140,7 @@ export fn rc_session_free(s: RcSession*) {
   s->cap_kept = 0;
 }
 
-// Number of results the session is keeping; 0 when `s` is 0.
+// Number of objects the session is holding; 0 when `s` is 0.
 export fn rc_session_kept(s: RcSession*) -> int32 {
   if (s == 0) { return 0; }
   return s->n_kept;

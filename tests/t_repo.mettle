@@ -286,6 +286,87 @@ fn check_bulk() -> int32 {
   return 0;
 }
 
+// --- 6. preload: one statement for all owners ------------------------------------
+
+fn check_preload() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+
+  if (push_users(a) != RC_OK) { return 2; }
+  var q: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&q);
+  var users: RcRows;
+  if (rc_repo_all(&s, &q, &users) != RC_OK || users.n != 2) { return 3; }
+
+  // Posts 10 and 11 belong to user 1, post 12 to user 2.
+  var posts: RcValue[15];
+  posts[0] = RcInt(10);
+  posts[1] = RcInt(1);
+  posts[2] = RcText("a");
+  posts[3] = RcNull;
+  posts[4] = RcNull;
+  posts[5] = RcInt(11);
+  posts[6] = RcInt(1);
+  posts[7] = RcText("b");
+  posts[8] = RcNull;
+  posts[9] = RcNull;
+  posts[10] = RcInt(12);
+  posts[11] = RcInt(2);
+  posts[12] = RcText("c");
+  posts[13] = RcNull;
+  posts[14] = RcNull;
+  if (rc_mem_push_rows(a, &posts[0], 3, 5) != RC_OK) { return 4; }
+  var has_posts: RcRelation = rc_relation_has_many("posts", user_meta(), "id", post_meta(),
+                                                   "user_id");
+  var pre: RcPreload;
+  var calls: int32 = rc_mem_call_count(a);
+  if (rc_repo_preload(&s, &users, &has_posts, &pre) != RC_OK) { return 5; }
+  if (rc_mem_call_count(a) != calls + 1) { return 6; }
+  var want: string = "SELECT \"id\", \"user_id\", \"title\", \"body\", \"published_at\" FROM \"posts\" WHERE \"user_id\" IN (?, ?)";
+  if (rc_mem_last_sql(a) != want) { return 7; }
+
+  var u1: User;
+  var u2: User;
+  var e1: RcEntity;
+  var e2: RcEntity;
+  if (rc_rows_get(&users, 0, (rawptr)&u1, &e1) != RC_OK) { return 8; }
+  if (rc_rows_get(&users, 1, (rawptr)&u2, &e2) != RC_OK) { return 9; }
+  if (rc_preload_count(&pre, &e1) != 2 || rc_preload_count(&pre, &e2) != 1) { return 10; }
+  var p: Post;
+  var pe: RcEntity;
+  if (rc_preload_get(&pre, &e1, 1, (rawptr)&p, &pe) != RC_OK) { return 11; }
+  if (p.title != "b" || p.user_id != 1 || pe.state != RC_ST_CLEAN) { return 12; }
+  if (rc_preload_get(&pre, &e1, 2, (rawptr)&p, &pe) != RC_ERR_USAGE) { return 13; }
+
+  // belongs_to for one entity: the post's user.
+  var one: RcValue[8];
+  one[0] = RcInt(2);
+  one[1] = RcText("grace@example.com");
+  one[2] = RcText("Grace");
+  one[3] = RcNull;
+  one[4] = RcBool(true);
+  one[5] = RcNull;
+  one[6] = RcTime(1);
+  one[7] = RcInt(2);
+  if (rc_mem_push_rows(a, &one[0], 1, 8) != RC_OK) { return 14; }
+  var author: RcRelation = rc_relation_belongs_to("user", post_meta(), "user_id", user_meta(), "id");
+  var pre2: RcPreload;
+  if (rc_preload_get(&pre, &e2, 0, (rawptr)&p, &pe) != RC_OK) { return 15; }
+  if (rc_repo_preload_one(&s, &pe, &author, &pre2) != RC_OK) { return 16; }
+  var who: User;
+  var we: RcEntity;
+  if (rc_preload_count(&pre2, &pe) != 1) { return 17; }
+  if (rc_preload_get(&pre2, &pe, 0, (rawptr)&who, &we) != RC_OK || who.name != "Grace") { return 18; }
+
+  // A relation built from field numbers has no target model to load into.
+  var bare: RcRelation = rc_relation("posts", RC_REL_HAS_MANY, 0, "posts", 1);
+  if (rc_repo_preload(&s, &users, &bare, &pre) != RC_ERR_USAGE) { return 19; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("repo: insert with and without a changeset", check_insert())) { failures = failures + 1; }
@@ -293,7 +374,8 @@ export fn main() -> int32 {
   if (!rc_report("repo: all and one", check_all_one())) { failures = failures + 1; }
   if (!rc_report("repo: the session keeps loaded rows", check_kept_rows())) { failures = failures + 1; }
   if (!rc_report("repo: update_all, delete_all and count", check_bulk())) { failures = failures + 1; }
-  return rc_summary(failures, 5);
+  if (!rc_report("repo: preload in one statement", check_preload())) { failures = failures + 1; }
+  return rc_summary(failures, 6);
 }
 
 @test fn t_repo() -> int32 {
@@ -302,5 +384,6 @@ export fn main() -> int32 {
   if (check_all_one() != 0) { return 3; }
   if (check_kept_rows() != 0) { return 4; }
   if (check_bulk() != 0) { return 5; }
+  if (check_preload() != 0) { return 6; }
   return 0;
 }

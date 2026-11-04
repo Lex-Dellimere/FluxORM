@@ -29,6 +29,8 @@ import "../core/persist";
 import "../adapter/adapter";
 import "../query/builder";
 import "../changeset/changeset";
+import "../relation/relation";
+import "../relation/load";
 
 // The rows of one rc_repo_all; read row i with rc_rows_get. Nothing in it is
 // owned: `res` belongs to the session and is valid until rc_session_clear.
@@ -284,4 +286,137 @@ export fn rc_repo_count(s: RcSession*, q: RcQuery*, n: int64*) -> int32 {
   rc = rc_result_i64(&res, 0, 0, n);
   rc_result_free(&res);
   return rc;
+}
+
+// --- preload -------------------------------------------------------------------
+// After Ecto's Repo.preload: one statement loads a relation for every owner
+// (two for has_many_through), never one per owner.
+//
+//   var pre: RcPreload;
+//   rc_repo_preload(&s, &users, &posts_rel, &pre);   // users from rc_repo_all
+//   var n: int32 = rc_preload_count(&pre, &user);    // user: one of the rows
+//   rc_preload_get(&pre, &user, 0, (rawptr)&post, &post_e);
+
+// The related rows rc_repo_preload loaded. The session holds them until
+// rc_session_clear; there is nothing to free.
+export struct RcPreload {
+  rel: RcRelationResult*;   // the loaded relation, held by the session
+  local: int32;             // owner field holding the key
+  meta: RcMeta;             // the target model
+}
+
+fn rc_repo_release_relation(p: rawptr) {
+  rc_relation_free((RcRelationResult*)p);
+  free(p);
+}
+
+fn rc_repo_preload_keys(s: RcSession*, rel: RcRelation*, owner: RcMeta, keys: RcValue*,
+                        n: int32, out: RcPreload*) -> int32 {
+  if (rel->target.n_fields == 0) { return RC_ERR_USAGE; }
+  var through: RcMeta* = 0;
+  if (rel->kind == RC_REL_HAS_MANY_THROUGH) { through = &rel->through; }
+  var rr: RcRelationResult* = malloc(sizeof(RcRelationResult));
+  if (rr == 0) { return RC_ERR_NOMEM; }
+  memset((rawptr)rr, 0, (int64)sizeof(RcRelationResult));
+  var a: RcAdapter* = rc_session_adapter(s);
+  var rc: int32 = rc_relation_load(a, rel, owner, rel->target, through, keys, n, rr);
+  if (rc == RC_OK) { rc = rc_session_hold(s, (rawptr)rr, &rc_repo_release_relation); }
+  if (rc != RC_OK) {
+    rc_repo_release_relation((rawptr)rr);
+    return rc;
+  }
+  out->rel = rr;
+  out->local = rel->local_field;
+  out->meta = rel->target;
+  return RC_OK;
+}
+
+// Loads `rel` for every row of `rows` in one statement.
+//   s     the session; it holds the loaded rows until rc_session_clear
+//   rows  owners from rc_repo_all over the relation's owner model
+//   rel   from rc_relation_has_many / belongs_to / has_many_through (they
+//         carry the target model; the index form rc_relation does not)
+//   out   receives the result; read it with rc_preload_count / rc_preload_get
+// Returns RC_OK; RC_ERR_USAGE when an argument is 0, rel was built without a
+// target model, or the rows are not of the relation's owner model; any code
+// of rc_relation_load (RC_ERR_CAST for a non-integer key, the adapter's code).
+// Owners with a NULL key, and owners with no related rows, get 0 rows.
+export fn rc_repo_preload(s: RcSession*, rows: RcRows*, rel: RcRelation*,
+                          out: RcPreload*) -> int32 {
+  if (s == 0 || rows == 0 || rel == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (rel->local_field < 0 || rel->local_field >= rows->meta.n_fields) {
+    return RC_ERR_USAGE;
+  }
+  var n: int32 = rows->n;
+  var keys: RcValue* = 0;
+  if (n > 0) {
+    keys = malloc((int64)n * (int64)sizeof(RcValue));
+    if (keys == 0) { return RC_ERR_NOMEM; }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    keys[i] = rc_result_borrow(rows->res, i, rel->local_field);
+    i = i + 1;
+  }
+  var rc: int32 = rc_repo_preload_keys(s, rel, rows->meta, keys, n, out);
+  if (keys != 0) { free((rawptr)keys); }
+  return rc;
+}
+
+// rc_repo_preload for one loaded entity (from rc_repo_get, rc_repo_one or
+// rc_rows_get). Same arguments and codes, with `owner` in place of `rows`.
+export fn rc_repo_preload_one(s: RcSession*, owner: RcEntity*, rel: RcRelation*,
+                              out: RcPreload*) -> int32 {
+  if (s == 0 || owner == 0 || rel == 0 || out == 0) { return RC_ERR_USAGE; }
+  var key: RcValue = RcNull;
+  var rc: int32 = rc_entity_get_field(owner, rel->local_field, &key);
+  if (rc != RC_OK) { return rc; }
+  return rc_repo_preload_keys(s, rel, owner->meta, &key, 1, out);
+}
+
+// The owner's group in the loaded relation, or -1 when it has none.
+fn rc_preload_group(p: RcPreload*, owner: RcEntity*) -> int32 {
+  if (p == 0 || p->rel == 0 || owner == 0) { return -1; }
+  var key: RcValue = RcNull;
+  if (rc_entity_get_field(owner, p->local, &key) != RC_OK) { return -1; }
+  var k: int64 = 0;
+  if (rc_value_as_i64(key, &k) != RC_OK) { return -1; }
+  return rc_relation_group(p->rel, k);
+}
+
+// How many related rows `owner` has (at most 1 for belongs_to).
+//   p      from rc_repo_preload / rc_repo_preload_one
+//   owner  one of the owners the preload was run for
+// Returns the count; 0 for an owner with none, a NULL key, or an owner that
+// was not in the preload.
+export fn rc_preload_count(p: RcPreload*, owner: RcEntity*) -> int32 {
+  var g: int32 = rc_preload_group(p, owner);
+  if (g < 0) { return 0; }
+  var n: int32 = rc_relation_count(p->rel, g);
+  if (n < 0) { return 0; }
+  return n;
+}
+
+// Reads related row i of `owner` into `model` (zeroed here) and sets *e to a
+// CLEAN entity for it, ready to edit and save.
+//   p      from rc_repo_preload / rc_repo_preload_one
+//   owner  one of the owners the preload was run for
+//   i      0 .. rc_preload_count(p, owner) - 1
+//   model  storage for one target model (p->meta.size bytes); its text
+//          fields point into rows the session holds
+//   e      receives the entity
+// Returns RC_OK; RC_ERR_USAGE when an argument is 0, the owner has no such
+// row, or i is out of range; RC_ERR_ADAPTER / RC_ERR_RANGE / RC_ERR_CAST when
+// a stored value does not fit the model.
+export fn rc_preload_get(p: RcPreload*, owner: RcEntity*, i: int32, model: rawptr,
+                         e: RcEntity*) -> int32 {
+  if (p == 0 || owner == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  var g: int32 = rc_preload_group(p, owner);
+  if (g < 0) { return RC_ERR_USAGE; }
+  memset(model, 0, (int64)p->meta.size);
+  var nulls: uint64 = 0;
+  var rc: int32 = rc_relation_hydrate(p->rel, g, i, model, &nulls);
+  if (rc != RC_OK) { return rc; }
+  *e = rc_entity_loaded(p->meta, model, nulls);
+  return RC_OK;
 }

@@ -44,6 +44,20 @@ export struct RcRelation {
   through_table: string;   // RC_REL_HAS_MANY_THROUGH only, else ""
   through_local: string;   // through column holding the owner key
   through_foreign: string; // through column holding the target key
+  target: RcMeta;          // the target model; set by the name-based forms
+  through: RcMeta;         // the join table model (THROUGH, name-based form)
+}
+
+// A meta with no fields: what rc_relation leaves in `target` / `through`.
+fn rc_relation_no_meta() -> RcMeta {
+  var m: RcMeta;
+  m.table = "";
+  m.name = "";
+  m.size = 0;
+  m.fields = 0;
+  m.n_fields = 0;
+  m.pk = -1;
+  return m;
 }
 
 // Builds a HAS_MANY or BELONGS_TO relation from 0-based field indexes. This is
@@ -68,6 +82,8 @@ export fn rc_relation(name: string, kind: int32, local_field: int32,
   r.through_table = "";
   r.through_local = "";
   r.through_foreign = "";
+  r.target = rc_relation_no_meta();
+  r.through = rc_relation_no_meta();
   return r;
 }
 
@@ -95,6 +111,8 @@ export fn rc_relation_through(name: string, local_field: int32,
   r.through_table = through_table;
   r.through_local = through_local;
   r.through_foreign = through_foreign;
+  r.target = rc_relation_no_meta();
+  r.through = rc_relation_no_meta();
   return r;
 }
 
@@ -122,8 +140,10 @@ fn rc_relation_kind_known(kind: int32) -> bool {
 // rc_relation_check / rc_relation_load.
 export fn rc_relation_has_many(name: string, owner: RcMeta, owner_col: string,
                                target: RcMeta, target_col: string) -> RcRelation {
-  return rc_relation(name, RC_REL_HAS_MANY, rc_meta_find(owner, owner_col),
-                     target.table, rc_meta_find(target, target_col));
+  var r: RcRelation = rc_relation(name, RC_REL_HAS_MANY, rc_meta_find(owner, owner_col),
+                                  target.table, rc_meta_find(target, target_col));
+  r.target = target;
+  return r;
 }
 
 // Declares that each owner points at one target row: the owner's `owner_col`
@@ -139,8 +159,10 @@ export fn rc_relation_has_many(name: string, owner: RcMeta, owner_col: string,
 // rc_relation_check / rc_relation_load.
 export fn rc_relation_belongs_to(name: string, owner: RcMeta, owner_col: string,
                                  target: RcMeta, target_col: string) -> RcRelation {
-  return rc_relation(name, RC_REL_BELONGS_TO, rc_meta_find(owner, owner_col),
-                     target.table, rc_meta_find(target, target_col));
+  var r: RcRelation = rc_relation(name, RC_REL_BELONGS_TO, rc_meta_find(owner, owner_col),
+                                  target.table, rc_meta_find(target, target_col));
+  r.target = target;
+  return r;
 }
 
 // Declares a many-to-many relation through a join table whose field 0 holds
@@ -163,8 +185,12 @@ export fn rc_relation_has_many_through(name: string, owner: RcMeta, owner_col: s
     tl = through.fields[0].name;
     tf = through.fields[1].name;
   }
-  return rc_relation_through(name, rc_meta_find(owner, owner_col), target.table,
-                             rc_meta_find(target, target_col), through.table, tl, tf);
+  var r: RcRelation = rc_relation_through(name, rc_meta_find(owner, owner_col),
+                                          target.table, rc_meta_find(target, target_col),
+                                          through.table, tl, tf);
+  r.target = target;
+  r.through = through;
+  return r;
 }
 
 // Checks a relation against its models. rc_relation_load calls it on every
