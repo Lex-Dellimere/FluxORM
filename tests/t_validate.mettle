@@ -132,6 +132,58 @@ fn check_custom() -> int32 {
   return 0;
 }
 
+// --- 3b. email, charset and digits ------------------------------------------------
+
+// The email validator's answer for one address: RC_OK or RC_ERR_CONSTRAINT.
+fn email_rc(addr: string) -> int32 {
+  var cs: RcChangeset = rc_changeset_new(user_meta());
+  defer rc_changeset_free(&cs);
+  rc_changeset_put(&cs, "email", RcText(addr));
+  return rc_validate_email(&cs, "email");
+}
+
+fn check_formats() -> int32 {
+  var good: string[4] = ["ada@example.com", "a.b+c@mail.example.co.uk", "x@a-b.io", "A@B.CD"];
+  var i: int32 = 0;
+  while (i < 4) {
+    if (email_rc(good[i]) != RC_OK) { return 1 + i; }
+    i = i + 1;
+  }
+  var bad: string[9] = ["plain", "@example.com", "ada@", "ada@example", "a@@b.com",
+                        "ada@ex ample.com", "ada@example..com", "ada@.com", "ada@ex_ample.com"];
+  i = 0;
+  while (i < 9) {
+    if (email_rc(bad[i]) != RC_ERR_CONSTRAINT) { return 10 + i; }
+    i = i + 1;
+  }
+
+  var m: RcMeta = user_meta();
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  rc_changeset_put(&cs, "email", RcText("not-an-email"));
+  if (rc_validate_email(&cs, "email") != RC_ERR_CONSTRAINT) { return 20; }
+  if (!has_error(&cs, 1, "has invalid format")) { return 21; }
+  rc_changeset_put(&cs, "name", RcText("ada-99"));
+  if (rc_validate_charset(&cs, "name", "abcdefghijklmnopqrstuvwxyz0123456789-") != RC_OK) { return 22; }
+  if (rc_validate_digits(&cs, "name") != RC_ERR_CONSTRAINT) { return 23; }
+  if (!has_error(&cs, 2, "must be digits")) { return 24; }
+  var cs2: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs2);
+  rc_changeset_put(&cs2, "name", RcText("Ada"));
+  if (rc_validate_charset(&cs2, "name", "abc") != RC_ERR_CONSTRAINT) { return 25; }
+  if (!has_error(&cs2, 2, "has invalid characters")) { return 26; }
+  rc_changeset_put(&cs2, "email", RcText("0123456789"));
+  if (rc_validate_digits(&cs2, "email") != RC_OK) { return 27; }
+  // Not text, unknown names, and no change at all.
+  rc_changeset_put(&cs2, "age", RcInt(3));
+  if (rc_validate_digits(&cs2, "age") != RC_ERR_CAST) { return 28; }
+  if (rc_validate_email(&cs2, "nope") != RC_ERR_USAGE) { return 29; }
+  var none: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&none);
+  if (rc_validate_email(&none, "email") != RC_OK || rc_validate_digits_field(&none, 1) != RC_OK) { return 30; }
+  return 0;
+}
+
 // --- 4. an invalid changeset writes nothing --------------------------------------
 
 fn new_session(a: RcAdapter**, s: RcSession*) -> int32 {
@@ -217,9 +269,10 @@ export fn main() -> int32 {
   if (!rc_report("validate: required", check_required())) { failures = failures + 1; }
   if (!rc_report("validate: length, numbers and inclusion", check_ranges())) { failures = failures + 1; }
   if (!rc_report("validate: a custom check", check_custom())) { failures = failures + 1; }
+  if (!rc_report("validate: email, charset and digits", check_formats())) { failures = failures + 1; }
   if (!rc_report("validate: an invalid changeset writes nothing", check_blocks_writes())) { failures = failures + 1; }
   if (!rc_report("validate: a duplicate key lands on the unique field", check_unique())) { failures = failures + 1; }
-  return rc_summary(failures, 5);
+  return rc_summary(failures, 6);
 }
 
 @test fn t_validate() -> int32 {
@@ -228,5 +281,6 @@ export fn main() -> int32 {
   if (check_custom() != 0) { return 3; }
   if (check_blocks_writes() != 0) { return 4; }
   if (check_unique() != 0) { return 5; }
+  if (check_formats() != 0) { return 6; }
   return 0;
 }

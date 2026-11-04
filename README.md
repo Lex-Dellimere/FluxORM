@@ -224,7 +224,7 @@ Conventions:
 | Repo | `rc_repo_insert`, `rc_repo_insert_all`, `rc_repo_get`, `rc_repo_get_by`, `rc_repo_one`, `rc_repo_all` + `rc_rows_get`, `rc_repo_update`, `rc_repo_delete`, `rc_repo_update_all`, `rc_repo_delete_all`, `rc_repo_count`, `rc_repo_exists`, `rc_repo_multi`, `rc_repo_preload`, `rc_repo_preload_one`, `rc_preload_count`, `rc_preload_get` |
 | Queries | `rc_query_select`, `rc_query_where`, `rc_query_where_in`, `rc_query_where_null`, `rc_query_where_not_null`, `rc_query_order_by`, `rc_query_limit`, `rc_query_offset`, `rc_query_join`, `rc_query_update_all` + `rc_query_set`, `rc_query_delete`, `rc_query_count`, `rc_query_free` |
 | Changesets | `rc_changeset_new`, `rc_changeset_bind`, `rc_changeset_cast`, `rc_changeset_put`, `rc_changeset_put_null`, `rc_changeset_changed`, `rc_changeset_unique`, `rc_changeset_valid`, `rc_changeset_error_count`, `rc_changeset_error_at`, `rc_changeset_free` |
-| Validations | `rc_validate_required`, `rc_validate_length`, `rc_validate_int`, `rc_validate_float`, `rc_validate_inclusion`, `rc_validate_change` |
+| Validations | `rc_validate_required`, `rc_validate_length`, `rc_validate_int`, `rc_validate_float`, `rc_validate_inclusion`, `rc_validate_email`, `rc_validate_charset`, `rc_validate_digits`, `rc_validate_change` |
 | Entities | `rc_entity_new`, `rc_entity_get`, `rc_entity_set`, `rc_entity_pk` |
 | Multi | `rc_multi_new`, `rc_multi_insert`, `rc_multi_update`, `rc_multi_delete`, `rc_multi_update_all`, `rc_multi_delete_all`, `rc_multi_run`, `rc_multi_failed_name`, `rc_multi_free` |
 | Relations | `rc_relation_has_many`, `rc_relation_belongs_to`, `rc_relation_has_many_through`, `rc_relation_load`, `rc_relation_group`, `rc_relation_count`, `rc_relation_hydrate`, `rc_relation_free` |
