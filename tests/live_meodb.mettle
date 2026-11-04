@@ -195,6 +195,22 @@ export fn main() -> int32 {
   if (found) { println("  FAIL exists: found a missing row"); return 21; }
   rc_query_free(&xq);
 
+  // a row over one page (1280 bytes) goes to overflow pages: 256 KiB of text
+  var big: string = "x";
+  var k: int32 = 0;
+  while (k < 18) { big = big + big; k = k + 1; }
+  var bn: Note;
+  memset((rawptr)&bn, 0, (int64)sizeof(Note));
+  var bne: RcEntity = rc_entity_new(note_meta(), (rawptr)&bn);
+  rc_entity_set(&bne, "text", RcText(big));
+  var nocs0: RcChangeset* = 0;
+  if (!step("insert a 256 KiB note", rc_repo_insert(&s, nocs0, &bne))) { return 27; }
+  var bb: Note;
+  var bbe: RcEntity;
+  if (!step("get it back", rc_repo_get(&s, note_meta(), RcInt(bn.id), (rawptr)&bb, &bbe))) { return 28; }
+  if (bb.text != big) { println("  FAIL big note: {bb.text.length} bytes back"); return 29; }
+  if (!step("delete it", rc_repo_delete(&s, &bbe))) { return 30; }
+
   // index ops: create (twice: IF NOT EXISTS), UNIQUE over duplicates, drop
   var tcol: string[1] = ["title"];
   var ucol: string[1] = ["user_id"];
