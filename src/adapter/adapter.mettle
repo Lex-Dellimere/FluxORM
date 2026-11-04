@@ -54,15 +54,16 @@ export struct RcResult {
 export struct RcAdapter {
   name: string;                                        // driver name, "mem"
   ud: rawptr;                                          // driver handle
-  open: fn(rawptr, string) -> int32;                   // (ud, dsn) -> RC_*
-  close: fn(rawptr) -> int32;                          // (ud) close the store
+  open: fn(rawptr, string) -> int32 with alloc, syscall;               // (ud, dsn) -> RC_*
+  close: fn(rawptr) -> int32 with alloc, syscall;                      // (ud) close the store
   // (ud, sql, argv, n_args, out): run SQL text, materialise rows into out
-  exec: fn(rawptr, string, RcValue*, int32, RcResult*) -> int32;
-  begin: fn(rawptr, int32) -> int32;                   // (ud, RC_TX_*)
-  commit: fn(rawptr) -> int32;                         // (ud) commit the tx
-  rollback: fn(rawptr) -> int32;                       // (ud) roll back the tx
-  ping: fn(rawptr) -> int32;                           // (ud) liveness check
-  query: fn(rawptr, RcStmt*, RcResult*) -> int32;     // typed stores; 0 = text only
+  exec: fn(rawptr, string, RcValue*, int32, RcResult*) -> int32 with alloc, syscall;
+  begin: fn(rawptr, int32) -> int32 with alloc, syscall;               // (ud, RC_TX_*)
+  commit: fn(rawptr) -> int32 with alloc, syscall;                     // (ud) commit the tx
+  rollback: fn(rawptr) -> int32 with alloc, syscall;                   // (ud) roll back the tx
+  ping: fn(rawptr) -> int32 with alloc, syscall;                       // (ud) liveness check
+  // (ud, stmt, out): typed stores; 0 = text only
+  query: fn(rawptr, RcStmt*, RcResult*) -> int32 with alloc, syscall;
 }
 
 // A vtable with no capabilities: name "none", ud 0, every slot 0. Every

@@ -158,7 +158,7 @@ export fn rc_validate_inclusion_field(cs: RcChangeset*, field: int32, allowed: R
 // generated code; apps use rc_validate_change. An index out of range is
 // recorded as RC_ERR_USAGE "field index out of range" and returned.
 export fn rc_validate_change_field(cs: RcChangeset*, field: int32,
-                             check: fn(rawptr, RcValue) -> bool, ctx: rawptr,
+                             check: fn(rawptr, RcValue) -> bool with alloc, syscall, ctx: rawptr,
                              reason: string) -> int32 {
   var rc: int32 = rc_validate_field_ok(cs, field);
   if (rc != RC_OK) { return rc; }
@@ -277,7 +277,7 @@ export fn rc_validate_inclusion(cs: RcChangeset*, name: string, allowed: RcValue
 // RC_ERR_CONSTRAINT, recorded with `reason`, when it fails; RC_ERR_USAGE,
 // not recorded, when check is 0.
 export fn rc_validate_change(cs: RcChangeset*, name: string,
-                             check: fn(rawptr, RcValue) -> bool, ctx: rawptr,
+                             check: fn(rawptr, RcValue) -> bool with alloc, syscall, ctx: rawptr,
                              reason: string) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
   if (f == -1) { return RC_ERR_USAGE; }

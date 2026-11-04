@@ -41,9 +41,9 @@ export struct RcMigration {
   version: int64;                // > 0, unique, ascending within the set
   name: string;                  // non-empty; stored in the ledger
   up_sql: string;                // SQL run by rc_adapter_exec, or ""
-  up: fn(RcAdapter*) -> int32;   // callback instead of up_sql, or 0
+  up: fn(RcAdapter*) -> int32 with alloc, syscall;   // callback instead of up_sql, or 0
   down_sql: string;              // SQL that undoes it, or ""
-  down: fn(RcAdapter*) -> int32; // callback instead of down_sql, or 0
+  down: fn(RcAdapter*) -> int32 with alloc, syscall; // callback instead of down_sql, or 0
 }
 
 // A list of migrations, as passed to rc_migration_run / rc_migration_down.

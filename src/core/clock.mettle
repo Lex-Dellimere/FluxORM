@@ -7,12 +7,12 @@
 
 import "status";
 
-var RC_CLOCK: fn() -> int64 = 0;
+var RC_CLOCK: fn() -> int64 with alloc, syscall = 0;
 
 // Installs the process-wide clock that timestamp writes read.
 //   now   function answering Unix microseconds; replaces any earlier clock.
 //         Passing 0 is the same as rc_clock_clear.
-export fn rc_clock_set(now: fn() -> int64) { RC_CLOCK = now; }
+export fn rc_clock_set(now: fn() -> int64 with alloc, syscall) { RC_CLOCK = now; }
 
 // Removes the installed clock. Writes that need a timestamp then fail with
 // RC_ERR_USAGE until a clock is set again.

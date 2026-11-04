@@ -32,7 +32,7 @@ export struct RcPool {
   free_: bool*;              // n flags: true when the session is checked in
   n: int32;
   lock: int32;               // spin lock over free_
-  release: fn(RcAdapter*) -> void;   // frees one adapter
+  release: fn(RcAdapter*) -> void with alloc, syscall;   // frees one adapter
 }
 
 // Frees the first n sessions' adapters and the pool's arrays.
@@ -64,8 +64,9 @@ fn rc_pool_drop(p: RcPool*, n: int32) {
 //   RC_ERR_NOMEM  an allocation failed or make returned 0
 //   the first failing rc_adapter_open code
 // On failure every adapter made so far is closed and released.
-export fn rc_pool_new(p: RcPool*, n: int32, make: fn(rawptr) -> RcAdapter*, ctx: rawptr,
-                      dsn: string, release: fn(RcAdapter*) -> void) -> int32 {
+export fn rc_pool_new(p: RcPool*, n: int32, make: fn(rawptr) -> RcAdapter* with alloc, syscall,
+                      ctx: rawptr, dsn: string,
+                      release: fn(RcAdapter*) -> void with alloc, syscall) -> int32 {
   if (p == 0 || make == 0 || release == 0 || n < 1) { return RC_ERR_USAGE; }
   p->n = 0;
   p->lock = 0;

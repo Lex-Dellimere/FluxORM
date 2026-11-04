@@ -216,7 +216,7 @@ fn check_transaction() -> int32 {
 
   // No body (a zero fn pointer, as in an empty vtable slot): refused,
   // nothing begun.
-  var nobody: fn(rawptr, RcSession*) -> int32 = 0;
+  var nobody: fn(rawptr, RcSession*) -> int32 with alloc, syscall = 0;
   if (rc_session_transaction(&s, RC_TX_DEFAULT, nobody, 0) != RC_ERR_USAGE) { return 18; }
   if (rc_mem_tx_depth(a) != 0) { return 19; }
   return 0;

@@ -83,7 +83,8 @@ export fn rc_schema_field(s: RcSchema*, name: string, kind: Kind, offset: int64,
 // refused (RC_ERR_UNSUPPORTED, and its metadata has 0 fields so every use of
 // it fails) rather than truncated; any other failure is the code from
 // rc_meta_finalize. `s` = 0 returns metadata with no fields.
-export fn rc_schema_meta(s: RcSchema*, fill: fn(RcSchema*) -> void, table: string,
+export fn rc_schema_meta(s: RcSchema*, fill: fn(RcSchema*) -> void with alloc, syscall,
+                         table: string,
                          name: string, size: int64, cols: RcColumn*,
                          n_cols: int32) -> RcMeta {
   if (s == 0) {

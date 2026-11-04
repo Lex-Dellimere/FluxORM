@@ -944,7 +944,7 @@ const RC_CHECK_NAMES: string[8] = [
   "integration: query results become models that can be saved",
 ];
 
-var RC_CHECKS: (fn() -> int32)[8];
+var RC_CHECKS: (fn() -> int32 with alloc, syscall)[8];
 
 export fn rc_checks_load() {
   RC_CHECKS[0] = &check_migration;
@@ -962,7 +962,7 @@ export fn main() -> int32 {
   var failures: int32 = 0;
   var i: int32 = 0;
   while (i < 8) {
-    var run: fn() -> int32 = RC_CHECKS[i];
+    var run: fn() -> int32 with alloc, syscall = RC_CHECKS[i];
     if (!rc_report(RC_CHECK_NAMES[i], run())) { failures = failures + 1; }
     i = i + 1;
   }

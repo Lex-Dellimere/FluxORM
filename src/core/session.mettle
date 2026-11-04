@@ -30,7 +30,7 @@ import "../adapter/adapter";
 // Something the session owns until rc_session_clear: `release(p)` frees it.
 export struct RcHeld {
   p: rawptr;
-  release: fn(rawptr) -> void;
+  release: fn(rawptr) -> void with alloc, syscall;
 }
 
 export struct RcSession {
@@ -70,7 +70,7 @@ export fn rc_session_new(a: RcAdapter*) -> RcSession {
 // Returns RC_OK; RC_ERR_USAGE when s, p or release is 0; RC_ERR_NOMEM when
 // the session cannot grow, in which case p is still yours.
 export fn rc_session_hold(s: RcSession*, p: rawptr,
-                          release: fn(rawptr) -> void) -> int32 {
+                          release: fn(rawptr) -> void with alloc, syscall) -> int32 {
   if (s == 0 || p == 0 || release == 0) { return RC_ERR_USAGE; }
   if (s->n_kept == s->cap_kept) {
     var cap: int32 = s->cap_kept * 2;
@@ -269,7 +269,7 @@ export fn rc_session_rollback(s: RcSession*) -> int32 {
 // RC_OK, even if the rollback also fails; otherwise rc_session_commit's result
 // (RC_ERR_TX when an inner level was doomed, or the adapter's commit error).
 export fn rc_session_transaction(s: RcSession*, mode: int32,
-                                 body: fn(rawptr, RcSession*) -> int32,
+                                 body: fn(rawptr, RcSession*) -> int32 with alloc, syscall,
                                  ctx: rawptr) -> int32 {
   if (s == 0 || body == 0) { return RC_ERR_USAGE; }
   var rc: int32 = rc_session_begin(s, mode);
