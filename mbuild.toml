@@ -69,3 +69,7 @@ main = "tests/t_wire.mettle"
 
 [bin.t_value]
 main = "tests/t_value.mettle"
+
+# Needs a running MeoSQL server; see the file's header. Not a t_* test.
+[bin.live_meosql]
+main = "tests/live_meosql.mettle"

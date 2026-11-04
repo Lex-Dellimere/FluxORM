@@ -7,9 +7,8 @@ update_all/delete_all/count, changeset validations, relations without N+1,
 migrations with up and down, sessions with transactions and stale-write
 detection and automatic timestamps and Multi all work and are tested in the
 interpreter, debug and release. The MeoSQL adapter talks to MeoSQL's server
-over its wire protocol; it is tested against a scripted server until the real
-one is released. The other tests run against an in-memory adapter that records
-statements.
+over its wire protocol, and has been run end to end against the real server.
+The other tests run against an in-memory adapter that records statements.
 
 ## Layout
 
@@ -246,6 +245,9 @@ $MB build && $MB build -r
 for t in build/linux/{debug,release}/t_*; do $t || echo "FAIL $t"; done
 ```
 
-`$MB run t_query` builds and runs one test. Run release as well as debug:
+`$MB run t_query` builds and runs one test. `tests/live_meosql.mettle` runs
+flux_orm against a real MeoSQL server; start one first
+(`../meosql/build/linux/release/meosql --db /tmp/flux_live.meo`), then
+`$MB run live_meosql`. Run release as well as debug:
 compiler bugs have shown up in release only. Imports are file-relative, so the
 compiler can be run from anywhere.

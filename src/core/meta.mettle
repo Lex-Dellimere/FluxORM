@@ -462,7 +462,8 @@ fn rc_range_ok(v: int64, lo: int64, hi: int64) -> bool {
 //           otherwise
 //   i       field index
 //   v       the value. RcNull zeroes the field's bytes. Text is stored as a
-//           view, so its bytes must outlive the model.
+//           view, so its bytes must outlive the model. A bool field also
+//           takes RcInt 0 or 1, which is how stores hand a bool back.
 // Returns RC_OK; RC_ERR_USAGE when `model` or `nulls` is 0 or `i` is out of
 // range; RC_ERR_CONSTRAINT for RcNull on a NOT NULL field; RC_ERR_CAST when
 // `v`'s arm does not convert (rules of rc_value_as_*); RC_ERR_RANGE when the
@@ -486,8 +487,22 @@ export fn rc_meta_set(m: RcMeta, model: rawptr, nulls: uint64*, i: int32,
 
   switch (f.kind) {
     case Kind.Bool: {
+      // Stores keep a bool as INTEGER 0/1 and hand it back as RcInt.
       var b: bool = false;
-      var rc: int32 = rc_value_as_bool(v, &b);
+      var rc: int32 = RC_OK;
+      match (v) {
+        case RcInt(x): {
+          if (x != (int64)0 && x != (int64)1) { return RC_ERR_RANGE; }
+          b = x == (int64)1;
+        }
+        case RcNull: { rc = rc_value_as_bool(v, &b); }
+        case RcBool(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcUint(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcFloat(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcTime(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcText(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcBlob(_x): { rc = rc_value_as_bool(v, &b); }
+      }
       if (rc != RC_OK) { return rc; }
       var p: bool* = (bool*)at;
       *p = b;
