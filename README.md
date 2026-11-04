@@ -3,8 +3,9 @@
 An ORM for the [MeoSQL](../meosql) database, written in Mettle.
 
 Status: models, queries, inserts, loads, updates of changed fields, deletes,
-changeset validations, relations without N+1, up-only migrations, sessions with transactions and
-stale-write detection and automatic timestamps all work and are tested in the interpreter, debug and
+update_all/delete_all/count, changeset validations, relations without N+1,
+up-only migrations, sessions with transactions and stale-write detection and
+automatic timestamps all work and are tested in the interpreter, debug and
 release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub until
 MeoSQL has its network server; the tests run against an in-memory adapter that
 records statements.
@@ -109,6 +110,11 @@ rc_query_free(&q);
 // Loaded models point into rows the session keeps. Clear them when done.
 rc_session_clear(&s);
 ```
+
+For many rows at once, build `rc_query_update_all`, `rc_query_delete` or
+`rc_query_count`, add WHERE terms, and run it with `rc_repo_update_all`,
+`rc_repo_delete_all` or `rc_repo_count`. An UPDATE or DELETE without a WHERE is
+refused.
 
 Every call returns an `RC_*` code (`src/core/status.mettle`). `rc_repo_one`
 expects exactly one row. Wrap related writes in

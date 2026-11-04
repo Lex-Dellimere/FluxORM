@@ -208,13 +208,90 @@ fn check_kept_rows() -> int32 {
   return 0;
 }
 
+// --- 5. update_all, delete_all, count ---------------------------------------------
+
+fn check_bulk() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var m: RcMeta = user_meta();
+
+  // Deactivate every user created before a cutoff.
+  var vals: RcValue[8];
+  vals[4] = RcBool(false);
+  var up: RcQuery = rc_query_update_all(m, rc_nulls_set((uint64)0, 4), &vals[0]);
+  defer rc_query_free(&up);
+  if (up.err != RC_OK) { return 2; }
+  var n: int32 = 0;
+  if (rc_repo_update_all(&s, &up, &n) != RC_ERR_USAGE) { return 3; }  // no WHERE yet
+  if (rc_mem_call_count(a) != 0) { return 4; }
+  if (rc_query_where_cmp(&up, 6, RC_CMP_LT, RcTime(1700000000000000)) != RC_OK) { return 5; }
+  if (rc_mem_push_ok(a, 3, 0) != RC_OK) { return 6; }
+  if (rc_repo_update_all(&s, &up, &n) != RC_OK) { return 7; }
+  if (n != 3) { return 8; }
+  if (rc_mem_last_sql(a) != "UPDATE \"users\" SET \"active\" = ? WHERE \"created_at\" < ?") { return 9; }
+  if (!rc_value_same(rc_mem_last_args(a)[0], RcBool(false))) { return 10; }
+  if (!rc_value_same(rc_mem_last_args(a)[1], RcTime(1700000000000000))) { return 11; }
+
+  // A versioned table cannot bump each row's version with one value.
+  var nv: RcValue[3];
+  nv[1] = RcText("x");
+  var vq: RcQuery = rc_query_update_all(note_meta(), rc_nulls_set((uint64)0, 1), &nv[0]);
+  defer rc_query_free(&vq);
+  if (vq.err != RC_ERR_UNSUPPORTED) { return 12; }
+
+  // updated_at is set from the clock, and needs one.
+  var tv: RcValue[4];
+  tv[1] = RcText("done");
+  var tmask: uint64 = rc_nulls_set((uint64)0, 1);
+  rc_clock_clear();
+  var nq: RcQuery = rc_query_update_all(task_meta(), tmask, &tv[0]);
+  defer rc_query_free(&nq);
+  if (nq.err != RC_ERR_USAGE) { return 13; }
+  rc_clock_set(&test_clock);
+  defer rc_clock_clear();
+  var tq: RcQuery = rc_query_update_all(task_meta(), tmask, &tv[0]);
+  defer rc_query_free(&tq);
+  var ids: RcValue[2];
+  ids[0] = RcInt(1);
+  ids[1] = RcInt(2);
+  if (rc_query_where_in(&tq, 0, &ids[0], 2) != RC_OK) { return 14; }
+  if (rc_query_sql(&tq) != "UPDATE \"tasks\" SET \"title\" = ?, \"updated_at\" = ? WHERE \"id\" IN (?, ?)") { return 15; }
+  if (!rc_value_same(rc_query_args(&tq)[1], RcTime(TEST_NOW))) { return 16; }
+
+  // delete_all needs a WHERE too.
+  var dq: RcQuery = rc_query_delete(m);
+  defer rc_query_free(&dq);
+  if (rc_repo_delete_all(&s, &dq, &n) != RC_ERR_USAGE) { return 17; }
+  if (rc_query_where_eq(&dq, 4, RcBool(false)) != RC_OK) { return 18; }
+  if (rc_mem_push_ok(a, 2, 0) != RC_OK) { return 19; }
+  if (rc_repo_delete_all(&s, &dq, &n) != RC_OK || n != 2) { return 20; }
+  if (rc_mem_last_sql(a) != "DELETE FROM \"users\" WHERE \"active\" = ?") { return 21; }
+
+  // count: one integer cell; SELECT-only clauses are refused.
+  var cq: RcQuery = rc_query_count(m);
+  defer rc_query_free(&cq);
+  if (rc_query_where_cmp(&cq, 3, RC_CMP_GE, RcInt(18)) != RC_OK) { return 22; }
+  if (rc_query_order_by(&cq, 0, true) != RC_ERR_USAGE) { return 23; }
+  if (rc_query_sql(&cq) != "SELECT COUNT(*) FROM \"users\" WHERE \"age\" >= ?") { return 24; }
+  var cell: RcValue[1];
+  cell[0] = RcInt(5);
+  if (rc_mem_push_rows(a, &cell[0], 1, 1) != RC_OK) { return 25; }
+  var count: int64 = 0;
+  if (rc_repo_count(&s, &cq, &count) != RC_OK || count != 5) { return 26; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("repo: insert with and without a changeset", check_insert())) { failures = failures + 1; }
   if (!rc_report("repo: get, update and delete", check_get_update_delete())) { failures = failures + 1; }
   if (!rc_report("repo: all and one", check_all_one())) { failures = failures + 1; }
   if (!rc_report("repo: the session keeps loaded rows", check_kept_rows())) { failures = failures + 1; }
-  return rc_summary(failures, 4);
+  if (!rc_report("repo: update_all, delete_all and count", check_bulk())) { failures = failures + 1; }
+  return rc_summary(failures, 5);
 }
 
 @test fn t_repo() -> int32 {
@@ -222,5 +299,6 @@ export fn main() -> int32 {
   if (check_get_update_delete() != 0) { return 2; }
   if (check_all_one() != 0) { return 3; }
   if (check_kept_rows() != 0) { return 4; }
+  if (check_bulk() != 0) { return 5; }
   return 0;
 }

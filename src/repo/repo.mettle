@@ -7,6 +7,9 @@
 //   rc_repo_get(s, m, pk, model, e)   load by key; RC_ERR_NOT_FOUND if none
 //   rc_repo_one(s, q, model, e)       exactly one row
 //   rc_repo_all(s, q, rows)           every row; read them with rc_rows_get
+//   rc_repo_update_all(s, q, &n)      rows from rc_query_update_all + WHERE
+//   rc_repo_delete_all(s, q, &n)      rows from rc_query_delete + WHERE
+//   rc_repo_count(s, q, &n)           rc_query_count + WHERE
 //
 // Loaded models point into results the session keeps, so they stay valid
 // until rc_session_clear. Every entity a read hands back is CLEAN.
@@ -120,4 +123,42 @@ export fn rc_rows_get(rows: RcRows*, i: int32, model: rawptr, e: RcEntity*) -> i
   if (rc != RC_OK) { return rc; }
   *e = rc_entity_loaded(rows->meta, model, nulls);
   return RC_OK;
+}
+
+// Runs an update_all or delete query; *n receives the rows it changed.
+fn rc_repo_write_all(s: RcSession*, q: RcQuery*, n: int32*) -> int32 {
+  if (s == 0 || q == 0 || n == 0) { return RC_ERR_USAGE; }
+  *n = 0;
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  *n = res.affected;
+  rc_result_free(&res);
+  return RC_OK;
+}
+
+// update_all: q comes from rc_query_update_all plus WHERE terms.
+export fn rc_repo_update_all(s: RcSession*, q: RcQuery*, n: int32*) -> int32 {
+  return rc_repo_write_all(s, q, n);
+}
+
+// delete_all: q comes from rc_query_delete plus WHERE terms.
+export fn rc_repo_delete_all(s: RcSession*, q: RcQuery*, n: int32*) -> int32 {
+  return rc_repo_write_all(s, q, n);
+}
+
+// The row count of q (from rc_query_count) into *n.
+export fn rc_repo_count(s: RcSession*, q: RcQuery*, n: int64*) -> int32 {
+  if (s == 0 || q == 0 || n == 0) { return RC_ERR_USAGE; }
+  *n = 0;
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  if (res.n_rows != 1 || res.n_cols != 1) {
+    rc_result_free(&res);
+    return RC_ERR_ADAPTER;
+  }
+  rc = rc_result_i64(&res, 0, 0, n);
+  rc_result_free(&res);
+  return rc;
 }
