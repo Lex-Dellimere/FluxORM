@@ -25,20 +25,9 @@
 import "std/io";
 import "std/mem";
 
-import "../src/core/status";
-import "../src/core/value";
-import "../src/core/meta";
-import "../src/core/entity";
-import "../src/core/buf";
-import "../src/core/persist";
-import "../src/adapter/adapter";
+// Through the import root, as an app would.
+import "../src/flux_orm";
 import "../src/adapter/mem";
-import "../src/query/builder";
-import "../src/changeset/changeset";
-import "../src/migration/ddl";
-import "../src/migration/version";
-import "../src/relation/relation";
-import "../src/relation/load";
 import "models";
 import "harness";
 

@@ -12,14 +12,15 @@ records statements.
 ## Layout
 
 ```
-src/core/       values, status codes, model metadata, entities, sessions,
-                single-row insert/load/delete
-src/adapter/    the adapter interface, the in-memory test adapter, MeoSQL
-src/query/      SELECT/INSERT/UPDATE builder and SQL dialect
-src/changeset/  casting user input, dirty fields, save
-src/relation/   has-many / belongs-to / through, loaded in batches
-src/migration/  CREATE TABLE from metadata, versioned migrations
-tests/          models.mettle (the model template) and one t_*.mettle per area
+src/flux_orm.mettle  the import root
+src/core/            values, status codes, model metadata, entities, sessions,
+                     clock, single-row insert/load/delete
+src/adapter/         the adapter interface, the in-memory test adapter, MeoSQL
+src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
+src/changeset/       casting user input, dirty fields, save
+src/relation/        has-many / belongs-to / through, loaded in batches
+src/migration/       CREATE TABLE from metadata, versioned migrations
+tests/               models.mettle (the model template), one t_*.mettle per area
 ```
 
 ## Models
@@ -46,6 +47,17 @@ const NOTE_COLS: RcColumn[3] = [
 ```
 
 ## Use
+
+Map the package in your app's `mettle.deps` and import the root:
+
+```
+flux_orm=../flux_orm/src
+```
+
+```mettle
+import "flux_orm/flux_orm";
+import "flux_orm/core/clock_linux";   // the real clock, if you use timestamps
+```
 
 ```mettle
 rc_clock_set(&rc_clock_realtime_us);  // once, if any model has timestamps
