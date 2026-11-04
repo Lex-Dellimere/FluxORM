@@ -1,0 +1,318 @@
+// tests/t_meosql.mettle — the MeoSQL adapter against a scripted fake server.
+//
+// The fake listens on loopback in a thread and answers with frames built here
+// from docs/PROTOCOL.md. It checks the request kinds and ids the adapter
+// sends, and drops the connection mid-transaction to test the loss rules.
+// The compile-time interpreter cannot run sockets or threads, so the @test
+// entry runs only the offline checks; the built binary runs all of them.
+
+import "std/mem";
+import "std/net";
+import "std/thread";
+
+import "../src/flux_orm";
+import "../src/adapter/meosql";
+import "../src/adapter/wire";
+import "models";
+import "harness";
+
+const SRV_PORT: int32 = 45490;
+
+var SRV_READY: int32 = 0;
+var SRV_KINDS: int32[32];
+var SRV_RIDS: int32[32];
+var SRV_N: int32 = 0;
+var SRV_FAIL: int32 = 0;   // nonzero: the server saw something wrong
+
+// --- frames the fake sends ----------------------------------------------------
+
+struct Out {
+  b: uint8[256];
+  n: int32;
+}
+
+fn o_le(o: Out*, v: int64, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    o->b[o->n] = (uint8)((v >> (int64)(8 * i)) & 255);
+    o->n = o->n + 1;
+    i = i + 1;
+  }
+}
+
+fn o_str(o: Out*, s: string) {
+  o_le(o, (int64)s.length, 2);
+  var i: uint64 = 0;
+  while (i < s.length) {
+    o->b[o->n] = s.chars[i];
+    o->n = o->n + 1;
+    i = i + 1;
+  }
+}
+
+// Wraps the payload in `p` in a header and sends it.
+fn srv_send(c: int64, kind: int32, rid: int32, p: Out*) {
+  var f: Out;
+  f.n = 0;
+  o_le(&f, (int64)p->n, 4);
+  o_le(&f, (int64)kind, 1);
+  o_le(&f, 0, 3);
+  o_le(&f, (int64)rid, 4);
+  var i: int32 = 0;
+  while (i < p->n) {
+    f.b[f.n] = p->b[i];
+    f.n = f.n + 1;
+    i = i + 1;
+  }
+  send_all(c, (cstring)&f.b[0], f.n);
+}
+
+fn srv_ok(c: int64, rid: int32) {
+  var p: Out;
+  p.n = 0;
+  srv_send(c, 64, rid, &p);
+}
+
+fn srv_hello_ok(c: int64, rid: int32, caps: int64) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, 1, 2);
+  o_le(&p, 0, 2);
+  o_le(&p, 16777216, 4);
+  o_le(&p, 7, 8);
+  o_le(&p, caps, 4);
+  o_str(&p, "fake");
+  srv_send(c, 65, rid, &p);
+}
+
+fn srv_error(c: int64, rid: int32, code: int64, fatal: int64, tx: int64) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, code, 4);
+  o_le(&p, fatal, 1);
+  o_le(&p, tx, 1);
+  o_str(&p, "scripted");
+  srv_send(c, 66, rid, &p);
+}
+
+// One row: (INT 5, TEXT "Ada").
+fn srv_rows(c: int64, rid: int32) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, 0, 4);
+  o_le(&p, 0, 8);
+  o_le(&p, 2, 2);
+  o_le(&p, 1, 1);
+  o_le(&p, 3, 1);
+  o_le(&p, 1, 4);
+  o_le(&p, 1, 1);
+  o_le(&p, 5, 8);
+  o_le(&p, 3, 1);
+  o_le(&p, 3, 4);
+  o_le(&p, 65, 1);
+  o_le(&p, 100, 1);
+  o_le(&p, 97, 1);
+  srv_send(c, 67, rid, &p);
+}
+
+fn srv_write(c: int64, rid: int32, affected: int64, last_id: int64) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, affected, 4);
+  o_le(&p, last_id, 8);
+  o_le(&p, 0, 2);
+  o_le(&p, 0, 4);
+  srv_send(c, 67, rid, &p);
+}
+
+// --- reading requests -------------------------------------------------------
+
+fn srv_read_n(c: int64, p: uint8*, n: int32) -> bool {
+  var got: int32 = 0;
+  while (got < n) {
+    var r: int32 = recv(c, (cstring)(p + got), n - got, 0);
+    if (r <= 0) { return false; }
+    got = got + r;
+  }
+  return true;
+}
+
+// Reads one request, records its kind and rid, and returns the rid (0 on EOF).
+fn srv_next(c: int64, want_kind: int32) -> int32 {
+  var head: uint8[12];
+  if (!srv_read_n(c, &head[0], 12)) {
+    SRV_FAIL = 100 + SRV_N;
+    return 0;
+  }
+  var len: int32 = (int32)head[0] | ((int32)head[1] << 8) | ((int32)head[2] << 16);
+  var kind: int32 = (int32)head[4];
+  var rid: int32 = (int32)head[8] | ((int32)head[9] << 8);
+  var body: uint8[512];
+  if (len > 512 || !srv_read_n(c, &body[0], len)) {
+    SRV_FAIL = 200 + SRV_N;
+    return 0;
+  }
+  if (SRV_N < 32) {
+    SRV_KINDS[SRV_N] = kind;
+    SRV_RIDS[SRV_N] = rid;
+  }
+  SRV_N = SRV_N + 1;
+  if (kind != want_kind && SRV_FAIL == 0) { SRV_FAIL = 300 + SRV_N; }
+  return rid;
+}
+
+fn srv_main(arg: cstring) -> uint32 {
+  var ls: int64 = -1;
+  match (socket_tcp()) {
+    case Ok(s): { ls = s; }
+    case Err(_e): { SRV_FAIL = 1; InterlockedExchange(&SRV_READY, 1); return 1; }
+  }
+  set_reuseaddr(ls, 1);
+  var addr: cstring = (cstring)0;
+  match (sockaddr_in((cstring)"127.0.0.1", SRV_PORT)) {
+    case Ok(a): { addr = a; }
+    case Err(_e): { SRV_FAIL = 2; InterlockedExchange(&SRV_READY, 1); return 1; }
+  }
+  if (bind(ls, addr, 16) != 0 || listen(ls, 4) != 0) {
+    SRV_FAIL = 3;
+    InterlockedExchange(&SRV_READY, 1);
+    return 1;
+  }
+  free((rawptr)addr);
+  InterlockedExchange(&SRV_READY, 1);
+
+  // Connection 1: hello, ping, select, count, a conflict in a transaction,
+  // then a drop in the middle of a second transaction.
+  var c: int64 = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c, srv_next(c, 1), 1);
+  srv_ok(c, srv_next(c, 2));
+  srv_rows(c, srv_next(c, 6));
+  var cnt: Out;
+  cnt.n = 0;
+  o_le(&cnt, 0, 4);
+  o_le(&cnt, 0, 8);
+  o_le(&cnt, 1, 2);
+  o_le(&cnt, 1, 1);
+  o_le(&cnt, 1, 4);
+  o_le(&cnt, 1, 1);
+  o_le(&cnt, 3, 8);
+  srv_send(c, 67, srv_next(c, 6), &cnt);
+  srv_ok(c, srv_next(c, 3));
+  srv_error(c, srv_next(c, 6), 13, 0, 1);
+  srv_ok(c, srv_next(c, 5));
+  srv_ok(c, srv_next(c, 3));
+  srv_next(c, 6);
+  closesocket(c);                         // lost inside the transaction
+
+  // Connection 2: the reconnect, an insert, then a fatal timeout.
+  var c2: int64 = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c2, srv_next(c2, 1), 0);
+  srv_write(c2, srv_next(c2, 6), 1, 9);
+  srv_error(c2, srv_next(c2, 6), 21, 1, 0);
+  closesocket(c2);
+  closesocket(ls);
+  return 0;
+}
+
+// --- offline: nothing reaches the network ---------------------------------------
+
+fn check_offline() -> int32 {
+  var a: RcAdapter* = rc_meosql_adapter("");
+  if (a == 0) { return 1; }
+  defer rc_meosql_adapter_free(a);
+  if (a.exec != 0 || a.query == 0) { return 2; }
+  // Before open there is no connection, and no host to reconnect to.
+  var res: RcResult;
+  var q: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&q);
+  if (rc_query_exec(&q, a, &res) != RC_ERR_CLOSED) { return 3; }
+  if (rc_adapter_begin(a, RC_TX_DEFAULT) != RC_ERR_CLOSED) { return 4; }
+  // A join is refused before anything is sent.
+  var jq: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&jq);
+  rc_query_join(&jq, post_meta(), 0, 1, RC_JOIN_INNER);
+  if (rc_query_exec(&jq, a, &res) != RC_ERR_UNSUPPORTED) { return 5; }
+  // Bad addresses.
+  if (rc_adapter_open(a, "127.0.0.1:") != RC_ERR_USAGE) { return 6; }
+  if (rc_adapter_open(a, ":5490") != RC_ERR_USAGE) { return 7; }
+  if (rc_adapter_open(a, "127.0.0.1:99999") != RC_ERR_USAGE) { return 8; }
+  return 0;
+}
+
+// --- against the fake server -----------------------------------------------------
+
+fn check_server() -> int32 {
+  var th: int64 = CreateThread((cstring)0, 0, &srv_main, (cstring)0, 0, (uint32*)0);
+  if (th == 0) { return 1; }
+  while (InterlockedCompareExchange(&SRV_READY, 0, 0) == 0) { Sleep(1); }
+  if (SRV_FAIL != 0) { return 2; }
+
+  var a: RcAdapter* = rc_meosql_adapter("tok");
+  defer rc_meosql_adapter_free(a);
+  if (rc_adapter_open(a, "127.0.0.1:45490") != RC_OK) { return 3; }
+  if (rc_meosql_caps(a) != RC_WIRE_CAP_COUNT) { return 4; }
+  if (rc_adapter_ping(a) != RC_OK) { return 5; }
+
+  // Rows come back as owned values.
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var q: RcQuery = rc_query_select(note_meta());
+  defer rc_query_free(&q);
+  var res: RcResult;
+  if (rc_query_exec(&q, a, &res) != RC_OK) { return 6; }
+  if (res.n_rows != 1 || !rc_value_same(rc_result_borrow(&res, 0, 1), RcText("Ada"))) { return 7; }
+  rc_result_free(&res);
+  var cq: RcQuery = rc_query_count(note_meta());
+  defer rc_query_free(&cq);
+  var n: int64 = 0;
+  if (rc_repo_count(&s, &cq, &n) != RC_OK || n != 3) { return 8; }
+
+  // A server error is mapped, and the transaction stays open until rollback.
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 9; }
+  if (rc_query_exec(&q, a, &res) != RC_ERR_CONFLICT) { return 10; }
+  if (rc_session_rollback(&s) != RC_OK) { return 11; }
+
+  // Lost inside a transaction: RC_ERR_TX until rollback, nothing resent.
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 12; }
+  if (rc_query_exec(&q, a, &res) != RC_ERR_TX) { return 13; }
+  if (rc_query_exec(&q, a, &res) != RC_ERR_TX) { return 14; }
+  if (rc_session_commit(&s) != RC_ERR_TX) { return 15; }   // the session rolls back for us
+  if (rc_session_in_tx(&s)) { return 16; }
+
+  // Outside a transaction the next call reconnects once.
+  var ins: RcQuery = rc_query_insert_batch(post_meta(), 1);
+  defer rc_query_free(&ins);
+  rc_query_push_arg(&ins, RcInt(1));
+  rc_query_push_arg(&ins, RcText("t"));
+  rc_query_push_arg(&ins, RcNull);
+  rc_query_push_arg(&ins, RcNull);
+  if (rc_query_exec(&ins, a, &res) != RC_OK) { return 17; }
+  if (res.affected != 1 || res.last_id != 9) { return 18; }
+  rc_result_free(&res);
+  // No COUNT capability on this connection: refused, nothing sent.
+  if (rc_repo_count(&s, &cq, &n) != RC_ERR_UNSUPPORTED) { return 19; }
+  // A fatal timeout closes it.
+  if (rc_query_exec(&q, a, &res) != RC_ERR_CLOSED) { return 20; }
+
+  thread_join_infinite(th);
+  CloseHandle(th);
+  if (SRV_FAIL != 0) { return 100 + SRV_FAIL; }
+  // Request ids start at 1 and count up on each connection.
+  if (SRV_N != 12) { return 21; }
+  if (SRV_RIDS[0] != 1 || SRV_RIDS[1] != 2 || SRV_RIDS[8] != 9) { return 22; }
+  if (SRV_RIDS[9] != 1 || SRV_RIDS[10] != 2) { return 23; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("meosql: offline refusals", check_offline())) { failures = failures + 1; }
+  if (!rc_report("meosql: a scripted server", check_server())) { failures = failures + 1; }
+  return rc_summary(failures, 2);
+}
+
+// The interpreter has no sockets or threads: offline checks only.
+@test fn t_meosql() -> int32 {
+  if (check_offline() != 0) { return 1; }
+  return 0;
+}

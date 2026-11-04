@@ -6,9 +6,10 @@ Status: models, queries, inserts, loads, updates of changed fields, deletes,
 update_all/delete_all/count, changeset validations, relations without N+1,
 migrations with up and down, sessions with transactions and stale-write
 detection and automatic timestamps and Multi all work and are tested in the
-interpreter, debug and release. The MeoSQL adapter
-(`src/adapter/meosql.mettle`) is a stub until MeoSQL has its network server;
-the tests run against an in-memory adapter that records statements.
+interpreter, debug and release. The MeoSQL adapter talks to MeoSQL's server
+over its wire protocol; it is tested against a scripted server until the real
+one is released. The other tests run against an in-memory adapter that records
+statements.
 
 ## Layout
 
@@ -17,7 +18,8 @@ src/flux_orm.mettle  the import root
 src/core/            values, status codes, model metadata, entities, sessions,
                      clock, single-row insert/load/delete
 src/adapter/         the adapter interface (SQL text, or statements as data),
-                     the in-memory test adapter, MeoSQL
+                     the in-memory test adapter, the MeoSQL wire codec and
+                     network adapter
 src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
 src/changeset/       casting user input, dirty fields, validations, save
 src/relation/        has-many / belongs-to / through, loaded in batches
@@ -75,6 +77,14 @@ flux_orm=../flux_orm/src
 ```mettle
 import "flux_orm/flux_orm";
 import "flux_orm/core/clock_linux";   // the real clock, if you use timestamps
+import "flux_orm/adapter/meosql";     // the MeoSQL adapter, if you use MeoSQL
+```
+
+Connect to MeoSQL's server (IPv4 address; the token is "" when it has none):
+
+```mettle
+var adapter: RcAdapter* = rc_meosql_adapter("token");
+rc_adapter_open(adapter, "127.0.0.1:5490");
 ```
 
 ```mettle

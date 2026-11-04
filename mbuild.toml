@@ -31,6 +31,9 @@ main = "tests/t_changeset.mettle"
 [bin.t_integration]
 main = "tests/t_integration.mettle"
 
+[bin.t_meosql]
+main = "tests/t_meosql.mettle"
+
 [bin.t_meta]
 main = "tests/t_meta.mettle"
 

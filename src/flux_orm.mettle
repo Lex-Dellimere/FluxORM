@@ -1,8 +1,9 @@
 // flux_orm: the import root. An app imports this one file to get the whole ORM.
 //
-// Not included: core/clock_linux (the real clock; import it where you call
-// rc_clock_set, it uses a syscall the compile-time interpreter cannot run) and
-// adapter/mem (the test adapter).
+// Not included, import them where you use them:
+//   core/clock_linux  the real clock for rc_clock_set (a syscall)
+//   adapter/meosql    the MeoSQL adapter (pulls in std/net)
+//   adapter/mem       the in-memory test adapter
 
 import "core/status";
 import "core/value";
@@ -14,7 +15,6 @@ import "core/clock";
 import "core/session";
 import "core/persist";
 import "adapter/adapter";
-import "adapter/meosql";
 import "query/dialect";
 import "query/builder";
 import "changeset/cast";
