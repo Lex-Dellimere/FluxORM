@@ -1,19 +1,14 @@
-// tests/models.mettle — the metadata generator, in the shape a user copies.
+// tests/models.mettle — the models the tests use, in the shape an app copies.
 //
-// This file is the template: a plain struct, one `comptime for` over its own
-// fields, one override table for the decisions a struct cannot express
-// (column names, keys, nullability, timestamps), one finalize call.
-//
-// The `comptime for` is the whole reflection story. Mettle reflects at compile
-// time and leaves nothing behind, so this file compiles to a static RcField
-// array with offsets the compiler chose. No macros, no build step, no
-// hand-maintained offset table.
-
-import "std/mem";
+// A model is a plain struct, an override table for what a struct cannot say
+// (column names, keys, NOT NULL, unique, timestamps, version), a field function
+// with one `comptime for`, and a `*_meta()` that builds the metadata once
+// (core/schema.mettle). Field names, offsets and types come from the compiler.
 
 import "../src/core/status";
 import "../src/core/value";
 import "../src/core/meta";
+import "../src/core/schema";
 
 // --- User --------------------------------------------------------------------
 
@@ -30,10 +25,6 @@ export struct User {
   role: Role;
 }
 
-var USER_FIELDS: RcField[8];
-var USER_META: RcMeta;
-var USER_READY: bool = false;
-
 const USER_COLS: RcColumn[8] = [
   { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
   { index: 1, column: "email", ty: RC_T_TEXT, flags: RC_F_NOT_NULL | RC_F_UNIQUE },
@@ -45,49 +36,22 @@ const USER_COLS: RcColumn[8] = [
   { index: 7, column: "role", ty: RC_T_I64, flags: RC_F_NOT_NULL },
 ];
 
-// The array is passed in, not captured: a module global referenced from inside
-// a comptime-for body in an *imported* module does not resolve (head compiler).
-// Taking the destination as a parameter sidesteps it and is clearer anyway.
-fn user_fields(out: RcField*) -> int32 {
-  var i: int32 = 0;
-  comptime for f in typeof(User).fields {
-    out[i].name = f.name;
-    out[i].column = f.name;
-    out[i].kind = f.type.kind;
-    out[i].ty = rc_kind_type(f.type.kind);
-    out[i].offset = (int32)f.offset;
-    out[i].size = (int32)f.type.size;
-    out[i].flags = 0;
-    i = i + 1;
-  }
-  return i;
-}
+var USER: RcSchema;
 
-fn user_build() -> int32 {
-  var i: int32 = user_fields(&USER_FIELDS[0]);
-  USER_META.table = "users";
-  USER_META.name = "User";
-  USER_META.size = (int32)sizeof(User);
-  USER_META.fields = &USER_FIELDS[0];
-  USER_META.n_fields = i;
-  USER_META.pk = -1;
-  return rc_meta_finalize(&USER_META, &USER_COLS[0], 8);
+fn user_fields(s: RcSchema*) {
+  comptime for f in typeof(User).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
 }
 
 export fn user_meta() -> RcMeta {
-  if (!USER_READY) {
-    user_build();
-    USER_READY = true;
-  }
-  return USER_META;
+  return rc_schema_meta(&USER, &user_fields, "users", "User", (int64)sizeof(User),
+                        &USER_COLS[0], 8);
 }
 
 export fn user_meta_status() -> int32 {
-  if (!USER_READY) {
-    user_build();
-    USER_READY = true;
-  }
-  return rc_meta_check(USER_META, 0);
+  user_meta();
+  return rc_schema_status(&USER);
 }
 
 // --- Post --------------------------------------------------------------------
@@ -100,10 +64,6 @@ export struct Post {
   published_at: int64;
 }
 
-var POST_FIELDS: RcField[5];
-var POST_META: RcMeta;
-var POST_READY: bool = false;
-
 const POST_COLS: RcColumn[5] = [
   { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
   { index: 1, column: "user_id", ty: RC_T_I64, flags: RC_F_NOT_NULL },
@@ -112,46 +72,22 @@ const POST_COLS: RcColumn[5] = [
   { index: 4, column: "published_at", ty: RC_T_TIME, flags: RC_F_TIMESTAMP },
 ];
 
-fn post_fields(out: RcField*) -> int32 {
-  var i: int32 = 0;
-  comptime for f in typeof(Post).fields {
-    out[i].name = f.name;
-    out[i].column = f.name;
-    out[i].kind = f.type.kind;
-    out[i].ty = rc_kind_type(f.type.kind);
-    out[i].offset = (int32)f.offset;
-    out[i].size = (int32)f.type.size;
-    out[i].flags = 0;
-    i = i + 1;
-  }
-  return i;
-}
+var POST: RcSchema;
 
-fn post_build() -> int32 {
-  var i: int32 = post_fields(&POST_FIELDS[0]);
-  POST_META.table = "posts";
-  POST_META.name = "Post";
-  POST_META.size = (int32)sizeof(Post);
-  POST_META.fields = &POST_FIELDS[0];
-  POST_META.n_fields = i;
-  POST_META.pk = -1;
-  return rc_meta_finalize(&POST_META, &POST_COLS[0], 5);
+fn post_fields(s: RcSchema*) {
+  comptime for f in typeof(Post).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
 }
 
 export fn post_meta() -> RcMeta {
-  if (!POST_READY) {
-    post_build();
-    POST_READY = true;
-  }
-  return POST_META;
+  return rc_schema_meta(&POST, &post_fields, "posts", "Post", (int64)sizeof(Post),
+                        &POST_COLS[0], 5);
 }
 
 export fn post_meta_status() -> int32 {
-  if (!POST_READY) {
-    post_build();
-    POST_READY = true;
-  }
-  return rc_meta_check(POST_META, 0);
+  post_meta();
+  return rc_schema_status(&POST);
 }
 
 // --- Note: a versioned table (RC_F_VERSION) -----------------------------------
@@ -162,56 +98,28 @@ export struct Note {
   version: int64;
 }
 
-var NOTE_FIELDS: RcField[3];
-var NOTE_META: RcMeta;
-var NOTE_READY: bool = false;
-
 const NOTE_COLS: RcColumn[3] = [
   { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
   { index: 1, column: "text", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
   { index: 2, column: "version", ty: RC_T_I64, flags: RC_F_VERSION | RC_F_NOT_NULL },
 ];
 
-fn note_fields(out: RcField*) -> int32 {
-  var i: int32 = 0;
-  comptime for f in typeof(Note).fields {
-    out[i].name = f.name;
-    out[i].column = f.name;
-    out[i].kind = f.type.kind;
-    out[i].ty = rc_kind_type(f.type.kind);
-    out[i].offset = (int32)f.offset;
-    out[i].size = (int32)f.type.size;
-    out[i].flags = 0;
-    i = i + 1;
-  }
-  return i;
-}
+var NOTE: RcSchema;
 
-fn note_build() -> int32 {
-  var i: int32 = note_fields(&NOTE_FIELDS[0]);
-  NOTE_META.table = "notes";
-  NOTE_META.name = "Note";
-  NOTE_META.size = (int32)sizeof(Note);
-  NOTE_META.fields = &NOTE_FIELDS[0];
-  NOTE_META.n_fields = i;
-  NOTE_META.pk = -1;
-  return rc_meta_finalize(&NOTE_META, &NOTE_COLS[0], 3);
+fn note_fields(s: RcSchema*) {
+  comptime for f in typeof(Note).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
 }
 
 export fn note_meta() -> RcMeta {
-  if (!NOTE_READY) {
-    note_build();
-    NOTE_READY = true;
-  }
-  return NOTE_META;
+  return rc_schema_meta(&NOTE, &note_fields, "notes", "Note", (int64)sizeof(Note),
+                        &NOTE_COLS[0], 3);
 }
 
 export fn note_meta_status() -> int32 {
-  if (!NOTE_READY) {
-    note_build();
-    NOTE_READY = true;
-  }
-  return rc_meta_check(NOTE_META, 0);
+  note_meta();
+  return rc_schema_status(&NOTE);
 }
 
 // --- Task: created/updated timestamps --------------------------------------
@@ -223,10 +131,6 @@ export struct Task {
   updated_at: int64;
 }
 
-var TASK_FIELDS: RcField[4];
-var TASK_META: RcMeta;
-var TASK_READY: bool = false;
-
 const TASK_COLS: RcColumn[4] = [
   { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
   { index: 1, column: "title", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
@@ -234,46 +138,22 @@ const TASK_COLS: RcColumn[4] = [
   { index: 3, column: "updated_at", ty: RC_T_TIME, flags: RC_F_UPDATED | RC_F_NOT_NULL },
 ];
 
-fn task_fields(out: RcField*) -> int32 {
-  var i: int32 = 0;
-  comptime for f in typeof(Task).fields {
-    out[i].name = f.name;
-    out[i].column = f.name;
-    out[i].kind = f.type.kind;
-    out[i].ty = rc_kind_type(f.type.kind);
-    out[i].offset = (int32)f.offset;
-    out[i].size = (int32)f.type.size;
-    out[i].flags = 0;
-    i = i + 1;
-  }
-  return i;
-}
+var TASK: RcSchema;
 
-fn task_build() -> int32 {
-  var i: int32 = task_fields(&TASK_FIELDS[0]);
-  TASK_META.table = "tasks";
-  TASK_META.name = "Task";
-  TASK_META.size = (int32)sizeof(Task);
-  TASK_META.fields = &TASK_FIELDS[0];
-  TASK_META.n_fields = i;
-  TASK_META.pk = -1;
-  return rc_meta_finalize(&TASK_META, &TASK_COLS[0], 4);
+fn task_fields(s: RcSchema*) {
+  comptime for f in typeof(Task).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
 }
 
 export fn task_meta() -> RcMeta {
-  if (!TASK_READY) {
-    task_build();
-    TASK_READY = true;
-  }
-  return TASK_META;
+  return rc_schema_meta(&TASK, &task_fields, "tasks", "Task", (int64)sizeof(Task),
+                        &TASK_COLS[0], 4);
 }
 
 export fn task_meta_status() -> int32 {
-  if (!TASK_READY) {
-    task_build();
-    TASK_READY = true;
-  }
-  return rc_meta_check(TASK_META, 0);
+  task_meta();
+  return rc_schema_status(&TASK);
 }
 
 // A fixed clock for the timestamp tests.
@@ -290,52 +170,26 @@ export struct Doc {
   attachment: uint8[];
 }
 
-var DOC_FIELDS: RcField[2];
-var DOC_META: RcMeta;
-var DOC_READY: bool = false;
+const DOC_COLS: RcColumn[1] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_NOT_NULL },
+];
 
-fn doc_fields(out: RcField*) -> int32 {
-  var i: int32 = 0;
+var DOC: RcSchema;
+
+fn doc_fields(s: RcSchema*) {
   comptime for f in typeof(Doc).fields {
-    out[i].name = f.name;
-    out[i].column = f.name;
-    out[i].kind = f.type.kind;
-    out[i].ty = rc_kind_type(f.type.kind);
-    out[i].offset = (int32)f.offset;
-    out[i].size = (int32)f.type.size;
-    out[i].flags = 0;
-    i = i + 1;
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
   }
-  return i;
-}
-
-fn doc_build() -> int32 {
-  var i: int32 = doc_fields(&DOC_FIELDS[0]);
-  DOC_META.table = "docs";
-  DOC_META.name = "Doc";
-  DOC_META.size = (int32)sizeof(Doc);
-  DOC_META.fields = &DOC_FIELDS[0];
-  DOC_META.n_fields = i;
-  DOC_META.pk = -1;
-  DOC_FIELDS[0].flags = RC_F_PK | RC_F_NOT_NULL;
-  DOC_META.pk = 0;
-  return rc_meta_check(DOC_META, 0);
 }
 
 export fn doc_meta() -> RcMeta {
-  if (!DOC_READY) {
-    doc_build();
-    DOC_READY = true;
-  }
-  return DOC_META;
+  return rc_schema_meta(&DOC, &doc_fields, "docs", "Doc", (int64)sizeof(Doc),
+                        &DOC_COLS[0], 1);
 }
 
 export fn doc_meta_status() -> int32 {
-  if (!DOC_READY) {
-    doc_build();
-    DOC_READY = true;
-  }
-  return rc_meta_check(DOC_META, 0);
+  doc_meta();
+  return rc_schema_status(&DOC);
 }
 
 export fn doc_field_count() -> int32 { return doc_meta().n_fields; }

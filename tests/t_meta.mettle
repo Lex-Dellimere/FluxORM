@@ -12,6 +12,7 @@ import "../src/core/status";
 import "../src/core/value";
 import "../src/core/meta";
 import "../src/core/entity";
+import "../src/core/schema";
 import "models";
 import "harness";
 
@@ -282,17 +283,44 @@ fn check_validation() -> int32 {
   return 0;
 }
 
+// A schema with more fields than the null bitmap holds is refused, not cut.
+var WIDE: RcSchema;
+
+fn wide_fields(s: RcSchema*) {
+  var i: int32 = 0;
+  while (i < 65) {
+    rc_schema_field(s, "f", Kind.Int64, (int64)i * 8, 8);
+    i = i + 1;
+  }
+}
+
+fn check_schema() -> int32 {
+  if (rc_schema_status(&WIDE) != RC_ERR_USAGE) { return 1; }  // not built yet
+  var m: RcMeta = rc_schema_meta(&WIDE, &wide_fields, "wide", "Wide", 520,
+                                 (RcColumn*)0, 0);
+  if (rc_schema_status(&WIDE) != RC_ERR_UNSUPPORTED) { return 2; }
+  if (m.n_fields != 65) { return 3; }
+  // The test models built with it are valid and keep their overrides.
+  if (user_meta_status() != RC_OK) { return 4; }
+  var u: RcMeta = user_meta();
+  if (u.pk != 0 || u.table != "users" || u.n_fields != 8) { return 5; }
+  if ((u.fields[1].flags & RC_F_UNIQUE) == 0 || u.fields[6].ty != RC_T_TIME) { return 6; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("meta: registry generated from typeof", check_generated())) { failures = failures + 1; }
   if (!rc_report("meta: access, nulls and ranges", check_access())) { failures = failures + 1; }
   if (!rc_report("meta: invalid tables are refused", check_validation())) { failures = failures + 1; }
-  return rc_summary(failures, 3);
+  if (!rc_report("meta: schemas build metadata once", check_schema())) { failures = failures + 1; }
+  return rc_summary(failures, 4);
 }
 
 @test fn t_meta() -> int32 {
   if (check_generated() != 0) { return 1; }
   if (check_access() != 0) { return 2; }
   if (check_validation() != 0) { return 3; }
+  if (check_schema() != 0) { return 4; }
   return 0;
 }

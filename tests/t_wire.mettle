@@ -1,0 +1,337 @@
+// tests/t_wire.mettle — the MeoSQL wire codec against docs/PROTOCOL.md.
+//
+// Expected bytes are built with this file's own little-endian writer from the
+// spec's tables, not with the codec, so a codec mistake cannot hide by being
+// repeated on both sides.
+
+import "std/mem";
+
+import "../src/flux_orm";
+import "../src/adapter/wire";
+import "models";
+import "harness";
+
+// --- an independent byte writer for expected frames --------------------------
+
+struct Exp {
+  b: uint8[512];
+  n: int32;
+}
+
+fn e_u8(e: Exp*, v: int64) {
+  e->b[e->n] = (uint8)(v & 255);
+  e->n = e->n + 1;
+}
+
+fn e_le(e: Exp*, v: int64, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    e_u8(e, (v >> (int64)(8 * i)) & 255);
+    i = i + 1;
+  }
+}
+
+fn e_str(e: Exp*, s: string) {
+  e_le(e, (int64)s.length, 2);
+  var i: uint64 = 0;
+  while (i < s.length) {
+    e_u8(e, (int64)s.chars[i]);
+    i = i + 1;
+  }
+}
+
+// The header for a payload of `len` bytes.
+fn e_header(e: Exp*, len: int64, kind: int32, rid: int64) {
+  e_le(e, len, 4);
+  e_u8(e, (int64)kind);
+  e_u8(e, 0);
+  e_le(e, 0, 2);
+  e_le(e, rid, 4);
+}
+
+fn same(w: RcWire*, e: Exp*) -> bool {
+  if (w->len != (int64)e->n) { return false; }
+  var i: int32 = 0;
+  while (i < e->n) {
+    if (w->data[i] != e->b[i]) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// --- 1. control frames ----------------------------------------------------------
+
+fn check_control() -> int32 {
+  var w: RcWire = rc_wire_new();
+  defer rc_wire_free(&w);
+  var e: Exp;
+  e.n = 0;
+
+  if (rc_wire_empty(&w, RC_WIRE_PING, 7) != RC_OK) { return 1; }
+  e_header(&e, 0, 2, 7);
+  if (!same(&w, &e)) { return 2; }
+
+  rc_wire_clear(&w);
+  e.n = 0;
+  if (rc_wire_begin(&w, 8, RC_TX_IMMEDIATE) != RC_OK) { return 3; }
+  e_header(&e, 1, 3, 8);
+  e_u8(&e, 2);
+  if (!same(&w, &e)) { return 4; }
+
+  // HELLO: "MEOS", major 1, minor 0, max_frame, token, name.
+  rc_wire_clear(&w);
+  e.n = 0;
+  if (rc_wire_hello(&w, 1, (uint32)16777216, "s3cret", "flux_orm") != RC_OK) { return 5; }
+  e_header(&e, 4 + 2 + 2 + 4 + 2 + 6 + 2 + 8, 1, 1);
+  e_u8(&e, 77);
+  e_u8(&e, 69);
+  e_u8(&e, 79);
+  e_u8(&e, 83);
+  e_le(&e, 1, 2);
+  e_le(&e, 0, 2);
+  e_le(&e, 16777216, 4);
+  e_str(&e, "s3cret");
+  e_str(&e, "flux_orm");
+  if (!same(&w, &e)) { return 6; }
+  // A name over 64 bytes is refused.
+  rc_wire_clear(&w);
+  if (rc_wire_hello(&w, 1, (uint32)65536, "", "01234567890123456789012345678901234567890123456789012345678901234") != RC_ERR_USAGE) { return 7; }
+  return 0;
+}
+
+// --- 2. values ------------------------------------------------------------------
+
+fn check_values() -> int32 {
+  var w: RcWire = rc_wire_new();
+  defer rc_wire_free(&w);
+  var e: Exp;
+  e.n = 0;
+  var blob: uint8[2];
+  blob[0] = (uint8)1;
+  blob[1] = (uint8)255;
+  var bb: RcBytes;
+  bb.data = &blob[0];
+  bb.len = 2;
+
+  if (rc_wire_val(&w, RcNull) != RC_OK) { return 1; }
+  if (rc_wire_val(&w, RcInt(-2)) != RC_OK) { return 2; }
+  if (rc_wire_val(&w, RcTime(5)) != RC_OK) { return 3; }
+  if (rc_wire_val(&w, RcBool(true)) != RC_OK) { return 4; }
+  if (rc_wire_val(&w, RcFloat(-0.0)) != RC_OK) { return 5; }
+  if (rc_wire_val(&w, RcText("hi")) != RC_OK) { return 6; }
+  if (rc_wire_val(&w, RcBlob(bb)) != RC_OK) { return 7; }
+  e_u8(&e, 0);
+  e_u8(&e, 1);
+  e_le(&e, -2, 8);
+  e_u8(&e, 1);
+  e_le(&e, 5, 8);
+  e_u8(&e, 1);
+  e_le(&e, 1, 8);
+  e_u8(&e, 2);                                // -0.0: only the sign bit
+  e_le(&e, 0, 7);
+  e_u8(&e, 128);
+  e_u8(&e, 3);
+  e_le(&e, 2, 4);
+  e_u8(&e, 104);
+  e_u8(&e, 105);
+  e_u8(&e, 4);
+  e_le(&e, 2, 4);
+  e_u8(&e, 1);
+  e_u8(&e, 255);
+  if (!same(&w, &e)) { return 8; }
+
+  // Above INT64_MAX does not fit and is not written.
+  var before: int64 = w.len;
+  if (rc_wire_val(&w, RcUint((uint64)9223372036854775808)) != RC_ERR_RANGE) { return 9; }
+  if (w.len != before) { return 10; }
+  return 0;
+}
+
+// --- 3. QUERY carries the RcStmt ------------------------------------------------
+
+fn check_query() -> int32 {
+  var w: RcWire = rc_wire_new();
+  defer rc_wire_free(&w);
+  var e: Exp;
+  e.n = 0;
+
+  var q: RcQuery = rc_query_select(note_meta());
+  defer rc_query_free(&q);
+  if (rc_query_where_eq(&q, 0, RcInt(5)) != RC_OK) { return 1; }
+  if (rc_query_order_by(&q, 2, false) != RC_OK) { return 2; }
+  if (rc_query_limit(&q, 1) != RC_OK) { return 3; }
+  if (rc_wire_query(&w, 3, rc_query_stmt(&q)) != RC_OK) { return 4; }
+
+  var p: Exp;
+  p.n = 0;
+  e_u8(&p, 3);              // op SELECT
+  e_u8(&p, 0);              // sflags
+  e_str(&p, "notes");
+  e_str(&p, "");
+  e_le(&p, 3, 2);           // picked columns: no type, no flags
+  e_str(&p, "id");
+  e_le(&p, 0, 2);
+  e_str(&p, "text");
+  e_le(&p, 0, 2);
+  e_str(&p, "version");
+  e_le(&p, 0, 2);
+  e_le(&p, 0, 4);           // n_rows
+  e_le(&p, 1, 2);           // one term: id EQ args[0..1)
+  e_str(&p, "id");
+  e_u8(&p, 0);
+  e_le(&p, 0, 4);
+  e_le(&p, 1, 4);
+  e_le(&p, 1, 2);           // order: version DESC
+  e_str(&p, "version");
+  e_u8(&p, 1);
+  e_le(&p, 1, 8);           // limit
+  e_le(&p, 0, 8);           // offset
+  e_le(&p, 1, 4);           // n_args
+  e_u8(&p, 1);
+  e_le(&p, 5, 8);
+  e_header(&e, (int64)p.n, 6, 3);
+  var i: int32 = 0;
+  while (i < p.n) {
+    e_u8(&e, (int64)p.b[i]);
+    i = i + 1;
+  }
+  if (!same(&w, &e)) { return 5; }
+
+  // CREATE sends column types and the wire's own flags (PK 1, NOT NULL 2).
+  var st: RcStmt;
+  if (rc_migration_create_stmt(note_meta(), &st) != RC_OK) { return 6; }
+  defer rc_stmt_free(&st);
+  rc_wire_clear(&w);
+  if (rc_wire_query(&w, 4, &st) != RC_OK) { return 7; }
+  // op, sflags (if_not_exists), table, name, n_cols, then "id": type 1, flags 3.
+  var at: int64 = (int64)RC_WIRE_HEADER;
+  if (w.data[at] != (uint8)1 || w.data[at + 1] != (uint8)1) { return 8; }
+  at = at + 2 + 2 + 5 + 2 + 2;            // past table "notes", name "", n_cols
+  if (w.data[at + 2 + 2] != (uint8)1 || w.data[at + 2 + 3] != (uint8)3) { return 9; }
+
+  // A statement with a join is refused, not sent.
+  var jq: RcQuery = rc_query_select(user_meta());
+  defer rc_query_free(&jq);
+  if (rc_query_join(&jq, post_meta(), 0, 1, RC_JOIN_INNER) != RC_OK) { return 10; }
+  if (rc_wire_query(&w, 5, rc_query_stmt(&jq)) != RC_ERR_UNSUPPORTED) { return 11; }
+  return 0;
+}
+
+// --- 4. decoding replies ---------------------------------------------------------
+
+fn check_decode() -> int32 {
+  var e: Exp;
+  e.n = 0;
+  e_header(&e, 9, 66, 4);
+  var len: int64 = 0;
+  var kind: int32 = 0;
+  var rid: uint32 = 0;
+  if (rc_wire_header(&e.b[0], &len, &kind, &rid) != RC_OK) { return 1; }
+  if (len != 9 || kind != RC_WIRE_ERROR || rid != (uint32)4) { return 2; }
+  e.b[5] = (uint8)1;                       // flags must be 0
+  if (rc_wire_header(&e.b[0], &len, &kind, &rid) != RC_ERR_ADAPTER) { return 3; }
+
+  // HELLO_OK
+  var h: Exp;
+  h.n = 0;
+  e_le(&h, 1, 2);
+  e_le(&h, 0, 2);
+  e_le(&h, 16777216, 4);
+  e_le(&h, 42, 8);
+  e_le(&h, 3, 4);
+  e_str(&h, "meosql 0.1.0");
+  var hello: RcWireHello;
+  if (rc_wire_hello_ok(&h.b[0], (int64)h.n, &hello) != RC_OK) { return 4; }
+  if (hello.max_frame != 16777216 || hello.caps != 3 || hello.name != "meosql 0.1.0") { return 5; }
+  if (rc_wire_hello_ok(&h.b[0], (int64)h.n - 1, &hello) != RC_ERR_ADAPTER) { return 6; }
+
+  // ERROR: CONFLICT, not fatal, transaction still open.
+  var er: Exp;
+  er.n = 0;
+  e_le(&er, 13, 4);
+  e_u8(&er, 0);
+  e_u8(&er, 1);
+  e_str(&er, "duplicate key");
+  var err: RcWireError;
+  if (rc_wire_error(&er.b[0], (int64)er.n, &err) != RC_OK) { return 7; }
+  if (err.code != 13 || err.fatal || err.tx != 1 || err.message != "duplicate key") { return 8; }
+  if (rc_wire_status(err.code) != RC_ERR_CONFLICT) { return 9; }
+  er.b[5] = (uint8)3;                      // tx > 2
+  if (rc_wire_error(&er.b[0], (int64)er.n, &err) != RC_ERR_ADAPTER) { return 10; }
+
+  // RESULT: two rows, (INT, TEXT) and (NULL, REAL).
+  var rs: Exp;
+  rs.n = 0;
+  e_le(&rs, 0, 4);
+  e_le(&rs, 0, 8);
+  e_le(&rs, 2, 2);
+  e_u8(&rs, 1);
+  e_u8(&rs, 3);
+  e_le(&rs, 2, 4);
+  e_u8(&rs, 1);
+  e_le(&rs, 7, 8);
+  e_u8(&rs, 3);
+  e_le(&rs, 3, 4);
+  e_u8(&rs, 65);
+  e_u8(&rs, 100);
+  e_u8(&rs, 97);
+  e_u8(&rs, 0);
+  e_u8(&rs, 2);
+  e_le(&rs, 4612811918334230528, 8);       // 2.5
+  var res: RcResult;
+  if (rc_wire_result(&rs.b[0], (int64)rs.n, &res) != RC_OK) { return 11; }
+  defer rc_result_free(&res);
+  if (res.n_rows != 2 || res.n_cols != 2) { return 12; }
+  if (!rc_value_same(rc_result_borrow(&res, 0, 0), RcInt(7))) { return 13; }
+  if (!rc_value_same(rc_result_borrow(&res, 0, 1), RcText("Ada"))) { return 14; }
+  if (!rc_value_is_null(rc_result_borrow(&res, 1, 0))) { return 15; }
+  if (!rc_value_same(rc_result_borrow(&res, 1, 1), RcFloat(2.5))) { return 16; }
+  // The text is a copy: it outlives the payload bytes.
+  rs.b[rs.n - 13] = (uint8)90;
+  if (!rc_value_same(rc_result_borrow(&res, 0, 1), RcText("Ada"))) { return 17; }
+
+  // A trailing byte, a short payload, and an unknown tag are all refused.
+  var bad: RcResult;
+  e_u8(&rs, 0);
+  if (rc_wire_result(&rs.b[0], (int64)rs.n, &bad) != RC_ERR_ADAPTER) { return 18; }
+  if (rc_wire_result(&rs.b[0], (int64)rs.n - 3, &bad) != RC_ERR_ADAPTER) { return 19; }
+  var t: Exp;
+  t.n = 0;
+  e_le(&t, 1, 4);
+  e_le(&t, 9, 8);
+  e_le(&t, 1, 2);
+  e_u8(&t, 0);
+  e_le(&t, 1, 4);
+  e_u8(&t, 7);                             // tag 7 does not exist
+  if (rc_wire_result(&t.b[0], (int64)t.n, &bad) != RC_ERR_ADAPTER) { return 20; }
+
+  // A write's result: no rows, the counts carried.
+  var wr: Exp;
+  wr.n = 0;
+  e_le(&wr, 3, 4);
+  e_le(&wr, 41, 8);
+  e_le(&wr, 0, 2);
+  e_le(&wr, 0, 4);
+  var wres: RcResult;
+  if (rc_wire_result(&wr.b[0], (int64)wr.n, &wres) != RC_OK) { return 21; }
+  if (wres.affected != 3 || wres.last_id != 41 || wres.n_rows != 0) { return 22; }
+  rc_result_free(&wres);
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("wire: control frames", check_control())) { failures = failures + 1; }
+  if (!rc_report("wire: values", check_values())) { failures = failures + 1; }
+  if (!rc_report("wire: QUERY carries the RcStmt", check_query())) { failures = failures + 1; }
+  if (!rc_report("wire: decoding replies", check_decode())) { failures = failures + 1; }
+  return rc_summary(failures, 4);
+}
+
+@test fn t_wire() -> int32 {
+  if (check_control() != 0) { return 1; }
+  if (check_values() != 0) { return 2; }
+  if (check_query() != 0) { return 3; }
+  if (check_decode() != 0) { return 4; }
+  return 0;
+}
