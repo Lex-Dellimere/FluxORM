@@ -20,6 +20,7 @@ src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
 src/changeset/       casting user input, dirty fields, save
 src/relation/        has-many / belongs-to / through, loaded in batches
 src/migration/       CREATE TABLE from metadata, versioned migrations
+src/repo/            insert, get, one, all, update, delete through a session
 tests/               models.mettle (the model template), one t_*.mettle per area
 ```
 
@@ -62,45 +63,51 @@ import "flux_orm/core/clock_linux";   // the real clock, if you use timestamps
 ```mettle
 rc_clock_set(&rc_clock_realtime_us);  // once, if any model has timestamps
 var s: RcSession = rc_session_new(adapter);
-var a: RcAdapter* = rc_session_adapter(&s);
+defer rc_session_free(&s);
 
-// Insert: the store assigns the id, the version starts at 1.
+// Insert through a changeset: casts and NOT NULL checks run first.
 var n: Note;
 memset((rawptr)&n, 0, (int64)sizeof(Note));
 var e: RcEntity = rc_entity_new(note_meta(), (rawptr)&n);
-rc_entity_set(&e, 1, RcText("draft"));
-rc_persist_insert(a, &e);
-
-// Change one field and save it. Only "text" is sent, keyed by id and version.
 var cs: RcChangeset = rc_changeset_new(note_meta());
-rc_changeset_bind(&cs, (rawptr)&n, e.nulls);
-rc_changeset_put_text(&cs, 1, "final");
-var rc: int32 = rc_changeset_save(a, &cs, &e);
-// RC_ERR_CONFLICT: someone else changed the row first; nothing was written.
+rc_changeset_put_text(&cs, 1, "draft");
+rc_repo_insert(&s, &cs, &e);
 rc_changeset_free(&cs);
 
-// Query, then fill a model from each row. Text fields point into `res`,
-// so free it after the last use of the models.
+// Load by key, change one field, save. Only "text" is sent, matched on the
+// version the row was read with.
+var got: Note;
+var ge: RcEntity;
+rc_repo_get(&s, note_meta(), RcInt(n.id), (rawptr)&got, &ge);
+var edit: RcChangeset = rc_changeset_new(note_meta());
+rc_changeset_bind(&edit, (rawptr)&got, ge.nulls);
+rc_changeset_put_text(&edit, 1, "final");
+var rc: int32 = rc_repo_update(&s, &edit, &ge);
+// RC_ERR_CONFLICT: someone else changed the row first; nothing was written.
+rc_changeset_free(&edit);
+
+// Query, and read each row into a model.
 var q: RcQuery = rc_query_select(note_meta());
 rc_query_where_cmp(&q, 2, RC_CMP_GT, RcInt(1));
 rc_query_order_by(&q, 0, true);
-var res: RcResult;
-rc_query_exec(&q, a, &res);
+var rows: RcRows;
+rc_repo_all(&s, &q, &rows);
 var i: int32 = 0;
-while (i < res.n_rows) {
+while (i < rows.n) {
   var row: Note;
-  var row_nulls: uint64 = 0;
-  memset((rawptr)&row, 0, (int64)sizeof(Note));
-  rc_persist_hydrate(note_meta(), &res, i, (rawptr)&row, &row_nulls);
-  // rc_entity_loaded(note_meta(), (rawptr)&row, row_nulls) to edit and save it
+  var re: RcEntity;
+  rc_rows_get(&rows, i, (rawptr)&row, &re);
   i = i + 1;
 }
-rc_result_free(&res);
 rc_query_free(&q);
+
+// Loaded models point into rows the session keeps. Clear them when done.
+rc_session_clear(&s);
 ```
 
-Every call returns an `RC_*` code (`src/core/status.mettle`). Wrap related
-writes in `rc_session_begin`/`rc_session_commit`, or `rc_session_transaction`.
+Every call returns an `RC_*` code (`src/core/status.mettle`). `rc_repo_one`
+expects exactly one row. Wrap related writes in
+`rc_session_begin`/`rc_session_commit`, or `rc_session_transaction`.
 
 ## Build and test
 

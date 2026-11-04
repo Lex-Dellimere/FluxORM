@@ -14,6 +14,13 @@
 //
 // One thread per session while a transaction is open: MeoSQL's lock belongs
 // to the thread that called begin.
+//
+// Loaded rows: a model's text fields point into the result it was loaded
+// from, so the session keeps those results (rc_session_keep) until
+// rc_session_clear or rc_session_free. Clear when the models from a batch of
+// work are no longer used; every model loaded before that is invalid after.
+
+import "std/mem";
 
 import "status";
 import "../adapter/adapter";
@@ -23,6 +30,9 @@ export struct RcSession {
   depth: int32;   // 0 = no transaction open; 1 = the adapter's transaction
   doomed: bool;   // an inner level rolled back: the outer commit rolls back
   mode: int32;    // RC_TX_* of the outermost begin
+  kept: RcResult**; // results loaded models point into, owned
+  n_kept: int32;
+  cap_kept: int32;
 }
 
 export fn rc_session_new(a: RcAdapter*) -> RcSession {
@@ -31,7 +41,61 @@ export fn rc_session_new(a: RcAdapter*) -> RcSession {
   s.depth = 0;
   s.doomed = false;
   s.mode = RC_TX_DEFAULT;
+  s.kept = 0;
+  s.n_kept = 0;
+  s.cap_kept = 0;
   return s;
+}
+
+// Moves `*res` into the session and points `*out` at the kept copy, which
+// stays valid until rc_session_clear. `*res` is left empty.
+export fn rc_session_keep(s: RcSession*, res: RcResult*, out: RcResult**) -> int32 {
+  if (s == 0 || res == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (s->n_kept == s->cap_kept) {
+    var cap: int32 = s->cap_kept * 2;
+    if (cap < 8) { cap = 8; }
+    var p: rawptr = realloc((rawptr)s->kept, (int64)cap * (int64)sizeof(RcResult*));
+    if (p == 0) { return RC_ERR_NOMEM; }
+    s->kept = (RcResult**)p;
+    s->cap_kept = cap;
+  }
+  var r: RcResult* = malloc(sizeof(RcResult));
+  if (r == 0) { return RC_ERR_NOMEM; }
+  *r = *res;
+  rc_result_init(res);
+  s->kept[s->n_kept] = r;
+  s->n_kept = s->n_kept + 1;
+  *out = r;
+  return RC_OK;
+}
+
+// Frees every kept result. Models loaded through this session are invalid
+// afterwards; the session itself stays usable.
+export fn rc_session_clear(s: RcSession*) {
+  if (s == 0) { return; }
+  var i: int32 = 0;
+  while (i < s->n_kept) {
+    rc_result_free(s->kept[i]);
+    free(s->kept[i]);
+    i = i + 1;
+  }
+  s->n_kept = 0;
+}
+
+// Clears and releases the session's own memory. It does not close the adapter.
+export fn rc_session_free(s: RcSession*) {
+  if (s == 0) { return; }
+  rc_session_clear(s);
+  if (s->kept != 0) {
+    free(s->kept);
+    s->kept = 0;
+  }
+  s->cap_kept = 0;
+}
+
+export fn rc_session_kept(s: RcSession*) -> int32 {
+  if (s == 0) { return 0; }
+  return s->n_kept;
 }
 
 export fn rc_session_adapter(s: RcSession*) -> RcAdapter* {

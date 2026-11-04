@@ -1,0 +1,120 @@
+// flux_orm/repo/repo.mettle — one place to read and write models, after
+// Ecto's Repo. The session is the repo: every call takes an RcSession*.
+//
+//   rc_repo_insert(s, cs, e)          insert a NEW entity, applying cs first
+//   rc_repo_update(s, cs, e)          save cs's dirty fields
+//   rc_repo_delete(s, e)              delete by key
+//   rc_repo_get(s, m, pk, model, e)   load by key; RC_ERR_NOT_FOUND if none
+//   rc_repo_one(s, q, model, e)       exactly one row
+//   rc_repo_all(s, q, rows)           every row; read them with rc_rows_get
+//
+// Loaded models point into results the session keeps, so they stay valid
+// until rc_session_clear. Every entity a read hands back is CLEAN.
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/entity";
+import "../core/session";
+import "../core/persist";
+import "../adapter/adapter";
+import "../query/builder";
+import "../changeset/changeset";
+
+// The rows of one rc_repo_all. `res` belongs to the session.
+export struct RcRows {
+  meta: RcMeta;
+  res: RcResult*;
+  n: int32;
+}
+
+// Inserts e, which must be NEW. A changeset (or 0) is applied first, so its
+// casts and NOT NULL checks run before anything is sent.
+export fn rc_repo_insert(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32 {
+  if (s == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
+  if (cs != 0) {
+    var rc: int32 = rc_changeset_apply(cs, e);
+    if (rc != RC_OK) { return rc; }
+  }
+  return rc_persist_insert(rc_session_adapter(s), e);
+}
+
+export fn rc_repo_update(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32 {
+  if (s == 0) { return RC_ERR_USAGE; }
+  return rc_changeset_save(rc_session_adapter(s), cs, e);
+}
+
+export fn rc_repo_delete(s: RcSession*, e: RcEntity*) -> int32 {
+  if (s == 0) { return RC_ERR_USAGE; }
+  return rc_persist_delete(rc_session_adapter(s), e);
+}
+
+// Loads the row with primary key `pk` into `model` (m.size bytes, zeroed
+// here) and sets *e to a CLEAN entity for it.
+export fn rc_repo_get(s: RcSession*, m: RcMeta, pk: RcValue, model: rawptr,
+                      e: RcEntity*) -> int32 {
+  if (s == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  memset(model, 0, (int64)m.size);
+  var nulls: uint64 = 0;
+  var res: RcResult;
+  var rc: int32 = rc_persist_load(rc_session_adapter(s), m, pk, model, &nulls, &res);
+  if (rc != RC_OK) { return rc; }
+  var kept: RcResult* = 0;
+  rc = rc_session_keep(s, &res, &kept);
+  if (rc != RC_OK) {
+    rc_result_free(&res);
+    return rc;
+  }
+  *e = rc_entity_loaded(m, model, nulls);
+  return RC_OK;
+}
+
+// Runs q and keeps its result in the session.
+fn rc_repo_run(s: RcSession*, q: RcQuery*, out: RcResult**) -> int32 {
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_session_keep(s, &res, out);
+  if (rc != RC_OK) { rc_result_free(&res); }
+  return rc;
+}
+
+// Every row of q. Read row i with rc_rows_get.
+export fn rc_repo_all(s: RcSession*, q: RcQuery*, rows: RcRows*) -> int32 {
+  if (s == 0 || q == 0 || rows == 0) { return RC_ERR_USAGE; }
+  rows->meta = q->meta;
+  rows->res = 0;
+  rows->n = 0;
+  var res: RcResult* = 0;
+  var rc: int32 = rc_repo_run(s, q, &res);
+  if (rc != RC_OK) { return rc; }
+  rows->res = res;
+  rows->n = res->n_rows;
+  return RC_OK;
+}
+
+// Exactly one row: RC_ERR_NOT_FOUND for none, RC_ERR_USAGE for more than one
+// (the query was not narrow enough, like Ecto's MultipleResultsError).
+export fn rc_repo_one(s: RcSession*, q: RcQuery*, model: rawptr, e: RcEntity*) -> int32 {
+  if (s == 0 || q == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  var rows: RcRows;
+  var rc: int32 = rc_repo_all(s, q, &rows);
+  if (rc != RC_OK) { return rc; }
+  if (rows.n == 0) { return RC_ERR_NOT_FOUND; }
+  if (rows.n > 1) { return RC_ERR_USAGE; }
+  return rc_rows_get(&rows, 0, model, e);
+}
+
+// Fills `model` (zeroed here) from row i and sets *e to a CLEAN entity.
+export fn rc_rows_get(rows: RcRows*, i: int32, model: rawptr, e: RcEntity*) -> int32 {
+  if (rows == 0 || rows->res == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  memset(model, 0, (int64)rows->meta.size);
+  var nulls: uint64 = 0;
+  var rc: int32 = rc_persist_hydrate(rows->meta, rows->res, i, model, &nulls);
+  if (rc != RC_OK) { return rc; }
+  *e = rc_entity_loaded(rows->meta, model, nulls);
+  return RC_OK;
+}
