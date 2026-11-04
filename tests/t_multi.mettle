@@ -1,0 +1,253 @@
+// tests/t_multi.mettle — named steps in one transaction: all commit, or the
+// first failure rolls back, is named, and the entities are put back.
+
+import "std/mem";
+
+import "../src/flux_orm";
+import "../src/adapter/mem";
+import "models";
+import "harness";
+
+fn new_adapter(out: RcAdapter**) -> int32 {
+  var a: RcAdapter* = rc_mem_adapter();
+  if (a == 0) { return RC_ERR_NOMEM; }
+  if (rc_adapter_open(a, "mem://flux_orm") != RC_OK) {
+    rc_mem_free(a);
+    return RC_ERR_ADAPTER;
+  }
+  *out = a;
+  return RC_OK;
+}
+
+// A loaded Note: id 5, version 3.
+fn loaded_note(n: Note*, e: RcEntity*) -> int32 {
+  memset((rawptr)n, 0, (int64)sizeof(Note));
+  *e = rc_entity_new(note_meta(), (rawptr)n);
+  if (rc_entity_set(e, 0, RcInt(5)) != RC_OK) { return 1; }
+  if (rc_entity_set(e, 1, RcText("draft")) != RC_OK) { return 2; }
+  if (rc_entity_set(e, 2, RcInt(3)) != RC_OK) { return 3; }
+  e->state = RC_ST_CLEAN;
+  return 0;
+}
+
+// The pieces most checks share: a new post to insert, a loaded note to edit,
+// and a loaded user to delete.
+struct Fixture {
+  post: Post;
+  pe: RcEntity;
+  pcs: RcChangeset;
+  note: Note;
+  ne: RcEntity;
+  ncs: RcChangeset;
+  user: User;
+  ue: RcEntity;
+}
+
+fn fixture(f: Fixture*) -> int32 {
+  memset((rawptr)&f->post, 0, (int64)sizeof(Post));
+  f->pe = rc_entity_new(post_meta(), (rawptr)&f->post);
+  f->pcs = rc_changeset_new(post_meta());
+  if (rc_changeset_put_text(&f->pcs, 1, "7") != RC_OK) { return 1; }
+  if (rc_changeset_put_text(&f->pcs, 2, "Hello") != RC_OK) { return 2; }
+  if (loaded_note(&f->note, &f->ne) != 0) { return 3; }
+  f->ncs = rc_changeset_new(note_meta());
+  if (rc_changeset_bind(&f->ncs, (rawptr)&f->note, f->ne.nulls) != RC_OK) { return 4; }
+  if (rc_changeset_put_text(&f->ncs, 1, "final") != RC_OK) { return 5; }
+  memset((rawptr)&f->user, 0, (int64)sizeof(User));
+  f->ue = rc_entity_loaded(user_meta(), (rawptr)&f->user, (uint64)0);
+  if (rc_entity_set(&f->ue, 0, RcInt(9)) != RC_OK) { return 6; }
+  f->ue.state = RC_ST_CLEAN;
+  return 0;
+}
+
+fn fixture_free(f: Fixture*) {
+  rc_changeset_free(&f->pcs);
+  rc_changeset_free(&f->ncs);
+}
+
+fn add_steps(m: RcMulti*, f: Fixture*) -> int32 {
+  if (rc_multi_insert(m, "post", &f->pcs, &f->pe) != RC_OK) { return 1; }
+  if (rc_multi_update(m, "note", &f->ncs, &f->ne) != RC_OK) { return 2; }
+  if (rc_multi_delete(m, "user", &f->ue) != RC_OK) { return 3; }
+  return 0;
+}
+
+// --- 1. every step runs and commits once --------------------------------------
+
+fn check_commit() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var f: Fixture;
+  if (fixture(&f) != 0) { return 2; }
+  defer fixture_free(&f);
+  var m: RcMulti = rc_multi_new();
+  defer rc_multi_free(&m);
+  if (add_steps(&m, &f) != 0) { return 3; }
+
+  // Names are unique.
+  if (rc_multi_delete(&m, "user", &f.ue) != RC_ERR_USAGE) { return 4; }
+
+  var vals: RcValue[8];
+  vals[4] = RcBool(false);
+  var up: RcQuery = rc_query_update_all(user_meta(), rc_nulls_set((uint64)0, 4), &vals[0]);
+  defer rc_query_free(&up);
+  if (rc_query_where_eq(&up, 7, RcInt(2)) != RC_OK) { return 5; }
+  if (rc_multi_update_all(&m, "deactivate", &up) != RC_OK) { return 6; }
+
+  if (rc_mem_push_ok(a, 1, 40) != RC_OK) { return 7; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 8; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 9; }
+  if (rc_mem_push_ok(a, 6, 0) != RC_OK) { return 10; }
+  if (rc_repo_multi(&s, &m, RC_TX_IMMEDIATE) != RC_OK) { return 11; }
+  if (rc_mem_commits(a) != 1 || rc_mem_rollbacks(a) != 0) { return 12; }
+  if (rc_mem_call_count(a) != 4) { return 13; }
+  if (rc_multi_failed_name(&m) != "") { return 14; }
+  if (f.post.id != 40 || f.pe.state != RC_ST_CLEAN) { return 15; }
+  if (f.note.version != 4 || f.ne.state != RC_ST_CLEAN) { return 16; }
+  if (f.ue.state != RC_ST_DELETED) { return 17; }
+  if (rc_multi_rows(&m, "deactivate") != 6) { return 18; }
+  return 0;
+}
+
+// --- 2. a failed step rolls back and the entities are put back --------------
+
+// A step that makes the next statement fail, the first time only.
+struct Arm {
+  a: RcAdapter*;
+  times: int32;
+}
+
+fn arm(ctx: rawptr, s: RcSession*) -> int32 {
+  var x: Arm* = (Arm*)ctx;
+  if (x->times > 0) {
+    x->times = x->times - 1;
+    rc_mem_fail_next(x->a, RC_ERR_CONFLICT);
+  }
+  return RC_OK;
+}
+
+fn check_rollback() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var f: Fixture;
+  if (fixture(&f) != 0) { return 2; }
+  defer fixture_free(&f);
+  var m: RcMulti = rc_multi_new();
+  defer rc_multi_free(&m);
+  var x: Arm;
+  x.a = a;
+  x.times = 1;
+  if (rc_multi_insert(&m, "post", &f.pcs, &f.pe) != RC_OK) { return 3; }
+  if (rc_multi_update(&m, "note", &f.ncs, &f.ne) != RC_OK) { return 4; }
+  if (rc_multi_run(&m, "arm", &arm, (rawptr)&x) != RC_OK) { return 5; }
+  if (rc_multi_delete(&m, "user", &f.ue) != RC_OK) { return 6; }
+
+  // post and note go through, then deleting the user fails.
+  if (rc_mem_push_ok(a, 1, 40) != RC_OK) { return 7; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 8; }
+  if (rc_repo_multi(&s, &m, RC_TX_DEFAULT) != RC_ERR_CONFLICT) { return 9; }
+  if (rc_multi_failed_name(&m) != "user" || rc_multi_failed_step(&m) != 3) { return 10; }
+  if (rc_mem_commits(a) != 0 || rc_mem_rollbacks(a) != 1) { return 11; }
+  if (rc_session_in_tx(&s)) { return 12; }
+
+  // Put back: the post is NEW with no key, the note has its old version and
+  // is DIRTY, the user is as it was.
+  if (f.pe.state != RC_ST_NEW || rc_entity_has_pk(&f.pe)) { return 13; }
+  if (f.note.version != 3 || f.ne.state != RC_ST_DIRTY) { return 14; }
+  if (f.ue.state != RC_ST_CLEAN) { return 15; }
+
+  // So the same Multi can simply run again.
+  if (rc_mem_push_ok(a, 1, 41) != RC_OK) { return 16; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 17; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 18; }
+  if (rc_repo_multi(&s, &m, RC_TX_DEFAULT) != RC_OK) { return 19; }
+  if (f.post.id != 41 || f.note.version != 4) { return 20; }
+  if (f.ue.state != RC_ST_DELETED) { return 21; }
+  if (rc_mem_commits(a) != 1) { return 22; }
+  return 0;
+}
+
+// --- 3. a step of your own, and a failed commit ------------------------------
+
+fn fails(ctx: rawptr, s: RcSession*) -> int32 { return RC_ERR_CONSTRAINT; }
+fn passes(ctx: rawptr, s: RcSession*) -> int32 { return RC_OK; }
+
+var FAKE_ROLLBACKS: int32 = 0;
+fn fake_begin(ud: rawptr, mode: int32) -> int32 { return RC_OK; }
+fn fake_commit_fails(ud: rawptr) -> int32 { return RC_ERR_ADAPTER; }
+fn fake_rollback(ud: rawptr) -> int32 {
+  FAKE_ROLLBACKS = FAKE_ROLLBACKS + 1;
+  return RC_OK;
+}
+
+fn check_run_and_commit() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+
+  var m: RcMulti = rc_multi_new();
+  defer rc_multi_free(&m);
+  if (rc_multi_run(&m, "first", &passes, 0) != RC_OK) { return 2; }
+  if (rc_multi_run(&m, "check", &fails, 0) != RC_OK) { return 3; }
+  if (rc_repo_multi(&s, &m, RC_TX_DEFAULT) != RC_ERR_CONSTRAINT) { return 4; }
+  if (rc_multi_failed_name(&m) != "check") { return 5; }
+
+  var f: RcAdapter = rc_adapter_empty();
+  f.begin = &fake_begin;
+  f.commit = &fake_commit_fails;
+  f.rollback = &fake_rollback;
+  var fs: RcSession = rc_session_new(&f);
+  defer rc_session_free(&fs);
+  var m2: RcMulti = rc_multi_new();
+  defer rc_multi_free(&m2);
+  if (rc_multi_run(&m2, "only", &passes, 0) != RC_OK) { return 6; }
+  if (rc_repo_multi(&fs, &m2, RC_TX_DEFAULT) != RC_ERR_ADAPTER) { return 7; }
+  if (rc_multi_failed_name(&m2) != "commit") { return 8; }
+  if (FAKE_ROLLBACKS != 1) { return 9; }
+  return 0;
+}
+
+// --- 4. inside an open transaction a failure dooms the outer one ------------
+
+fn check_nested() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var s: RcSession = rc_session_new(a);
+  defer rc_session_free(&s);
+  var m: RcMulti = rc_multi_new();
+  defer rc_multi_free(&m);
+  if (rc_multi_run(&m, "check", &fails, 0) != RC_OK) { return 2; }
+
+  if (rc_session_begin(&s, RC_TX_DEFAULT) != RC_OK) { return 3; }
+  if (rc_repo_multi(&s, &m, RC_TX_DEFAULT) != RC_ERR_CONSTRAINT) { return 4; }
+  if (!rc_session_doomed(&s)) { return 5; }
+  if (rc_session_commit(&s) != RC_ERR_TX) { return 6; }
+  if (rc_mem_commits(a) != 0 || rc_mem_rollbacks(a) != 1) { return 7; }
+  return 0;
+}
+
+export fn main() -> int32 {
+  var failures: int32 = 0;
+  if (!rc_report("multi: every step runs and commits once", check_commit())) { failures = failures + 1; }
+  if (!rc_report("multi: a failed step rolls back and is undone", check_rollback())) { failures = failures + 1; }
+  if (!rc_report("multi: own steps and a failed commit", check_run_and_commit())) { failures = failures + 1; }
+  if (!rc_report("multi: nested in an open transaction", check_nested())) { failures = failures + 1; }
+  return rc_summary(failures, 4);
+}
+
+@test fn t_multi() -> int32 {
+  if (check_commit() != 0) { return 1; }
+  if (check_rollback() != 0) { return 2; }
+  if (check_run_and_commit() != 0) { return 3; }
+  if (check_nested() != 0) { return 4; }
+  return 0;
+}

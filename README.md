@@ -5,10 +5,10 @@ An ORM for the [MeoSQL](../meosql) database, written in Mettle.
 Status: models, queries, inserts, loads, updates of changed fields, deletes,
 update_all/delete_all/count, changeset validations, relations without N+1,
 up-only migrations, sessions with transactions and stale-write detection and
-automatic timestamps all work and are tested in the interpreter, debug and
-release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub until
-MeoSQL has its network server; the tests run against an in-memory adapter that
-records statements.
+automatic timestamps and Multi all work and are tested in the interpreter,
+debug and release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub
+until MeoSQL has its network server; the tests run against an in-memory adapter
+that records statements.
 
 ## Layout
 
@@ -21,7 +21,7 @@ src/query/           SELECT/INSERT/UPDATE builder and SQL dialect
 src/changeset/       casting user input, dirty fields, validations, save
 src/relation/        has-many / belongs-to / through, loaded in batches
 src/migration/       CREATE TABLE from metadata, versioned migrations
-src/repo/            insert, get, one, all, update, delete through a session
+src/repo/            insert, get, one, all, update, delete, Multi, through a session
 tests/               models.mettle (the model template), one t_*.mettle per area
 ```
 
@@ -109,6 +109,19 @@ rc_query_free(&q);
 
 // Loaded models point into rows the session keeps. Clear them when done.
 rc_session_clear(&s);
+```
+
+Several writes that must all happen or none, after Ecto.Multi:
+
+```mettle
+var m: RcMulti = rc_multi_new();
+rc_multi_insert(&m, "post", &post_cs, &post);
+rc_multi_update(&m, "author", &author_cs, &author);
+if (rc_repo_multi(&s, &m, RC_TX_DEFAULT) != RC_OK) {
+  // rc_multi_failed_name(&m) says which step failed; nothing was written,
+  // and the entities are back as they were, so the Multi can run again.
+}
+rc_multi_free(&m);
 ```
 
 For many rows at once, build `rc_query_update_all`, `rc_query_delete` or

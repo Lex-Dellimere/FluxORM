@@ -24,3 +24,4 @@ import "relation/load";
 import "migration/ddl";
 import "migration/version";
 import "repo/repo";
+import "repo/multi";

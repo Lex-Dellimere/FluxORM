@@ -37,6 +37,9 @@ main = "tests/t_meta.mettle"
 [bin.t_migration]
 main = "tests/t_migration.mettle"
 
+[bin.t_multi]
+main = "tests/t_multi.mettle"
+
 [bin.t_persist]
 main = "tests/t_persist.mettle"
 
