@@ -856,16 +856,84 @@ fn check_failure_matrix() -> int32 {
   return 0;
 }
 
+// --- 8. query results become models that can be saved ------------------------
+
+fn check_query_models() -> int32 {
+  var a: RcAdapter* = 0;
+  if (new_adapter(&a) != RC_OK) { return 1; }
+  defer rc_mem_free(a);
+  var m: RcMeta = user_meta();
+
+  var rows: RcValue[16];
+  rows[0] = RcInt(1);
+  rows[1] = RcText("ada@example.com");
+  rows[2] = RcText("Ada");
+  rows[3] = RcInt(36);
+  rows[4] = RcBool(true);
+  rows[5] = RcFloat(9.5);
+  rows[6] = RcTime(1700000000000000);
+  rows[7] = RcInt(1);
+  rows[8] = RcInt(2);
+  rows[9] = RcText("grace@example.com");
+  rows[10] = RcText("Grace");
+  rows[11] = RcNull;
+  rows[12] = RcBool(false);
+  rows[13] = RcNull;
+  rows[14] = RcTime(1700000000000001);
+  rows[15] = RcInt(2);
+  if (rc_mem_push_rows(a, &rows[0], 2, 8) != RC_OK) { return 2; }
+
+  var q: RcQuery = rc_query_select(m);
+  defer rc_query_free(&q);
+  if (rc_query_where_cmp(&q, 4, RC_CMP_EQ, RcBool(true)) != RC_OK) { return 3; }
+  var res: RcResult;
+  if (rc_query_exec(&q, a, &res) != RC_OK) { return 4; }
+  defer rc_result_free(&res);
+  if (res.n_rows != 2) { return 5; }
+
+  var users: User[2];
+  var nulls: uint64[2];
+  var i: int32 = 0;
+  while (i < 2) {
+    memset((rawptr)&users[i], 0, (int64)sizeof(User));
+    if (rc_persist_hydrate(m, &res, i, (rawptr)&users[i], &nulls[i]) != RC_OK) { return 6; }
+    i = i + 1;
+  }
+  if (users[0].name != "Ada" || users[0].age != 36) { return 7; }
+  if (users[1].name != "Grace" || users[1].role != Role.Member) { return 8; }
+  if (!rc_nulls_has(nulls[1], 3) || !rc_nulls_has(nulls[1], 5)) { return 9; }
+  if (rc_nulls_has(nulls[0], 3)) { return 10; }
+
+  // A row from the query is a loaded entity: edit and save it.
+  var e: RcEntity = rc_entity_loaded(m, (rawptr)&users[1], nulls[1]);
+  if (e.state != RC_ST_CLEAN) { return 11; }
+  var cs: RcChangeset = rc_changeset_new(m);
+  defer rc_changeset_free(&cs);
+  if (rc_changeset_bind(&cs, (rawptr)&users[1], nulls[1]) != RC_OK) { return 12; }
+  if (rc_changeset_put_text(&cs, 3, "40") != RC_OK) { return 13; }
+  if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 14; }
+  if (rc_changeset_save(a, &cs, &e) != RC_OK) { return 15; }
+  if (rc_mem_last_sql(a) != "UPDATE \"users\" SET \"age\" = ? WHERE \"id\" = ?") { return 16; }
+  if (users[1].age != 40) { return 17; }
+
+  // Out of range rows are refused.
+  var spare: User;
+  var sn: uint64 = 0;
+  if (rc_persist_hydrate(m, &res, 2, (rawptr)&spare, &sn) != RC_ERR_USAGE) { return 18; }
+  if (rc_persist_hydrate(m, &res, -1, (rawptr)&spare, &sn) != RC_ERR_USAGE) { return 19; }
+  return 0;
+}
+
 // --- runner -----------------------------------------------------------------
 //
 // One table of checks, walked by main(). The @test entry goes through the same
 // table: on head 8f14c612 the compile-time interpreter segfaults in "IR
-// lowering" when a @test *calls* these seven functions directly — the callees
+// lowering" when a @test *calls* these functions directly — the callees
 // are merged into one IR unit and the lowering crashes. A function-pointer cell
 // is the barrier that keeps each check its own unit; the checks, their order and
 // their report lines are unchanged. Reported, not papered over.
 
-const RC_CHECK_NAMES: string[7] = [
+const RC_CHECK_NAMES: string[8] = [
   "integration: migration creates the ledger and the schema",
   "integration: insert binds args and adopts the key",
   "integration: query builds the statement and binds in order",
@@ -873,9 +941,10 @@ const RC_CHECK_NAMES: string[7] = [
   "integration: relation preloads in one exec for three owners",
   "integration: delete and a conflict leave no state",
   "integration: the failure matrix never reaches the store",
+  "integration: query results become models that can be saved",
 ];
 
-var RC_CHECKS: (fn() -> int32)[7];
+var RC_CHECKS: (fn() -> int32)[8];
 
 export fn rc_checks_load() {
   RC_CHECKS[0] = &check_migration;
@@ -885,18 +954,19 @@ export fn rc_checks_load() {
   RC_CHECKS[4] = &check_relations;
   RC_CHECKS[5] = &check_delete_and_conflict;
   RC_CHECKS[6] = &check_failure_matrix;
+  RC_CHECKS[7] = &check_query_models;
 }
 
 export fn main() -> int32 {
   rc_checks_load();
   var failures: int32 = 0;
   var i: int32 = 0;
-  while (i < 7) {
+  while (i < 8) {
     var run: fn() -> int32 = RC_CHECKS[i];
     if (!rc_report(RC_CHECK_NAMES[i], run())) { failures = failures + 1; }
     i = i + 1;
   }
-  return rc_summary(failures, 7);
+  return rc_summary(failures, 8);
 }
 
 @test fn t_integration() -> int32 {

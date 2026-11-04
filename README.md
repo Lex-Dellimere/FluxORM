@@ -79,12 +79,22 @@ var rc: int32 = rc_changeset_save(a, &cs, &e);
 // RC_ERR_CONFLICT: someone else changed the row first; nothing was written.
 rc_changeset_free(&cs);
 
-// Query.
+// Query, then fill a model from each row. Text fields point into `res`,
+// so free it after the last use of the models.
 var q: RcQuery = rc_query_select(note_meta());
 rc_query_where_cmp(&q, 2, RC_CMP_GT, RcInt(1));
 rc_query_order_by(&q, 0, true);
 var res: RcResult;
 rc_query_exec(&q, a, &res);
+var i: int32 = 0;
+while (i < res.n_rows) {
+  var row: Note;
+  var row_nulls: uint64 = 0;
+  memset((rawptr)&row, 0, (int64)sizeof(Note));
+  rc_persist_hydrate(note_meta(), &res, i, (rawptr)&row, &row_nulls);
+  // rc_entity_loaded(note_meta(), (rawptr)&row, row_nulls) to edit and save it
+  i = i + 1;
+}
 rc_result_free(&res);
 rc_query_free(&q);
 ```

@@ -151,6 +151,25 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
   return RC_OK;
 }
 
+// Fills `model` from row `row` of a result whose columns are in RcMeta order,
+// which is what rc_query_select produces. Text fields borrow from `res`, so
+// `res` must outlive the model (the same rule as rc_persist_load).
+export fn rc_persist_hydrate(m: RcMeta, res: RcResult*, row: int32, model: rawptr,
+                             nulls: uint64*) -> int32 {
+  if (res == 0 || model == 0 || nulls == 0) { return RC_ERR_USAGE; }
+  if (row < 0 || row >= res->n_rows) { return RC_ERR_USAGE; }
+  if (res->n_cols != m.n_fields) { return RC_ERR_ADAPTER; }
+  *nulls = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var v: RcValue = rc_result_borrow(res, row, i);
+    var rc: int32 = rc_meta_set(m, model, nulls, i, v);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
 // Loads one row by primary key into `model`, which must already be zeroed.
 //
 // Lifetime, and it is the one thing to get right here: a model's string fields
@@ -194,21 +213,10 @@ export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
     rc_result_free(&res);
     return RC_ERR_NOT_FOUND;
   }
-  if (res.n_cols != m.n_fields) {
+  rc = rc_persist_hydrate(m, &res, 0, model, nulls);
+  if (rc != RC_OK) {
     rc_result_free(&res);
-    return RC_ERR_ADAPTER;
-  }
-
-  *nulls = 0;
-  var i: int32 = 0;
-  while (i < m.n_fields) {
-    var v: RcValue = rc_result_borrow(&res, 0, i);
-    rc = rc_meta_set(m, model, nulls, i, v);
-    if (rc != RC_OK) {
-      rc_result_free(&res);
-      return rc;
-    }
-    i = i + 1;
+    return rc;
   }
   *owner = res;
   return RC_OK;

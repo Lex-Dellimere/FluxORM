@@ -45,6 +45,17 @@ export fn rc_entity_new(m: RcMeta, model: rawptr) -> RcEntity {
   return e;
 }
 
+// An entity for a model just filled from the store (rc_persist_load or
+// rc_persist_hydrate): it is CLEAN, so a changeset can save it.
+export fn rc_entity_loaded(m: RcMeta, model: rawptr, nulls: uint64) -> RcEntity {
+  var e: RcEntity;
+  e.meta = m;
+  e.model = model;
+  e.nulls = nulls;
+  e.state = RC_ST_CLEAN;
+  return e;
+}
+
 export fn rc_entity_get(e: RcEntity*, i: int32, out: RcValue*) -> int32 {
   if (e == 0) { return RC_ERR_USAGE; }
   return rc_meta_get(e.meta, e.model, e.nulls, i, out);
