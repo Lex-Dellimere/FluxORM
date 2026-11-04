@@ -61,5 +61,8 @@ main = "tests/t_stmt.mettle"
 [bin.t_validate]
 main = "tests/t_validate.mettle"
 
+[bin.t_wire]
+main = "tests/t_wire.mettle"
+
 [bin.t_value]
 main = "tests/t_value.mettle"
