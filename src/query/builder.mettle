@@ -376,7 +376,7 @@ export fn rc_query_select(m: RcMeta) -> RcQuery {
   if (rc != RC_OK) { return rc_query_fail(&q, rc); }
   var c: int32 = 0;
   while (c < m.n_fields) {
-    rc = rc_stmt_col(&q.st, m.fields[c].column, m.fields[c].ty, m.fields[c].flags);
+    rc = rc_stmt_field(&q.st, m.fields[c]);
     if (rc != RC_OK) { return rc_query_fail(&q, rc); }
     c = c + 1;
   }
@@ -422,7 +422,7 @@ export fn rc_query_insert_batch(m: RcMeta, n_rows: int32) -> RcQuery {
         if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       }
       rc = rc_query_put_ident(&q, m.fields[i].column);
-      if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
+      if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[i]); }
       if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       first = false;
     }
@@ -528,7 +528,7 @@ fn rc_query_put_set(q: RcQuery*, i: int32, v: RcValue) -> int32 {
   if (rc == RC_OK) { rc = rc_query_put(q, " = "); }
   if (rc == RC_OK) { rc = rc_query_put_question(q); }
   if (rc == RC_OK) {
-    rc = rc_stmt_col(&q->st, q->meta.fields[i].column, q->meta.fields[i].ty, q->meta.fields[i].flags);
+    rc = rc_stmt_field(&q->st, q->meta.fields[i]);
   }
   if (rc != RC_OK) {
     q->buf.len = mark;
@@ -663,7 +663,7 @@ fn rc_query_update_build(m: RcMeta, mask: uint64) -> RcQuery {
       rc = rc_query_put_ident(&q, m.fields[i].column);
       if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
       if (rc == RC_OK) { rc = rc_query_put_question(&q); }
-      if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
+      if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[i]); }
       if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       n_cols = n_cols + 1;
     }
@@ -676,7 +676,7 @@ fn rc_query_update_build(m: RcMeta, mask: uint64) -> RcQuery {
       if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.fields[i].column); }
       if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
       if (rc == RC_OK) { rc = rc_query_put_question(&q); }
-      if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
+      if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[i]); }
       if (rc != RC_OK) { return rc_query_fail(&q, rc); }
       n_cols = n_cols + 1;
     }
@@ -688,7 +688,7 @@ fn rc_query_update_build(m: RcMeta, mask: uint64) -> RcQuery {
     if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.fields[vf].column); }
     if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
     if (rc == RC_OK) { rc = rc_query_put_question(&q); }
-    if (rc == RC_OK) { rc = rc_stmt_col(&q.st, m.fields[vf].column, m.fields[vf].ty, m.fields[vf].flags); }
+    if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[vf]); }
     if (rc != RC_OK) { return rc_query_fail(&q, rc); }
     n_cols = n_cols + 1;
   }
@@ -1061,7 +1061,8 @@ export fn rc_query_where(q: RcQuery*, column: string, op: int32, v: RcValue) -> 
 // Returns RC_OK. RC_ERR_USAGE when n <= 0 or vals is 0: `IN ()` is a syntax
 // error, and "match nothing" is the caller's call to make. Plus the shared
 // WHERE failures above.
-export fn rc_query_where_in(q: RcQuery*, column: string, vals: RcValue*, n: int32) -> int32 {
+export fn rc_query_where_in(q: RcQuery*, column: string, vals: RcValue*,
+                            n: int32) -> int32 {
   if (q == 0) { return RC_ERR_USAGE; }
   return rc_query_where_in_field(q, rc_query_find(q, column), vals, n);
 }

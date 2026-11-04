@@ -129,7 +129,8 @@ export fn rc_migration_create_stmt(m: RcMeta, out: RcStmt*) -> int32 {
   while (i < m.n_fields) {
     var f: RcField = m.fields[i];
     if (rc_migration_affinity(f.ty).length == (uint64)0) { return RC_ERR_UNSUPPORTED; }
-    rc = rc_stmt_col(out, f.column, f.ty, f.flags & (RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE));
+    var keep: int32 = RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE;
+    rc = rc_stmt_col(out, f.column, f.ty, f.flags & keep);
     if (rc != RC_OK) { return rc; }
     i = i + 1;
   }

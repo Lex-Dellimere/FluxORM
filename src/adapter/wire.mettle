@@ -267,7 +267,9 @@ export fn rc_wire_begin(w: RcWire*, rid: uint32, mode: int32) -> int32 {
 
 // RC_T_* -> the wire's column type: 1 INT, 2 REAL, 3 TEXT, 4 BLOB.
 fn rc_wire_type(ty: int32) -> int64 {
-  if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) { return 1; }
+  if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) {
+    return 1;
+  }
   if (ty == RC_T_F64) { return 2; }
   if (ty == RC_T_TEXT) { return 3; }
   if (ty == RC_T_BLOB) { return 4; }
@@ -307,7 +309,9 @@ export fn rc_wire_query(w: RcWire*, rid: uint32, st: RcStmt*) -> int32 {
   if (rc == RC_OK) { rc = rc_wire_str16(w, st->name); }
   if (rc != RC_OK) { return rc; }
   var defs: bool = st->op == RC_OP_CREATE || st->op == RC_OP_ADD_COLUMN;
-  if (st->n_cols > 65535 || st->n_terms > 65535 || st->n_order > 65535) { return RC_ERR_RANGE; }
+  if (st->n_cols > 65535 || st->n_terms > 65535 || st->n_order > 65535) {
+    return RC_ERR_RANGE;
+  }
   rc_wire_le(w, (uint64)st->n_cols, 2);
   var i: int32 = 0;
   while (i < st->n_cols) {

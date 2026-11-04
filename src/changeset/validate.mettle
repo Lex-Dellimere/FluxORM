@@ -32,9 +32,15 @@ fn rc_validate_field_ok(cs: RcChangeset*, field: int32) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
   if (field < 0 || field >= cs->meta.n_fields) {
-    return rc_changeset_add_error_field(cs, field, RC_ERR_USAGE, "field index out of range");
+    return rc_changeset_add_error_field(cs, field, RC_ERR_USAGE,
+                                        "field index out of range");
   }
   return RC_OK;
+}
+
+// Records an out-of-range error on `field` and returns RC_ERR_RANGE.
+fn rc_validate_range(cs: RcChangeset*, field: int32, why: string) -> int32 {
+  return rc_changeset_add_error_field(cs, field, RC_ERR_RANGE, why);
 }
 
 // UTF-8 code points, not bytes: "é" is one.
@@ -97,7 +103,8 @@ export fn rc_validate_length_field(cs: RcChangeset*, field: int32, min: int64,
 // rc_validate_int by field index. Takes a 0-based field index for generated
 // code; apps use rc_validate_int. An index out of range is recorded as
 // RC_ERR_USAGE "field index out of range" and returned.
-export fn rc_validate_int_field(cs: RcChangeset*, field: int32, lo: int64, hi: int64) -> int32 {
+export fn rc_validate_int_field(cs: RcChangeset*, field: int32, lo: int64,
+                                hi: int64) -> int32 {
   var rc: int32 = rc_validate_field_ok(cs, field);
   if (rc != RC_OK) { return rc; }
   var v: RcValue = RcNull;
@@ -106,8 +113,8 @@ export fn rc_validate_int_field(cs: RcChangeset*, field: int32, lo: int64, hi: i
   if (rc_value_as_i64(v, &x) != RC_OK) {
     return rc_changeset_add_error_field(cs, field, RC_ERR_CAST, "is not an integer");
   }
-  if (x < lo) { return rc_changeset_add_error_field(cs, field, RC_ERR_RANGE, "is too small"); }
-  if (x > hi) { return rc_changeset_add_error_field(cs, field, RC_ERR_RANGE, "is too large"); }
+  if (x < lo) { return rc_validate_range(cs, field, "is too small"); }
+  if (x > hi) { return rc_validate_range(cs, field, "is too large"); }
   return RC_OK;
 }
 
@@ -124,8 +131,8 @@ export fn rc_validate_float_field(cs: RcChangeset*, field: int32, lo: float64,
   if (rc_value_as_f64(v, &x) != RC_OK) {
     return rc_changeset_add_error_field(cs, field, RC_ERR_CAST, "is not a number");
   }
-  if (x < lo) { return rc_changeset_add_error_field(cs, field, RC_ERR_RANGE, "is too small"); }
-  if (x > hi) { return rc_changeset_add_error_field(cs, field, RC_ERR_RANGE, "is too large"); }
+  if (x < lo) { return rc_validate_range(cs, field, "is too small"); }
+  if (x > hi) { return rc_validate_range(cs, field, "is too large"); }
   return RC_OK;
 }
 
@@ -173,7 +180,9 @@ export fn rc_validate_change_field(cs: RcChangeset*, field: int32,
 fn rc_validate_find(cs: RcChangeset*, name: string) -> int32 {
   if (cs == 0 || cs->values == 0) { return -2; }
   var field: int32 = rc_meta_find(cs->meta, name);
-  if (field < 0) { rc_changeset_add_error_field(cs, -1, RC_ERR_USAGE, "unknown field name"); }
+  if (field < 0) {
+    rc_changeset_add_error_field(cs, -1, RC_ERR_USAGE, "unknown field name");
+  }
   return field;
 }
 
@@ -200,7 +209,8 @@ export fn rc_validate_required(cs: RcChangeset*, name: string) -> int32 {
 // Returns RC_OK when it fits or was skipped (no change, or a NULL change);
 // otherwise records and returns RC_ERR_RANGE "is too short" or "is too
 // long", or RC_ERR_CAST "is not text" when the value is not RcText.
-export fn rc_validate_length(cs: RcChangeset*, name: string, min: int64, max: int64) -> int32 {
+export fn rc_validate_length(cs: RcChangeset*, name: string, min: int64,
+                             max: int64) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
   if (f == -1) { return RC_ERR_USAGE; }
   return rc_validate_length_field(cs, f, min, max);
@@ -230,7 +240,8 @@ export fn rc_validate_int(cs: RcChangeset*, name: string, lo: int64, hi: int64) 
 // Returns RC_OK when it fits or was skipped (no change, or a NULL change);
 // otherwise records and returns RC_ERR_RANGE "is too small" or "is too
 // large", or RC_ERR_CAST "is not a number" for a value that does not convert.
-export fn rc_validate_float(cs: RcChangeset*, name: string, lo: float64, hi: float64) -> int32 {
+export fn rc_validate_float(cs: RcChangeset*, name: string, lo: float64,
+                            hi: float64) -> int32 {
   var f: int32 = rc_validate_find(cs, name);
   if (f == -1) { return RC_ERR_USAGE; }
   return rc_validate_float_field(cs, f, lo, hi);

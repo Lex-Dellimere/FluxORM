@@ -63,7 +63,9 @@ export fn rc_migration_add_column_field(a: RcAdapter*, m: RcMeta, field: int32) 
   if (rc != RC_OK) { return rc; }
   if (field < 0 || field >= m.n_fields) { return RC_ERR_USAGE; }
   var f: RcField = m.fields[field];
-  if ((f.flags & (RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE)) != 0) { return RC_ERR_UNSUPPORTED; }
+  if ((f.flags & (RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE)) != 0) {
+    return RC_ERR_UNSUPPORTED;
+  }
   var ty: string = rc_migration_affinity(f.ty);
   if (ty.length == (uint64)0) { return RC_ERR_UNSUPPORTED; }
   var b: RcBuf = rc_buf_new(96);
@@ -95,8 +97,10 @@ export fn rc_migration_add_column_field(a: RcAdapter*, m: RcMeta, field: int32) 
 // empty, m is malformed or a field index is out of range (rc_meta_check's
 // RC_ERR_UNSUPPORTED also passes through).
 export fn rc_migration_create_index_field(a: RcAdapter*, m: RcMeta, name: string,
-                                          fields: int32*, n: int32, unique: bool) -> int32 {
-  if (a == 0 || fields == 0 || n <= 0 || name.length == (uint64)0) { return RC_ERR_USAGE; }
+                                          fields: int32*, n: int32,
+                                          unique: bool) -> int32 {
+  if (a == 0 || fields == 0 || n <= 0) { return RC_ERR_USAGE; }
+  if (name.length == (uint64)0) { return RC_ERR_USAGE; }
   var rc: int32 = rc_meta_check(m, 0);
   if (rc != RC_OK) { return rc; }
   var b: RcBuf = rc_buf_new(128);

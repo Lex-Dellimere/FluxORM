@@ -137,7 +137,8 @@ fn rc_multi_add(m: RcMulti*, name: string, kind: int32) -> RcMultiStep* {
 //   e     the NEW entity; borrowed
 // Returns RC_OK; RC_ERR_USAGE when m or e is 0, the name is empty or taken,
 // or the step array cannot grow.
-export fn rc_multi_insert(m: RcMulti*, name: string, cs: RcChangeset*, e: RcEntity*) -> int32 {
+export fn rc_multi_insert(m: RcMulti*, name: string, cs: RcChangeset*,
+                          e: RcEntity*) -> int32 {
   if (e == 0) { return RC_ERR_USAGE; }
   var st: RcMultiStep* = rc_multi_add(m, name, RC_MS_INSERT);
   if (st == 0) { return RC_ERR_USAGE; }
@@ -153,7 +154,8 @@ export fn rc_multi_insert(m: RcMulti*, name: string, cs: RcChangeset*, e: RcEnti
 //   e     the loaded entity; borrowed
 // Returns RC_OK; RC_ERR_USAGE when m, cs or e is 0, the name is empty or
 // taken, or the step array cannot grow.
-export fn rc_multi_update(m: RcMulti*, name: string, cs: RcChangeset*, e: RcEntity*) -> int32 {
+export fn rc_multi_update(m: RcMulti*, name: string, cs: RcChangeset*,
+                          e: RcEntity*) -> int32 {
   if (cs == 0 || e == 0) { return RC_ERR_USAGE; }
   var st: RcMultiStep* = rc_multi_add(m, name, RC_MS_UPDATE);
   if (st == 0) { return RC_ERR_USAGE; }

@@ -86,7 +86,8 @@ fn rc_meosql_cstr(s: string) -> cstring {
 }
 
 fn rc_meosql_send(m: RcMeosql*) -> bool {
-  var r: Result<int32, int32> = send_all(m->sock, (cstring)m->out.data, (int32)m->out.len);
+  var r: Result<int32, int32> = send_all(m->sock, (cstring)m->out.data,
+                                         (int32)m->out.len);
   match (r) {
     case Ok(_n): { return true; }
     case Err(_e): { return false; }
@@ -197,7 +198,8 @@ fn rc_meosql_connect(m: RcMeosql*) -> int32 {
   m->max_frame = 65536;
 
   rc_wire_clear(&m->out);
-  var rc: int32 = rc_wire_hello(&m->out, m->rid, (uint32)RC_MEOSQL_MAX_FRAME, m->token, "flux_orm");
+  var rc: int32 = rc_wire_hello(&m->out, m->rid, (uint32)RC_MEOSQL_MAX_FRAME,
+                                m->token, "flux_orm");
   if (rc != RC_OK) {
     rc_meosql_drop(m);
     return rc;
@@ -348,7 +350,9 @@ fn rc_meosql_query(ud: rawptr, st: RcStmt*, out: RcResult*) -> int32 {
   if (st->n_joins > 0) { return RC_ERR_UNSUPPORTED; }
   var rc: int32 = rc_meosql_ready(m);
   if (rc != RC_OK) { return rc; }
-  if (st->op == RC_OP_COUNT && (m->caps & RC_WIRE_CAP_COUNT) == 0) { return RC_ERR_UNSUPPORTED; }
+  if (st->op == RC_OP_COUNT && (m->caps & RC_WIRE_CAP_COUNT) == 0) {
+    return RC_ERR_UNSUPPORTED;
+  }
   var rid: uint32 = rc_meosql_next_rid(m);
   rc_wire_clear(&m->out);
   rc = rc_wire_query(&m->out, rid, st);

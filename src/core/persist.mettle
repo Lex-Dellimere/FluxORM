@@ -106,7 +106,7 @@ export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
         if (rc != RC_OK) { return rc; }
       }
       rc = rc_buf_ident(&buf, m.fields[i].column);
-      if (rc == RC_OK) { rc = rc_stmt_col(&st, m.fields[i].column, m.fields[i].ty, m.fields[i].flags); }
+      if (rc == RC_OK) { rc = rc_stmt_field(&st, m.fields[i]); }
       if (rc != RC_OK) { return rc; }
       first = false;
       n_args = n_args + 1;
@@ -247,7 +247,7 @@ export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
   defer rc_stmt_free(&st);
   var c: int32 = 0;
   while (c < m.n_fields) {
-    rc = rc_stmt_col(&st, m.fields[c].column, m.fields[c].ty, m.fields[c].flags);
+    rc = rc_stmt_field(&st, m.fields[c]);
     if (rc != RC_OK) { return rc; }
     c = c + 1;
   }

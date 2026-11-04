@@ -12,6 +12,7 @@ import "std/mem";
 
 import "../core/status";
 import "../core/value";
+import "../core/meta";
 
 // Statement operations, for RcStmt.op. CREATE is CREATE TABLE with `cols` as
 // the column definitions; INSERT, SELECT, UPDATE, DELETE and COUNT match the
@@ -177,10 +178,20 @@ export fn rc_stmt_col(st: RcStmt*, name: string, ty: int32, flags: int32) -> int
 // Nothing is checked against the argv here; the caller keeps them in step.
 // Returns RC_OK. RC_ERR_USAGE when st is 0. RC_ERR_NOMEM when the array cannot
 // grow; st is then unchanged.
-export fn rc_stmt_term(st: RcStmt*, col: string, op: int32, arg0: int32, n_args: int32) -> int32 {
+// Appends a model field as a column: its column name, wire type and flags.
+//   st  the statement
+//   f   the field (from RcMeta.fields); its column name is borrowed
+// Returns RC_OK; RC_ERR_USAGE when st is 0; RC_ERR_NOMEM.
+export fn rc_stmt_field(st: RcStmt*, f: RcField) -> int32 {
+  return rc_stmt_col(st, f.column, f.ty, f.flags);
+}
+
+export fn rc_stmt_term(st: RcStmt*, col: string, op: int32, arg0: int32,
+                       n_args: int32) -> int32 {
   if (st == 0) { return RC_ERR_USAGE; }
   var p: rawptr = (rawptr)st->terms;
-  var rc: int32 = rc_stmt_grow(&p, &st->cap_terms, st->n_terms, (int64)sizeof(RcStmtTerm));
+  var size: int64 = (int64)sizeof(RcStmtTerm);
+  var rc: int32 = rc_stmt_grow(&p, &st->cap_terms, st->n_terms, size);
   if (rc != RC_OK) { return rc; }
   st->terms = (RcStmtTerm*)p;
   st->terms[st->n_terms].col = col;
@@ -200,7 +211,8 @@ export fn rc_stmt_term(st: RcStmt*, col: string, op: int32, arg0: int32, n_args:
 export fn rc_stmt_order(st: RcStmt*, col: string, desc: bool) -> int32 {
   if (st == 0) { return RC_ERR_USAGE; }
   var p: rawptr = (rawptr)st->order;
-  var rc: int32 = rc_stmt_grow(&p, &st->cap_order, st->n_order, (int64)sizeof(RcStmtOrder));
+  var size: int64 = (int64)sizeof(RcStmtOrder);
+  var rc: int32 = rc_stmt_grow(&p, &st->cap_order, st->n_order, size);
   if (rc != RC_OK) { return rc; }
   st->order = (RcStmtOrder*)p;
   st->order[st->n_order].col = col;
