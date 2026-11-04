@@ -1,13 +1,13 @@
 // flux_orm/adapter/meosql.mettle — the bridge to MeoSQL.
 //
-// Status: gated. MeoSQL (../meosql) has its storage layer (pager, rollback
-// journal, B+ tree) and has frozen the shared types of its SQL core: MeoValue,
-// the MEO_T_* tags, MEO_ROW/MEO_DONE and the status codes 13-18. The db handle
-// and statement API are not built yet. So this file defines the bridge and
-// refuses to pretend. Every entry point returns RC_ERR_UNSUPPORTED and
-// rc_meosql_supported() is false.
+// Status: gated. flux_orm does not compile MeoSQL in; apps depend on flux_orm,
+// not the other way round. This adapter will talk to MeoSQL's network server
+// (MeoSQL roadmap M7) once it exists. Until then every entry point returns
+// RC_ERR_UNSUPPORTED and rc_meosql_supported() is false.
 //
-// The plan is MeoSQL's own (meosql/.apex/DECISIONS.md D8, the "flux slots"):
+// The calls below are MeoSQL's embedded API (meosql/.apex/DECISIONS.md D8).
+// The server's protocol carries the same prepare/bind/step/finalize and
+// begin/commit steps, so the mapping and the status table still apply:
 //
 //   open      meo_db_open(dsn, flags, RC_MEOSQL_N_FRAMES, &db)
 //   close     meo_db_close(db)

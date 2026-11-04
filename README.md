@@ -6,7 +6,7 @@ Status: models, queries, inserts, loads, updates of changed fields, deletes,
 relations without N+1, up-only migrations, sessions with transactions and
 stale-write detection all work and are tested in the interpreter, debug and
 release. The MeoSQL adapter (`src/adapter/meosql.mettle`) is a stub until
-MeoSQL's SQL API is ready; the tests run against an in-memory adapter that
+MeoSQL has its network server; the tests run against an in-memory adapter that
 records statements.
 
 ## Layout
