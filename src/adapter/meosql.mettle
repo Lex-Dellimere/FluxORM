@@ -54,9 +54,9 @@
 //    the one place where an ORM normally duplicates the storage engine by
 //    accident.
 //
-// What MeoSQL's SQL v1 grammar (D7) does not parse yet, though flux_orm emits
-// it: JOIN / LEFT JOIN (-> RC_ERR_UNSUPPORTED) and the rc_query_where_cmp
-// operators <, <=, >, >=, <> (also -> RC_ERR_UNSUPPORTED); both arrive in M3.
+// What MeoSQL's SQL v1 does not parse yet, though flux_orm emits it:
+// JOIN / LEFT JOIN (-> RC_ERR_UNSUPPORTED), planned for MeoSQL M3. The
+// rc_query_where_cmp operators parse since MeoSQL 351a1e8.
 // MeoSQL also has no nested transactions; core/session flattens nesting
 // before it reaches the adapter.
 
