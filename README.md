@@ -98,12 +98,13 @@ var n: Note;
 memset((rawptr)&n, 0, (int64)sizeof(Note));
 var e: RcEntity = rc_entity_new(note_meta(), (rawptr)&n);
 var cs: RcChangeset = rc_changeset_new(note_meta());
-rc_changeset_put_text(&cs, 1, "draft");
-rc_validate_length(&cs, 1, 1, 200);
-rc_changeset_unique(&cs, 1);  // a duplicate key is reported on "text"
+rc_changeset_cast(&cs, "text", "draft");
+rc_validate_required(&cs, "text");
+rc_validate_length(&cs, "text", 1, 200);
+rc_changeset_unique(&cs, "text");  // a duplicate key is reported on "text"
 rc_repo_insert(&s, &cs, &e);
 // On failure, rc_changeset_error_at(&cs, i) for i < rc_changeset_error_count(&cs)
-// gives each error's field, code and reason ("is too long", ...).
+// gives each error's field name, code and reason ("is too long", ...).
 rc_changeset_free(&cs);
 
 // Load by key, change one field, save. Only "text" is sent, matched on the
@@ -113,7 +114,7 @@ var ge: RcEntity;
 rc_repo_get(&s, note_meta(), RcInt(n.id), (rawptr)&got, &ge);
 var edit: RcChangeset = rc_changeset_new(note_meta());
 rc_changeset_bind(&edit, (rawptr)&got, ge.nulls);
-rc_changeset_put_text(&edit, 1, "final");
+rc_changeset_cast(&edit, "text", "final");
 var rc: int32 = rc_repo_update(&s, &edit, &ge);
 // RC_ERR_CONFLICT: someone else changed the row first; nothing was written.
 rc_changeset_free(&edit);

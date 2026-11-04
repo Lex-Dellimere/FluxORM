@@ -56,12 +56,12 @@ export fn rc_entity_loaded(m: RcMeta, model: rawptr, nulls: uint64) -> RcEntity 
   return e;
 }
 
-export fn rc_entity_get(e: RcEntity*, i: int32, out: RcValue*) -> int32 {
+export fn rc_entity_get_field(e: RcEntity*, i: int32, out: RcValue*) -> int32 {
   if (e == 0) { return RC_ERR_USAGE; }
   return rc_meta_get(e.meta, e.model, e.nulls, i, out);
 }
 
-export fn rc_entity_set(e: RcEntity*, i: int32, v: RcValue) -> int32 {
+export fn rc_entity_set_field(e: RcEntity*, i: int32, v: RcValue) -> int32 {
   if (e == 0) { return RC_ERR_USAGE; }
   if (e.state == RC_ST_DELETED) { return RC_ERR_USAGE; }
   var rc: int32 = rc_meta_set(e.meta, e.model, &e.nulls, i, v);
@@ -84,4 +84,16 @@ export fn rc_entity_has_pk(e: RcEntity*) -> bool {
   var v: RcValue = rc_entity_pk(e);
   if (rc_value_is_null(v)) { return false; }
   return true;
+}
+
+// rc_entity_get / rc_entity_set by field or column name; an unknown name is
+// RC_ERR_USAGE.
+export fn rc_entity_get(e: RcEntity*, name: string, out: RcValue*) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  return rc_entity_get_field(e, rc_meta_find(e->meta, name), out);
+}
+
+export fn rc_entity_set(e: RcEntity*, name: string, v: RcValue) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  return rc_entity_set_field(e, rc_meta_find(e->meta, name), v);
 }

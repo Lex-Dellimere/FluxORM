@@ -58,8 +58,8 @@ fn check_insert() -> int32 {
   var e: RcEntity = rc_entity_new(m, (rawptr)&p);
   var cs: RcChangeset = rc_changeset_new(m);
   defer rc_changeset_free(&cs);
-  if (rc_changeset_put_text(&cs, 1, "7") != RC_OK) { return 2; }
-  if (rc_changeset_put_text(&cs, 2, "Hello") != RC_OK) { return 3; }
+  if (rc_changeset_cast_field(&cs, 1, "7") != RC_OK) { return 2; }
+  if (rc_changeset_cast_field(&cs, 2, "Hello") != RC_OK) { return 3; }
   if (rc_mem_push_ok(a, 1, 31) != RC_OK) { return 4; }
   if (rc_repo_insert(&s, &cs, &e) != RC_OK) { return 5; }
   if (p.id != 31 || p.user_id != 7 || p.title != "Hello") { return 6; }
@@ -74,14 +74,14 @@ fn check_insert() -> int32 {
   var e2: RcEntity = rc_entity_new(m, (rawptr)&p2);
   var bad: RcChangeset = rc_changeset_new(m);
   defer rc_changeset_free(&bad);
-  if (rc_changeset_put_null(&bad, 2) != RC_ERR_CONSTRAINT) { return 9; }
+  if (rc_changeset_put_null_field(&bad, 2) != RC_ERR_CONSTRAINT) { return 9; }
   var calls: int32 = rc_mem_call_count(a);
   if (rc_repo_insert(&s, &bad, &e2) != RC_ERR_USAGE) { return 10; }
   if (rc_mem_call_count(a) != calls) { return 11; }
 
   // No changeset: the entity is inserted as it is.
-  if (rc_entity_set(&e2, 1, RcInt(7)) != RC_OK) { return 12; }
-  if (rc_entity_set(&e2, 2, RcText("Bye")) != RC_OK) { return 13; }
+  if (rc_entity_set_field(&e2, 1, RcInt(7)) != RC_OK) { return 12; }
+  if (rc_entity_set_field(&e2, 2, RcText("Bye")) != RC_OK) { return 13; }
   if (rc_mem_push_ok(a, 1, 32) != RC_OK) { return 14; }
   var none: RcChangeset* = 0;
   if (rc_repo_insert(&s, none, &e2) != RC_OK) { return 15; }
@@ -110,7 +110,7 @@ fn check_get_update_delete() -> int32 {
   var cs: RcChangeset = rc_changeset_new(m);
   defer rc_changeset_free(&cs);
   if (rc_changeset_bind(&cs, (rawptr)&u, e.nulls) != RC_OK) { return 7; }
-  if (rc_changeset_put_text(&cs, 2, "Ada L.") != RC_OK) { return 8; }
+  if (rc_changeset_cast_field(&cs, 2, "Ada L.") != RC_OK) { return 8; }
   if (rc_mem_push_ok(a, 1, 0) != RC_OK) { return 9; }
   if (rc_repo_update(&s, &cs, &e) != RC_OK) { return 10; }
   if (rc_mem_last_sql(a) != "UPDATE \"users\" SET \"name\" = ? WHERE \"id\" = ?") { return 11; }

@@ -278,7 +278,7 @@ export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
     if (rc != RC_OK) { return rc; }
     rc = rc_buf_put(&buf, " = ?");
     if (rc != RC_OK) { return rc; }
-    rc = rc_entity_get(e, vf, &args[1]);
+    rc = rc_entity_get_field(e, vf, &args[1]);
     if (rc == RC_OK) { rc = rc_stmt_term(&st, m.fields[vf].column, RC_W_EQ, 1, 1); }
     if (rc != RC_OK) { return rc; }
     n_args = 2;

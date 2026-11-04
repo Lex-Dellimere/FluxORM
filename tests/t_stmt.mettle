@@ -184,8 +184,8 @@ fn check_typed_repo() -> int32 {
   var p: Post;
   memset((rawptr)&p, 0, (int64)sizeof(Post));
   var pe: RcEntity = rc_entity_new(post_meta(), (rawptr)&p);
-  if (rc_entity_set(&pe, 1, RcInt(1)) != RC_OK) { return 7; }
-  if (rc_entity_set(&pe, 2, RcText("Hi")) != RC_OK) { return 8; }
+  if (rc_entity_set_field(&pe, 1, RcInt(1)) != RC_OK) { return 7; }
+  if (rc_entity_set_field(&pe, 2, RcText("Hi")) != RC_OK) { return 8; }
   FAKE_LAST_ID = 77;
   var none: RcChangeset* = 0;
   if (rc_repo_insert(&s, none, &pe) != RC_OK) { return 9; }

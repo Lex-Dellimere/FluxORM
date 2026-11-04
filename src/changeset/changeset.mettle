@@ -48,9 +48,10 @@ import "cast";
 
 // One recorded error. `reason` is a static string, never owned.
 export struct RcFieldError {
-  field: int32;   // -1 when the error is not about one field
+  field: int32;   // field index, -1 when the error is not about one field
+  name: string;   // field name, "" when field is -1
   code: int32;    // RC_ERR_*
-  reason: string;
+  reason: string; // e.g. "can't be blank", "is too long"
 }
 
 export struct RcChangeset {
@@ -104,6 +105,10 @@ fn rc_changeset_note(cs: RcChangeset*, field: int32, code: int32,
     cs->cap_errors = cap;
   }
   cs->errors[cs->n_errors].field = field;
+  cs->errors[cs->n_errors].name = "";
+  if (field >= 0 && field < cs->meta.n_fields) {
+    cs->errors[cs->n_errors].name = cs->meta.fields[field].name;
+  }
   cs->errors[cs->n_errors].code = code;
   cs->errors[cs->n_errors].reason = reason;
   cs->n_errors = cs->n_errors + 1;
@@ -111,7 +116,7 @@ fn rc_changeset_note(cs: RcChangeset*, field: int32, code: int32,
 }
 
 // Records an error, as a validation does. Returns `code`.
-export fn rc_changeset_add_error(cs: RcChangeset*, field: int32, code: int32,
+export fn rc_changeset_add_error_field(cs: RcChangeset*, field: int32, code: int32,
                                  why: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
@@ -127,6 +132,7 @@ export fn rc_changeset_error_count(cs: RcChangeset*) -> int32 {
 export fn rc_changeset_error_at(cs: RcChangeset*, i: int32) -> RcFieldError {
   var e: RcFieldError;
   e.field = -1;
+  e.name = "";
   e.code = RC_ERR_USAGE;
   e.reason = "";
   if (cs == 0 || i < 0 || i >= cs->n_errors) { return e; }
@@ -134,7 +140,7 @@ export fn rc_changeset_error_at(cs: RcChangeset*, i: int32) -> RcFieldError {
 }
 
 // True when an error is recorded for `field`.
-export fn rc_changeset_field_has_error(cs: RcChangeset*, field: int32) -> bool {
+export fn rc_changeset_has_error_field(cs: RcChangeset*, field: int32) -> bool {
   if (cs == 0) { return false; }
   var i: int32 = 0;
   while (i < cs->n_errors) {
@@ -148,7 +154,7 @@ export fn rc_changeset_field_has_error(cs: RcChangeset*, field: int32) -> bool {
 // RC_ERR_CONFLICT (a duplicate key), the error is recorded on `field` instead
 // of on no field. With several unique fields registered the store does not say
 // which one clashed, so the error goes on field -1.
-export fn rc_changeset_unique(cs: RcChangeset*, field: int32) -> int32 {
+export fn rc_changeset_unique_field(cs: RcChangeset*, field: int32) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
   if (field < 0 || field >= cs->meta.n_fields) { return RC_ERR_USAGE; }
@@ -321,7 +327,7 @@ fn rc_changeset_bit(field: int32) -> uint64 {
 //
 // Last wins: putting field 2 twice keeps the second value and still counts the
 // field once.
-export fn rc_changeset_put(cs: RcChangeset*, field: int32, v: RcValue) -> int32 {
+export fn rc_changeset_put_field(cs: RcChangeset*, field: int32, v: RcValue) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
   if (field < 0 || field >= cs->meta.n_fields) {
@@ -354,21 +360,62 @@ export fn rc_changeset_put(cs: RcChangeset*, field: int32, v: RcValue) -> int32 
 // Puts by field *or* column name (rc_meta_find: name first, then column). An
 // unknown name is RC_ERR_USAGE with err_field == -1, because there is no field
 // index to report.
-export fn rc_changeset_put_name(cs: RcChangeset*, name: string, v: RcValue) -> int32 {
+// Resolves a field or column name; an unknown one is recorded as an error
+// (RC_ERR_USAGE, field -1, "unknown field name") and answers -1.
+fn rc_changeset_field_of(cs: RcChangeset*, name: string) -> int32 {
+  var field: int32 = rc_meta_find(cs->meta, name);
+  if (field < 0) { rc_changeset_note(cs, -1, RC_ERR_USAGE, "unknown field name"); }
+  return field;
+}
+
+export fn rc_changeset_put(cs: RcChangeset*, name: string, v: RcValue) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
+  var field: int32 = rc_changeset_field_of(cs, name);
+  if (field < 0) { return RC_ERR_USAGE; }
+  return rc_changeset_put_field(cs, field, v);
+}
+
+export fn rc_changeset_cast(cs: RcChangeset*, name: string, text: string) -> int32 {
+  if (cs == 0) { return RC_ERR_USAGE; }
+  if (cs->values == 0) { return cs->err_code; }
+  var field: int32 = rc_changeset_field_of(cs, name);
+  if (field < 0) { return RC_ERR_USAGE; }
+  return rc_changeset_cast_field(cs, field, text);
+}
+
+export fn rc_changeset_put_null(cs: RcChangeset*, name: string) -> int32 {
+  return rc_changeset_put(cs, name, RcNull);
+}
+
+export fn rc_changeset_changed(cs: RcChangeset*, name: string) -> bool {
+  if (cs == 0) { return false; }
+  return rc_changeset_changed_field(cs, rc_meta_find(cs->meta, name));
+}
+
+export fn rc_changeset_unique(cs: RcChangeset*, name: string) -> int32 {
+  if (cs == 0) { return RC_ERR_USAGE; }
+  return rc_changeset_unique_field(cs, rc_meta_find(cs->meta, name));
+}
+
+export fn rc_changeset_add_error(cs: RcChangeset*, name: string, code: int32,
+                                 reason: string) -> int32 {
+  if (cs == 0) { return RC_ERR_USAGE; }
+  return rc_changeset_add_error_field(cs, rc_meta_find(cs->meta, name), code, reason);
+}
+
+export fn rc_changeset_has_error(cs: RcChangeset*, name: string) -> bool {
+  if (cs == 0) { return false; }
   var field: int32 = rc_meta_find(cs->meta, name);
-  if (field < 0) {
-    return rc_changeset_note(cs, -1, RC_ERR_USAGE, "unknown field name");
-  }
-  return rc_changeset_put(cs, field, v);
+  if (field < 0) { return false; }
+  return rc_changeset_has_error_field(cs, field);
 }
 
 // Parses user text for the field's declared wire type and puts the result. This
 // is the single parsing entry point; there is no put_text_i64/put_text_f64
 // family, because the field's `ty` already says which arm to produce.
 // rc_cast_text documents the matrix; the text is borrowed, never copied.
-export fn rc_changeset_put_text(cs: RcChangeset*, field: int32, s: string) -> int32 {
+export fn rc_changeset_cast_field(cs: RcChangeset*, field: int32, s: string) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
   if (cs->values == 0) { return cs->err_code; }
   if (field < 0 || field >= cs->meta.n_fields) {
@@ -381,23 +428,23 @@ export fn rc_changeset_put_text(cs: RcChangeset*, field: int32, s: string) -> in
   if (rc != RC_OK) {
     return rc_changeset_note(cs, field, rc, why);
   }
-  return rc_changeset_put(cs, field, v);
+  return rc_changeset_put_field(cs, field, v);
 }
 
 // Explicit "this column becomes NULL". Same rules as put(cs, field, RcNull).
-export fn rc_changeset_put_null(cs: RcChangeset*, field: int32) -> int32 {
+export fn rc_changeset_put_null_field(cs: RcChangeset*, field: int32) -> int32 {
   if (cs == 0) { return RC_ERR_USAGE; }
-  return rc_changeset_put(cs, field, RcNull);
+  return rc_changeset_put_field(cs, field, RcNull);
 }
 
-export fn rc_changeset_has(cs: RcChangeset*, field: int32) -> bool {
+export fn rc_changeset_changed_field(cs: RcChangeset*, field: int32) -> bool {
   if (cs == 0) { return false; }
   if (cs->values == 0) { return false; }
   if (field < 0 || field >= cs->meta.n_fields) { return false; }
   return rc_nulls_has(cs->changes, field);
 }
 
-export fn rc_changeset_n_dirty(cs: RcChangeset*) -> int32 {
+export fn rc_changeset_n_changed(cs: RcChangeset*) -> int32 {
   if (cs == 0) { return 0; }
   if (cs->values == 0) { return 0; }
   var n: int32 = 0;
@@ -493,7 +540,7 @@ export fn rc_changeset_apply(cs: RcChangeset*, e: RcEntity*) -> int32 {
   var i: int32 = 0;
   while (i < cs->meta.n_fields) {
     if (rc_nulls_has(cs->changes, i)) {
-      var rc: int32 = rc_entity_set(e, i, cs->values[i]);
+      var rc: int32 = rc_entity_set_field(e, i, cs->values[i]);
       if (rc != RC_OK) {
         return rc_changeset_note(cs, i, rc, "core/meta refused the write");
       }
@@ -566,7 +613,7 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
   var old_ver: int64 = 0;
   if (vf >= 0) {
     var cur: RcValue = RcNull;
-    rc = rc_entity_get(e, vf, &cur);
+    rc = rc_entity_get_field(e, vf, &cur);
     if (rc != RC_OK) { return rc; }
     rc = rc_value_as_i64(cur, &old_ver);
     if (rc != RC_OK) {
@@ -583,7 +630,7 @@ export fn rc_changeset_save(a: RcAdapter*, cs: RcChangeset*, e: RcEntity*) -> in
   while (i < cs->meta.n_fields) {
     if (rc_nulls_has(cs->changes, i)) {
       var v: RcValue = RcNull;
-      rc = rc_entity_get(e, i, &v);
+      rc = rc_entity_get_field(e, i, &v);
       if (rc != RC_OK) { return rc; }
       rc = rc_query_push_arg(&q, v);
       if (rc != RC_OK) { return rc; }

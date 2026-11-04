@@ -191,7 +191,7 @@ fn rc_multi_version_of(e: RcEntity*, out: int64*) {
   var vf: int32 = rc_meta_version(e->meta);
   if (vf < 0) { return; }
   var v: RcValue = RcNull;
-  if (rc_entity_get(e, vf, &v) != RC_OK) { return; }
+  if (rc_entity_get_field(e, vf, &v) != RC_OK) { return; }
   rc_value_as_i64(v, out);
 }
 
