@@ -229,7 +229,7 @@ Conventions:
 | Multi | `rc_multi_new`, `rc_multi_insert`, `rc_multi_update`, `rc_multi_delete`, `rc_multi_update_all`, `rc_multi_delete_all`, `rc_multi_run`, `rc_multi_failed_name`, `rc_multi_free` |
 | Relations | `rc_relation_has_many`, `rc_relation_belongs_to`, `rc_relation_has_many_through`, `rc_relation_load`, `rc_relation_group`, `rc_relation_count`, `rc_relation_hydrate`, `rc_relation_free` |
 | Migrations | `rc_migration_set`, `rc_migration_run`, `rc_migration_down`, `rc_migration_create`, `rc_migration_drop`, `rc_migration_add_column`, `rc_migration_create_index`, `rc_migration_drop_index` |
-| Adapters | `rc_meosql_adapter`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
+| Adapters | `rc_meosql_adapter`, `rc_meosql_timeout`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
 | Clock | `rc_clock_set`, `rc_clock_realtime_us` |
 
 ## Build and test

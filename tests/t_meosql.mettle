@@ -210,6 +210,15 @@ fn srv_main(arg: cstring) -> uint32 {
   srv_write(c2, srv_next(c2, 6), 1, 9);
   srv_error(c2, srv_next(c2, 6), 21, 1, 0);
   closesocket(c2);
+
+  // Connection 3: a query that never gets a reply. Wait for the client to
+  // give up and close.
+  var c3: int64 = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c3, srv_next(c3, 1), 0);
+  srv_next(c3, 6);
+  var junk: uint8[64];
+  while (recv(c3, (cstring)&junk[0], 64, 0) > 0) {}
+  closesocket(c3);
   closesocket(ls);
   return 0;
 }
@@ -293,12 +302,16 @@ fn check_server() -> int32 {
   if (rc_repo_count(&s, &cq, &n) != RC_ERR_UNSUPPORTED) { return 19; }
   // A fatal timeout closes it.
   if (rc_query_exec(&q, a, &res) != RC_ERR_CLOSED) { return 20; }
+  // A reply that never comes: the timeout closes the connection.
+  if (rc_meosql_timeout(a, -1) != RC_ERR_USAGE) { return 24; }
+  if (rc_meosql_timeout(a, 200) != RC_OK) { return 25; }
+  if (rc_query_exec(&q, a, &res) != RC_ERR_CLOSED) { return 26; }
 
   thread_join_infinite(th);
   CloseHandle(th);
   if (SRV_FAIL != 0) { return 100 + SRV_FAIL; }
   // Request ids start at 1 and count up on each connection.
-  if (SRV_N != 12) { return 21; }
+  if (SRV_N != 14) { return 21; }
   if (SRV_RIDS[0] != 1 || SRV_RIDS[1] != 2 || SRV_RIDS[8] != 9) { return 22; }
   if (SRV_RIDS[9] != 1 || SRV_RIDS[10] != 2) { return 23; }
   return 0;

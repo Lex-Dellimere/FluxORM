@@ -27,8 +27,9 @@
 //   - outside one: that call answers RC_ERR_CLOSED (it may or may not have
 //     run), and the next call reconnects once before sending.
 // A fatal ERROR from the server, or CORRUPT / NOT_A_DB / VERSION, drops the
-// connection the same way. There is no local read timeout yet: the server's
-// own timeouts (idle, tx_idle) end a stuck session.
+// connection the same way. With rc_meosql_timeout set, a reply that takes
+// longer than that is a connection loss too; without it, only the server's own
+// timeouts (idle, tx_idle) end a stuck session.
 
 import "std/mem";
 import "std/net";
@@ -56,6 +57,17 @@ export struct RcMeosql {
   out: RcWire;       // request bytes
   buf: uint8*;       // reply payload
   cap: int64;        // bytes allocated at buf
+  timeout_ms: int32; // send and receive timeout; 0 = wait forever
+}
+
+// Sets SO_RCVTIMEO and SO_SNDTIMEO (Linux numbers 20 and 21) on the socket.
+fn rc_meosql_apply_timeout(m: RcMeosql*) {
+  if (m->sock < 0) { return; }
+  var tv: int64[2];                                // struct timeval
+  tv[0] = (int64)(m->timeout_ms / 1000);
+  tv[1] = (int64)(m->timeout_ms % 1000) * 1000;
+  setsockopt(m->sock, SOL_SOCKET(), 20, (cstring)&tv[0], 16);
+  setsockopt(m->sock, SOL_SOCKET(), 21, (cstring)&tv[0], 16);
 }
 
 fn rc_meosql_of(ud: rawptr) -> RcMeosql* { return (RcMeosql*)ud; }
@@ -194,6 +206,7 @@ fn rc_meosql_connect(m: RcMeosql*) -> int32 {
   var one: int32 = 1;
   setsockopt(sock, IPPROTO_TCP(), 1, (cstring)&one, 4);   // TCP_NODELAY
   m->sock = sock;
+  rc_meosql_apply_timeout(m);
   m->rid = 1;
   m->max_frame = 65536;
 
@@ -394,6 +407,7 @@ export fn rc_meosql_adapter(token: string) -> RcAdapter* {
   m->out = rc_wire_new();
   m->buf = 0;
   m->cap = 0;
+  m->timeout_ms = 0;
   var a: RcAdapter* = malloc(sizeof(RcAdapter));
   if (a == 0) {
     rc_text_free(m->token);
@@ -419,6 +433,21 @@ export fn rc_meosql_adapter(token: string) -> RcAdapter* {
 export fn rc_meosql_caps(a: RcAdapter*) -> int32 {
   if (a == 0 || a.ud == 0) { return 0; }
   return rc_meosql_of(a.ud)->caps;
+}
+
+// Limits how long one send or reply may take. A call that runs past it gets
+// the connection-loss codes (RC_ERR_CLOSED, or RC_ERR_TX in a transaction) and
+// the socket is closed, since its reply may still arrive. Applies now and to
+// every later connection.
+//   a   an adapter from rc_meosql_adapter
+//   ms  milliseconds; 0 waits forever (the default)
+// Returns RC_OK; RC_ERR_USAGE when a is 0 or ms < 0.
+export fn rc_meosql_timeout(a: RcAdapter*, ms: int32) -> int32 {
+  if (a == 0 || a.ud == 0 || ms < 0) { return RC_ERR_USAGE; }
+  var m: RcMeosql* = rc_meosql_of(a.ud);
+  m->timeout_ms = ms;
+  rc_meosql_apply_timeout(m);
+  return RC_OK;
 }
 
 // Closes the socket without BYE and frees the adapter and its state.
