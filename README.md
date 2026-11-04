@@ -67,10 +67,11 @@ export fn note_meta() -> RcMeta {
 
 ## Use
 
-Map the package in your app's `mettle.deps` and import the root:
+Add flux_orm as a path dependency in your app's `mbuild.mettle`, then import
+the root:
 
 ```
-flux_orm=../flux_orm/src
+mb_dep_path("flux_orm", "../flux_orm");
 ```
 
 ```mettle
@@ -234,10 +235,11 @@ Conventions:
 ## Build and test
 
 flux_orm is a library: there are no programs to link. It needs the dev Mettle
-compiler; `mbuild.toml` has no toolchain pin, so select it with `METTLE`.
+compiler; `mbuild.mettle` has no toolchain pin, so select it with `METTLE`.
+`mbuild` writes a `mettle.deps` (not committed) that maps `flux_orm` to `src/`.
 
 ```
-MB=/home/nox/Projects/mettle/mbuild/build/bootstrap/mbuild
+MB=/home/nox/Projects/mettle/mbuild/build/linux/release/mbuild
 export METTLE=/home/nox/Projects/mettle/Mettle/bin/mettle
 $MB check             # type-check src/flux_orm.mettle and what it imports
 $MB test              # every @test, in the interpreter
