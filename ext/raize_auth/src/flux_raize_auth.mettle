@@ -1,0 +1,557 @@
+// flux_raize_auth: raize_auth's storage contract (RaStore) on flux_orm.
+//
+// Tokens and lockout counters live in two tables of their own, ra_tokens and
+// ra_counters (rfa_migration creates them). Credentials stay in the app's user
+// table; RfaUsers names its columns. Every call checks a session out of a
+// flux_orm pool, does its work and checks it back in, so one store serves any
+// number of threads:
+//
+//   var pool: RcPool;
+//   rc_meodb_pool(&pool, 8, "", "127.0.0.1:5490");
+//   var ctx: RfaStore;
+//   ctx.pool = &pool;
+//   ctx.users.meta = user_meta();
+//   ctx.users.login = "email";
+//   ctx.users.owner = "id";
+//   ctx.users.hash = "password_hash";
+//   ctx.users.disabled = "";
+//   var st: RaStore;
+//   rfa_store_bind(&st, &ctx);
+//
+// Rows are read cell by cell from RcResult, never into a model: a flux model
+// cannot hold the 32-byte BLOB keys.
+
+import "std/mem";
+import "std/conv";
+import "flux_orm/flux_orm";
+import "flux_orm/repo/pool";
+import "raize_auth/auth";
+
+// How long a call waits for a free session, in ms.
+const RFA_WAIT_MS: int32 = 5000;
+
+// Where the app keeps its users. Column names are field or column names in
+// meta. The hash column is TEXT and holds the Argon2id string; disabled is ""
+// when the app never disables users, else an integer or bool column (nonzero
+// or true = disabled, NULL = enabled).
+export struct RfaUsers {
+  meta: RcMeta;
+  login: string;
+  owner: string;
+  hash: string;
+  disabled: string;
+}
+
+// The store's context: what RaStore.ctx points at. The app owns it and the
+// pool, and keeps both alive while the store is in use.
+export struct RfaStore {
+  pool: RcPool*;   // borrowed
+  users: RfaUsers;
+}
+
+// --- tables ------------------------------------------------------------------
+// Cells only, never a struct: offsets are 8-byte slots so rc_meta_check is
+// satisfied, and nothing reads them. The field array is the caller's (a
+// local), since a Kind cannot sit in a constant.
+
+fn rfa_field(f: RcField*, i: int32, name: string, ty: int32, flags: int32) {
+  f[i].name = name;
+  f[i].column = name;
+  f[i].kind = Kind.Int64;
+  f[i].ty = ty;
+  f[i].offset = i * 8;
+  f[i].size = 8;
+  f[i].flags = flags | RC_F_NOT_NULL;
+}
+
+fn rfa_meta(table: string, f: RcField*, n: int32) -> RcMeta {
+  var m: RcMeta;
+  m.table = table;
+  m.name = table;
+  m.size = n * 8;
+  m.fields = f;
+  m.n_fields = n;
+  m.pk = 0;
+  return m;
+}
+
+// ra_tokens; f holds 8 fields and must outlive every use of the meta.
+fn rfa_tok_meta(f: RcField*) -> RcMeta {
+  rfa_field(f, 0, "key", RC_T_BLOB, RC_F_PK);
+  rfa_field(f, 1, "owner", RC_T_I64, 0);
+  rfa_field(f, 2, "created", RC_T_I64, 0);
+  rfa_field(f, 3, "expires", RC_T_I64, 0);
+  rfa_field(f, 4, "last_used", RC_T_I64, 0);
+  rfa_field(f, 5, "revoked", RC_T_I64, 0);
+  rfa_field(f, 6, "scope", RC_T_TEXT, 0);
+  rfa_field(f, 7, "label", RC_T_TEXT, 0);
+  return rfa_meta("ra_tokens", f, 8);
+}
+
+// ra_counters; f holds 4 fields.
+fn rfa_ctr_meta(f: RcField*) -> RcMeta {
+  rfa_field(f, 0, "key", RC_T_BLOB, RC_F_PK);
+  rfa_field(f, 1, "failures", RC_T_I64, 0);
+  rfa_field(f, 2, "window_start", RC_T_I64, 0);
+  rfa_field(f, 3, "locked_until", RC_T_I64, 0);
+  return rfa_meta("ra_counters", f, 4);
+}
+
+// --- helpers -----------------------------------------------------------------
+
+// flux code -> RA code.
+fn rfa_code(rc: int32) -> int32 {
+  if (rc == RC_OK) { return RA_OK; }
+  if (rc == RC_ERR_NOT_FOUND) { return RA_E_NOT_FOUND; }
+  if (rc == RC_ERR_NOMEM) { return RA_E_NOMEM; }
+  return RA_E_STORE;
+}
+
+fn rfa_checkout(ctx: rawptr, out: RcSession**) -> int32 {
+  var c: RfaStore* = (RfaStore*)ctx;
+  if (c == 0 || c->pool == 0) { return RC_ERR_USAGE; }
+  return rc_pool_checkout(c->pool, RFA_WAIT_MS, out);
+}
+
+fn rfa_checkin(ctx: rawptr, s: RcSession*) {
+  var c: RfaStore* = (RfaStore*)ctx;
+  rc_pool_checkin(c->pool, s);
+}
+
+fn rfa_key(key: uint8*) -> RcValue { return rc_value_blob(key, 32); }
+
+// Runs q and returns its affected count in *n.
+fn rfa_run(q: RcQuery*, s: RcSession*, n: int32*) -> int32 {
+  var r: RcResult;
+  rc_result_init(&r);
+  var rc: int32 = rc_query_exec(q, rc_session_adapter(s), &r);
+  if (rc == RC_OK && n != 0) { *n = r.affected; }
+  rc_result_free(&r);
+  return rc;
+}
+
+fn rfa_i64(r: RcResult*, row: int32, col: int32, out: int64*) -> int32 {
+  return rc_result_i64(r, row, col, out);
+}
+
+// Copies a text cell into buf (cap bytes); too long is a store error.
+fn rfa_text(r: RcResult*, row: int32, col: int32, buf: uint8*, cap: int32,
+            len: int32*) -> int32 {
+  var t: string = "";
+  var rc: int32 = rc_result_text(r, row, col, &t);
+  if (rc != RC_OK) { return rc; }
+  if (t.length > (uint64)cap) { return RC_ERR_RANGE; }
+  if (t.length > (uint64)0) { memcpy((rawptr)buf, (rawptr)t.chars, (int64)t.length); }
+  *len = (int32)t.length;
+  return RC_OK;
+}
+
+// Copies a 32-byte BLOB key cell into key.
+fn rfa_key_cell(r: RcResult*, row: int32, col: int32, key: uint8*) -> int32 {
+  var b: RcBytes;
+  var rc: int32 = rc_value_as_blob(rc_result_borrow(r, row, col), &b);
+  if (rc != RC_OK) { return rc; }
+  if (b.len != 32) { return RC_ERR_RANGE; }
+  memcpy((rawptr)key, (rawptr)b.data, 32);
+  return RC_OK;
+}
+
+// Reads row `row` of a ra_tokens SELECT into *t.
+fn rfa_tok_row(r: RcResult*, row: int32, t: RaToken*) -> int32 {
+  memset((rawptr)t, 0, (int64)sizeof(RaToken));
+  var rev: int64 = 0;
+  var rc: int32 = rfa_key_cell(r, row, 0, &t->key[0]);
+  if (rc == RC_OK) { rc = rfa_i64(r, row, 1, &t->owner); }
+  if (rc == RC_OK) { rc = rfa_i64(r, row, 2, &t->created); }
+  if (rc == RC_OK) { rc = rfa_i64(r, row, 3, &t->expires); }
+  if (rc == RC_OK) { rc = rfa_i64(r, row, 4, &t->last_used); }
+  if (rc == RC_OK) { rc = rfa_i64(r, row, 5, &rev); }
+  if (rc == RC_OK) { rc = rfa_text(r, row, 6, &t->scope[0], RA_SCOPE_CAP, &t->scope_len); }
+  if (rc == RC_OK) { rc = rfa_text(r, row, 7, &t->label[0], RA_LABEL_CAP, &t->label_len); }
+  t->revoked = (int32)rev;
+  return rc;
+}
+
+// --- tokens ------------------------------------------------------------------
+
+// UPDATE every column by key; INSERT when no row matched. In the caller's
+// transaction.
+fn rfa_tok_upsert(s: RcSession*, t: RaToken*) -> int32 {
+  var tf: RcField[8];
+  var m: RcMeta = rfa_tok_meta(&tf[0]);
+  var scope: string = ra_token_scope(t);
+  var label: string = ra_token_label(t);
+  var n: int32 = 0;
+  var q: RcQuery = rc_query_update_all(m);
+  rc_query_set(&q, "owner", RcInt(t->owner));
+  rc_query_set(&q, "created", RcInt(t->created));
+  rc_query_set(&q, "expires", RcInt(t->expires));
+  rc_query_set(&q, "last_used", RcInt(t->last_used));
+  rc_query_set(&q, "revoked", RcInt((int64)t->revoked));
+  rc_query_set(&q, "scope", RcText(scope));
+  rc_query_set(&q, "label", RcText(label));
+  rc_query_where(&q, "key", RC_CMP_EQ, rfa_key(&t->key[0]));
+  var rc: int32 = rfa_run(&q, s, &n);
+  rc_query_free(&q);
+  if (rc != RC_OK || n > 0) { return rc; }
+
+  var ins: RcQuery = rc_query_insert_batch(m, 1);
+  rc_query_push_arg(&ins, rfa_key(&t->key[0]));
+  rc_query_push_arg(&ins, RcInt(t->owner));
+  rc_query_push_arg(&ins, RcInt(t->created));
+  rc_query_push_arg(&ins, RcInt(t->expires));
+  rc_query_push_arg(&ins, RcInt(t->last_used));
+  rc_query_push_arg(&ins, RcInt((int64)t->revoked));
+  rc_query_push_arg(&ins, RcText(scope));
+  rc_query_push_arg(&ins, RcText(label));
+  rc = rfa_run(&ins, s, 0);
+  rc_query_free(&ins);
+  return rc;
+}
+
+fn rfa_tok_put(ctx: rawptr, t: RaToken*) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  rc = rc_session_begin(s, RC_TX_IMMEDIATE);
+  if (rc == RC_OK) {
+    rc = rfa_tok_upsert(s, t);
+    if (rc == RC_OK) {
+      rc = rc_session_commit(s);
+    } else {
+      rc_session_rollback(s);
+    }
+  }
+  rfa_checkin(ctx, s);
+  return rfa_code(rc);
+}
+
+fn rfa_tok_get(ctx: rawptr, key: uint8*, out: RaToken*) -> int32 {
+  var tf: RcField[8];
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var q: RcQuery = rc_query_select(rfa_tok_meta(&tf[0]));
+  rc_query_where(&q, "key", RC_CMP_EQ, rfa_key(key));
+  var r: RcResult;
+  rc_result_init(&r);
+  rc = rc_query_exec(&q, rc_session_adapter(s), &r);
+  if (rc == RC_OK) {
+    if (r.n_rows == 0) {
+      rc = RC_ERR_NOT_FOUND;
+    } else {
+      rc = rfa_tok_row(&r, 0, out);
+    }
+  }
+  rc_result_free(&r);
+  rc_query_free(&q);
+  rfa_checkin(ctx, s);
+  return rfa_code(rc);
+}
+
+fn rfa_del_key(ctx: rawptr, m: RcMeta, key: uint8*) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var n: int32 = 0;
+  var q: RcQuery = rc_query_delete(m);
+  rc_query_where(&q, "key", RC_CMP_EQ, rfa_key(key));
+  rc = rfa_run(&q, s, &n);
+  rc_query_free(&q);
+  rfa_checkin(ctx, s);
+  if (rc == RC_OK && n == 0) { return RA_E_NOT_FOUND; }
+  return rfa_code(rc);
+}
+
+fn rfa_tok_del(ctx: rawptr, key: uint8*) -> int32 {
+  var tf: RcField[8];
+  return rfa_del_key(ctx, rfa_tok_meta(&tf[0]), key);
+}
+
+fn rfa_tok_list(ctx: rawptr, owner: int64, skip: int64, out: RaToken*, cap: int32) -> int32 {
+  var tf: RcField[8];
+  if (out == 0 || cap < 1 || skip < 0) { return RA_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var q: RcQuery = rc_query_select(rfa_tok_meta(&tf[0]));
+  rc_query_where(&q, "owner", RC_CMP_EQ, RcInt(owner));
+  rc_query_order_by(&q, "created", RC_ASC);
+  rc_query_order_by(&q, "key", RC_ASC);
+  rc_query_limit(&q, (int64)cap);
+  if (skip > 0) { rc_query_offset(&q, skip); }
+  var r: RcResult;
+  rc_result_init(&r);
+  rc = rc_query_exec(&q, rc_session_adapter(s), &r);
+  var n: int32 = 0;
+  while (rc == RC_OK && n < r.n_rows && n < cap) {
+    rc = rfa_tok_row(&r, n, &out[n]);
+    if (rc == RC_OK) { n = n + 1; }
+  }
+  rc_result_free(&r);
+  rc_query_free(&q);
+  rfa_checkin(ctx, s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  return n;
+}
+
+// --- counters ----------------------------------------------------------------
+
+fn rfa_ctr_get(ctx: rawptr, key: uint8*, out: RaCounter*) -> int32 {
+  var cf: RcField[4];
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var q: RcQuery = rc_query_select(rfa_ctr_meta(&cf[0]));
+  rc_query_where(&q, "key", RC_CMP_EQ, rfa_key(key));
+  var r: RcResult;
+  rc_result_init(&r);
+  rc = rc_query_exec(&q, rc_session_adapter(s), &r);
+  if (rc == RC_OK && r.n_rows == 0) { rc = RC_ERR_NOT_FOUND; }
+  if (rc == RC_OK) {
+    memset((rawptr)out, 0, (int64)sizeof(RaCounter));
+    var f: int64 = 0;
+    rc = rfa_key_cell(&r, 0, 0, &out->key[0]);
+    if (rc == RC_OK) { rc = rfa_i64(&r, 0, 1, &f); }
+    if (rc == RC_OK) { rc = rfa_i64(&r, 0, 2, &out->window_start); }
+    if (rc == RC_OK) { rc = rfa_i64(&r, 0, 3, &out->locked_until); }
+    out->failures = (int32)f;
+  }
+  rc_result_free(&r);
+  rc_query_free(&q);
+  rfa_checkin(ctx, s);
+  return rfa_code(rc);
+}
+
+fn rfa_ctr_upsert(s: RcSession*, c: RaCounter*) -> int32 {
+  var cf: RcField[4];
+  var m: RcMeta = rfa_ctr_meta(&cf[0]);
+  var n: int32 = 0;
+  var q: RcQuery = rc_query_update_all(m);
+  rc_query_set(&q, "failures", RcInt((int64)c->failures));
+  rc_query_set(&q, "window_start", RcInt(c->window_start));
+  rc_query_set(&q, "locked_until", RcInt(c->locked_until));
+  rc_query_where(&q, "key", RC_CMP_EQ, rfa_key(&c->key[0]));
+  var rc: int32 = rfa_run(&q, s, &n);
+  rc_query_free(&q);
+  if (rc != RC_OK || n > 0) { return rc; }
+
+  var ins: RcQuery = rc_query_insert_batch(m, 1);
+  rc_query_push_arg(&ins, rfa_key(&c->key[0]));
+  rc_query_push_arg(&ins, RcInt((int64)c->failures));
+  rc_query_push_arg(&ins, RcInt(c->window_start));
+  rc_query_push_arg(&ins, RcInt(c->locked_until));
+  rc = rfa_run(&ins, s, 0);
+  rc_query_free(&ins);
+  return rc;
+}
+
+fn rfa_ctr_put(ctx: rawptr, c: RaCounter*) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  rc = rc_session_begin(s, RC_TX_IMMEDIATE);
+  if (rc == RC_OK) {
+    rc = rfa_ctr_upsert(s, c);
+    if (rc == RC_OK) {
+      rc = rc_session_commit(s);
+    } else {
+      rc_session_rollback(s);
+    }
+  }
+  rfa_checkin(ctx, s);
+  return rfa_code(rc);
+}
+
+fn rfa_ctr_del(ctx: rawptr, key: uint8*) -> int32 {
+  var cf: RcField[4];
+  return rfa_del_key(ctx, rfa_ctr_meta(&cf[0]), key);
+}
+
+// --- credentials -------------------------------------------------------------
+
+fn rfa_cred_row(u: RfaUsers*, r: RcResult*, out: RaCredential*) -> int32 {
+  memset((rawptr)out, 0, (int64)sizeof(RaCredential));
+  var oc: int32 = rc_meta_find(u->meta, u->owner);
+  var hc: int32 = rc_meta_find(u->meta, u->hash);
+  if (oc < 0 || hc < 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rfa_i64(r, 0, oc, &out->owner);
+  if (rc != RC_OK) { return rc; }
+  // NULL or "" = no password set: a zero hash, which never verifies.
+  var h: RcValue = rc_result_borrow(r, 0, hc);
+  if (!rc_value_is_null(h)) {
+    var text: string = "";
+    rc = rc_value_as_text(h, &text);
+    if (rc != RC_OK) { return rc; }
+    if (text.length > (uint64)0 && ra_password_from_text(&out->hash, text) != RA_OK) {
+      return RC_ERR_CAST;
+    }
+  }
+  if (u->disabled.length > (uint64)0) {
+    var dc: int32 = rc_meta_find(u->meta, u->disabled);
+    if (dc < 0) { return RC_ERR_USAGE; }
+    var d: RcValue = rc_result_borrow(r, 0, dc);
+    if (!rc_value_is_null(d)) {
+      var dv: int64 = 0;
+      rc = rc_value_as_i64(d, &dv);
+      if (rc != RC_OK) { return rc; }
+      if (dv != 0) { out->disabled = 1; }
+    }
+  }
+  return RC_OK;
+}
+
+fn rfa_cred_get(ctx: rawptr, login: string, out: RaCredential*) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var u: RfaUsers* = &((RfaStore*)ctx)->users;
+  var q: RcQuery = rc_query_select(u->meta);
+  rc_query_where(&q, u->login, RC_CMP_EQ, RcText(login));
+  rc_query_limit(&q, 1);
+  var r: RcResult;
+  rc_result_init(&r);
+  rc = rc_query_exec(&q, rc_session_adapter(s), &r);
+  if (rc == RC_OK && r.n_rows == 0) { rc = RC_ERR_NOT_FOUND; }
+  if (rc == RC_OK) { rc = rfa_cred_row(u, &r, out); }
+  rc_result_free(&r);
+  rc_query_free(&q);
+  rfa_checkin(ctx, s);
+  return rfa_code(rc);
+}
+
+fn rfa_cred_set_hash(ctx: rawptr, owner: int64, h: CrPwHash*) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var u: RfaUsers* = &((RfaStore*)ctx)->users;
+  var n: int32 = 0;
+  var q: RcQuery = rc_query_update_all(u->meta);
+  rc_query_set(&q, u->hash, RcText(ra_password_text(h)));
+  rc_query_where(&q, u->owner, RC_CMP_EQ, RcInt(owner));
+  rc = rfa_run(&q, s, &n);
+  rc_query_free(&q);
+  rfa_checkin(ctx, s);
+  if (rc == RC_OK && n == 0) { return RA_E_NOT_FOUND; }
+  return rfa_code(rc);
+}
+
+// --- prune -------------------------------------------------------------------
+
+fn rfa_prune_all(s: RcSession*, now: int64, counter_before: int64, total: int32*) -> int32 {
+  var tf: RcField[8];
+  var cf: RcField[4];
+  var n: int32 = 0;
+  var q1: RcQuery = rc_query_delete(rfa_tok_meta(&tf[0]));
+  rc_query_where(&q1, "revoked", RC_CMP_EQ, RcInt(1));
+  var rc: int32 = rfa_run(&q1, s, &n);
+  rc_query_free(&q1);
+  if (rc != RC_OK) { return rc; }
+  *total = *total + n;
+
+  n = 0;
+  var q2: RcQuery = rc_query_delete(rfa_tok_meta(&tf[0]));
+  rc_query_where(&q2, "expires", RC_CMP_GT, RcInt(0));
+  rc_query_where(&q2, "expires", RC_CMP_LE, RcInt(now));
+  rc = rfa_run(&q2, s, &n);
+  rc_query_free(&q2);
+  if (rc != RC_OK) { return rc; }
+  *total = *total + n;
+
+  n = 0;
+  var q3: RcQuery = rc_query_delete(rfa_ctr_meta(&cf[0]));
+  rc_query_where(&q3, "locked_until", RC_CMP_LE, RcInt(now));
+  rc_query_where(&q3, "window_start", RC_CMP_LT, RcInt(counter_before));
+  rc = rfa_run(&q3, s, &n);
+  rc_query_free(&q3);
+  if (rc != RC_OK) { return rc; }
+  *total = *total + n;
+  return RC_OK;
+}
+
+fn rfa_prune(ctx: rawptr, now: int64, counter_before: int64) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = rfa_checkout(ctx, &s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  var total: int32 = 0;
+  rc = rc_session_begin(s, RC_TX_IMMEDIATE);
+  if (rc == RC_OK) {
+    rc = rfa_prune_all(s, now, counter_before, &total);
+    if (rc == RC_OK) {
+      rc = rc_session_commit(s);
+    } else {
+      rc_session_rollback(s);
+    }
+  }
+  rfa_checkin(ctx, s);
+  if (rc != RC_OK) { return rfa_code(rc); }
+  return total;
+}
+
+// --- public ------------------------------------------------------------------
+
+// Points a raize_auth store at this backend: sets st.ctx and all ten
+// functions. Each function checks a session out of ctx.pool (waiting up to
+// 5 s), so the store is safe from any thread.
+//   st   the store to fill
+//   ctx  the context; borrowed, must outlive every call through st
+// Returns nothing; a 0 st or ctx is ignored.
+// The functions return RA_OK, RA_E_NOT_FOUND, RA_E_NOMEM, or RA_E_STORE for
+// anything else (a busy pool included). cred_set_hash writes the hash with
+// flux's update_all: a user table with an RC_F_VERSION column is refused
+// (RA_E_STORE), and RC_F_UPDATED columns are stamped from rc_clock_set's
+// clock, which must then be installed.
+export fn rfa_store_bind(st: RaStore*, ctx: RfaStore*) {
+  if (st == 0 || ctx == 0) { return; }
+  st->ctx = (rawptr)ctx;
+  st->tok_put = &rfa_tok_put;
+  st->tok_get = &rfa_tok_get;
+  st->tok_del = &rfa_tok_del;
+  st->tok_list = &rfa_tok_list;
+  st->ctr_get = &rfa_ctr_get;
+  st->ctr_put = &rfa_ctr_put;
+  st->ctr_del = &rfa_ctr_del;
+  st->cred_get = &rfa_cred_get;
+  st->cred_set_hash = &rfa_cred_set_hash;
+  st->prune = &rfa_prune;
+}
+
+fn rfa_up(a: RcAdapter*) -> int32 {
+  var tf: RcField[8];
+  var cf: RcField[4];
+  var rc: int32 = rc_migration_create(a, rfa_tok_meta(&tf[0]));
+  if (rc == RC_OK) { rc = rc_migration_create(a, rfa_ctr_meta(&cf[0])); }
+  if (rc == RC_OK) {
+    var cols: string[1];
+    cols[0] = "owner";
+    rc = rc_migration_create_index(a, rfa_tok_meta(&tf[0]), "ra_tokens_owner_index",
+                                   &cols[0], 1, false);
+  }
+  return rc;
+}
+
+fn rfa_down(a: RcAdapter*) -> int32 {
+  var tf: RcField[8];
+  var cf: RcField[4];
+  var rc: int32 = rc_migration_drop(a, rfa_tok_meta(&tf[0]));
+  if (rc == RC_OK) { rc = rc_migration_drop(a, rfa_ctr_meta(&cf[0])); }
+  return rc;
+}
+
+// Fills a migration that creates ra_tokens (key BLOB PK, owner, created,
+// expires, last_used, revoked, scope, label; indexed on owner) and
+// ra_counters (key BLOB PK, failures, window_start, locked_until). Its down
+// step drops both. Add it to the app's migration set.
+//   out      the migration to fill
+//   version  its version in the app's set, > 0
+// Returns nothing; a 0 out is ignored. Times are int64 columns, in whatever
+// unit raize_auth passes (unix seconds).
+export fn rfa_migration(out: RcMigration*, version: int64) {
+  if (out == 0) { return; }
+  out->version = version;
+  out->name = "raize_auth tokens and counters";
+  out->up_sql = "";
+  out->up = &rfa_up;
+  out->down_sql = "";
+  out->down = &rfa_down;
+}

@@ -219,6 +219,10 @@ if (rc_pool_checkout(&pool, 1000, &s) == RC_OK) {   // RC_ERR_BUSY after 1 s
 rc_pool_free(&pool);
 ```
 
+raize_auth apps can keep API tokens, lockout counters and password hashes in
+MeoDB through `ext/raize_auth` (package `flux_raize_auth`), a separate package
+so flux_orm itself does not depend on raize_auth. See its README.
+
 ## Reference
 
 Every exported function has a comment above it in `src/` with its inputs,

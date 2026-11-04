@@ -1,0 +1,363 @@
+// tests/store_live: the RaStore contract (raize_auth/tests/store_test.mettle)
+// against a real MeoDB server, through a flux_orm pool. Needs a server on
+// 127.0.0.1:5491 with an empty database; see README.md for the commands.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "flux_orm/flux_orm";
+import "flux_orm/adapter/meodb";
+import "flux_orm/repo/pool";
+import "raize_auth/auth";
+import "flux_raize_auth/flux_raize_auth";
+
+var g_fail: int32 = 0;
+
+fn check(name: string, ok: bool) {
+  if (!ok) {
+    g_fail = g_fail + 1;
+    println("FAIL " + name);
+  }
+}
+
+// ---- the app's user table ----
+
+struct AppUser {
+  id: int64;
+  login: string;
+  pw_hash: string;
+  disabled: bool;
+}
+
+const USER_COLS: RcColumn[4] = [
+  { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
+  { index: 1, column: "login", ty: RC_T_TEXT, flags: RC_F_NOT_NULL | RC_F_UNIQUE },
+  { index: 2, column: "pw_hash", ty: RC_T_TEXT, flags: 0 },
+  { index: 3, column: "disabled", ty: RC_T_BOOL, flags: RC_F_NOT_NULL },
+];
+
+var USER: RcSchema;
+
+fn user_fields(s: RcSchema*) {
+  comptime for f in typeof(AppUser).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
+}
+
+fn user_meta() -> RcMeta {
+  return rc_schema_meta(&USER, &user_fields, "app_users", "AppUser", (int64)sizeof(AppUser),
+                        &USER_COLS[0], 4);
+}
+
+fn up_users(a: RcAdapter*) -> int32 { return rc_migration_create(a, user_meta()); }
+
+// Inserts a user with no password; returns its id, or -1.
+fn add_user(s: RcSession*, login: string, disabled: bool) -> int64 {
+  var q: RcQuery = rc_query_insert_batch(user_meta(), 1);
+  rc_query_push_arg(&q, RcText(login));
+  rc_query_push_arg(&q, RcNull);
+  rc_query_push_arg(&q, RcBool(disabled));
+  var r: RcResult;
+  rc_result_init(&r);
+  var id: int64 = -1;
+  if (rc_query_exec(&q, rc_session_adapter(s), &r) == RC_OK) { id = r.last_id; }
+  rc_result_free(&r);
+  rc_query_free(&q);
+  return id;
+}
+
+// ---- helpers ----
+
+fn make_token(t: RaToken*, secret: string, owner: int64) {
+  memset((rawptr)t, 0, (int64)sizeof(RaToken));
+  var h: CrSha256;
+  cr_token_hash(&h, secret);
+  memcpy((rawptr)&t->key[0], (rawptr)&h.b[0], 32);
+  t->owner = owner;
+}
+
+fn key_of(out: CrSha256*, secret: string) {
+  cr_token_hash(out, secret);
+}
+
+// ---- threads ----
+
+var g_st: RaStore;
+var g_ids: int32[4];
+var g_bad: int32 = 0;
+
+fn worker(arg: cstring) -> uint32 {
+  var id: int32 = *(int32*)arg;
+  var owner: int64 = (int64)(1000 + id);
+  var k: int32 = 0;
+  while (k < 25) {
+    var t: RaToken;
+    make_token(&t, "rat_thr{id}_{k}", owner);
+    t.created = (int64)k;
+    ra_token_set_label(&t, "thread {id}");
+    if (ra_store_tok_put(&g_st, &t) != RA_OK) { atomic_inc_i32(&g_bad); }
+    var got: RaToken;
+    if (ra_store_tok_get(&g_st, &t.key[0], &got) != RA_OK) {
+      atomic_inc_i32(&g_bad);
+    } else if (got.owner != owner || got.created != (int64)k) {
+      atomic_inc_i32(&g_bad);
+    }
+    k = k + 1;
+  }
+  var page: RaToken[32];
+  if (ra_store_tok_list(&g_st, owner, 0, &page[0], 32) != 25) { atomic_inc_i32(&g_bad); }
+  return 0;
+}
+
+export fn main() -> int32 {
+  if (cr_init() != CR_OK) { println("FAIL cr_init"); return 1; }
+
+  var pool: RcPool;
+  var rc: int32 = RC_ERR_CLOSED;
+  var tries: int32 = 0;
+  while (rc != RC_OK && tries < 50) {
+    rc = rc_meodb_pool(&pool, 2, "", "127.0.0.1:5491");
+    if (rc != RC_OK) { thread_sleep_ms(100); }
+    tries = tries + 1;
+  }
+  if (rc != RC_OK) { println("FAIL pool: {rc_status_name(rc)}"); return 1; }
+
+  // ---- migrations: the app's users, then raize_auth's tables ----
+  var migs: RcMigration[2];
+  migs[0].version = 1;
+  migs[0].name = "users";
+  migs[0].up_sql = "";
+  migs[0].up = &up_users;
+  migs[0].down_sql = "";
+  migs[0].down = 0;
+  rfa_migration(&migs[1], 2);
+  var set: RcMigrationSet = rc_migration_set(&migs[0], 2);
+  var rep: RcMigrationReport;
+  var s: RcSession* = 0;
+  check("checkout", rc_pool_checkout(&pool, 1000, &s) == RC_OK);
+  rc = rc_migration_run(rc_session_adapter(s), &set, &rep);
+  check("migrate", rc == RC_OK && rep.applied == 2);
+  if (rc != RC_OK) { println("  migrate: {rc_status_name(rc)} at {rep.failed_version}"); }
+  var ada_id: int64 = add_user(s, "ada", false);
+  var bob_id: int64 = add_user(s, "bob", true);
+  check("users added", ada_id > 0 && bob_id > 0 && ada_id != bob_id);
+  rc_pool_checkin(&pool, s);
+
+  var ctx: RfaStore;
+  ctx.pool = &pool;
+  ctx.users.meta = user_meta();
+  ctx.users.login = "login";
+  ctx.users.owner = "id";
+  ctx.users.hash = "pw_hash";
+  ctx.users.disabled = "disabled";
+  var st: RaStore;
+  rfa_store_bind(&st, &ctx);
+  check("complete after bind", ra_store_complete(&st));
+
+  // ---- tokens ----
+  var t1: RaToken;
+  var t2: RaToken;
+  var t3: RaToken;
+  make_token(&t1, "rat_test1", 1);
+  make_token(&t2, "rat_test2", 1);
+  make_token(&t3, "rat_test3", 2);
+  t1.created = 10;
+  t2.created = 20;
+  t1.expires = 5000;
+  t1.last_used = 11;
+  check("scope t1", ra_token_set_scope(&t1, "publish yank") == RA_OK);
+  check("label t1", ra_token_set_label(&t1, "CI publish") == RA_OK);
+  check("scope t2", ra_token_set_scope(&t2, "read") == RA_OK);
+  check("label t2", ra_token_set_label(&t2, "laptop") == RA_OK);
+  check("scope t3", ra_token_set_scope(&t3, "admin") == RA_OK);
+  check("label t3", ra_token_set_label(&t3, "bob token") == RA_OK);
+  check("put t1", ra_store_tok_put(&st, &t1) == RA_OK);
+  check("put t2", ra_store_tok_put(&st, &t2) == RA_OK);
+  check("put t3", ra_store_tok_put(&st, &t3) == RA_OK);
+
+  var got: RaToken;
+  check("get t1", ra_store_tok_get(&st, &t1.key[0], &got) == RA_OK);
+  check("get t1 key", memcmp((rawptr)&got.key[0], (rawptr)&t1.key[0], 32) == 0);
+  check("get t1 owner", got.owner == 1);
+  check("get t1 times", got.created == 10 && got.expires == 5000 && got.last_used == 11);
+  check("get t1 revoked", got.revoked == 0);
+  check("get t1 scope", ra_token_scope(&got) == "publish yank");
+  check("get t1 label", ra_token_label(&got) == "CI publish");
+  var got3: RaToken;
+  check("get t3", ra_store_tok_get(&st, &t3.key[0], &got3) == RA_OK);
+  check("get t3 owner", got3.owner == 2);
+  check("get t3 scope", ra_token_scope(&got3) == "admin");
+
+  var unknown: CrSha256;
+  key_of(&unknown, "rat_unknown");
+  var miss: RaToken;
+  check("get unknown", ra_store_tok_get(&st, &unknown.b[0], &miss) == RA_E_NOT_FOUND);
+
+  var page: RaToken[4];
+  check("list owner 1 count", ra_store_tok_list(&st, 1, 0, &page[0], 4) == 2);
+  check("list owner 1 order", page[0].created == 10 && page[1].created == 20);
+  check("list owner 2 count", ra_store_tok_list(&st, 2, 0, &page[0], 4) == 1);
+  check("list unknown owner", ra_store_tok_list(&st, 77, 0, &page[0], 4) == 0);
+
+  // put of the same key replaces; count stays the same.
+  var t1b: RaToken;
+  make_token(&t1b, "rat_test1", 1);
+  t1b.created = 10;
+  t1b.revoked = 1;
+  check("scope t1b", ra_token_set_scope(&t1b, "publish") == RA_OK);
+  check("label t1b", ra_token_set_label(&t1b, "renamed") == RA_OK);
+  check("put t1 again", ra_store_tok_put(&st, &t1b) == RA_OK);
+  check("list after replace", ra_store_tok_list(&st, 1, 0, &page[0], 4) == 2);
+  var got1b: RaToken;
+  check("get replaced", ra_store_tok_get(&st, &t1.key[0], &got1b) == RA_OK);
+  check("replaced scope", ra_token_scope(&got1b) == "publish");
+  check("replaced label", ra_token_label(&got1b) == "renamed");
+  check("replaced revoked", got1b.revoked == 1 && got1b.expires == 0);
+
+  // ---- tok_list paging ----
+  var one: RaToken[1];
+  check("page cap1 skip0", ra_store_tok_list(&st, 1, 0, &one[0], 1) == 1);
+  check("page skip0 is t1", one[0].created == 10);
+  check("page cap1 skip1", ra_store_tok_list(&st, 1, 1, &one[0], 1) == 1);
+  check("page skip1 is t2", one[0].created == 20);
+  check("page cap1 skip2", ra_store_tok_list(&st, 1, 2, &one[0], 1) == 0);
+  check("list cap 0 is USAGE", ra_store_tok_list(&st, 1, 0, &one[0], 0) == RA_E_USAGE);
+  check("list skip -1 is USAGE", ra_store_tok_list(&st, 1, -1, &one[0], 1) == RA_E_USAGE);
+
+  // ---- delete ----
+  check("del t2", ra_store_tok_del(&st, &t2.key[0]) == RA_OK);
+  check("get after del", ra_store_tok_get(&st, &t2.key[0], &miss) == RA_E_NOT_FOUND);
+  check("del again", ra_store_tok_del(&st, &t2.key[0]) == RA_E_NOT_FOUND);
+  check("list after del", ra_store_tok_list(&st, 1, 0, &page[0], 4) == 1);
+
+  // ---- counters ----
+  var ck: CrSha256;
+  key_of(&ck, "login:ada");
+  var c: RaCounter;
+  memcpy((rawptr)&c.key[0], (rawptr)&ck.b[0], 32);
+  c.failures = 3;
+  c.window_start = 1000;
+  c.locked_until = 2000;
+  check("ctr put", ra_store_ctr_put(&st, &c) == RA_OK);
+  var cg: RaCounter;
+  check("ctr get", ra_store_ctr_get(&st, &ck.b[0], &cg) == RA_OK);
+  check("ctr key", memcmp((rawptr)&cg.key[0], (rawptr)&ck.b[0], 32) == 0);
+  check("ctr failures", cg.failures == 3);
+  check("ctr window_start", cg.window_start == 1000);
+  check("ctr locked_until", cg.locked_until == 2000);
+  c.failures = 4;
+  check("ctr put replace", ra_store_ctr_put(&st, &c) == RA_OK);
+  check("ctr get replaced", ra_store_ctr_get(&st, &ck.b[0], &cg) == RA_OK && cg.failures == 4);
+  check("ctr del", ra_store_ctr_del(&st, &ck.b[0]) == RA_OK);
+  check("ctr get after del", ra_store_ctr_get(&st, &ck.b[0], &cg) == RA_E_NOT_FOUND);
+  check("ctr del again", ra_store_ctr_del(&st, &ck.b[0]) == RA_E_NOT_FOUND);
+
+  // ---- credentials ----
+  var cred: RaCredential;
+  check("cred ada", ra_store_cred_get(&st, "ada", &cred) == RA_OK);
+  check("cred ada owner", cred.owner == ada_id);
+  check("cred ada enabled", cred.disabled == 0);
+  check("cred ada no password", !ra_password_verify(&cred.hash, "correct horse"));
+  var cred_bob: RaCredential;
+  check("cred bob", ra_store_cred_get(&st, "bob", &cred_bob) == RA_OK);
+  check("cred bob owner", cred_bob.owner == bob_id);
+  check("cred bob disabled", cred_bob.disabled == 1);
+  check("cred nobody", ra_store_cred_get(&st, "nobody", &cred) == RA_E_NOT_FOUND);
+  check("cred empty login", ra_store_cred_get(&st, "", &cred) == RA_E_USAGE);
+
+  var h: CrPwHash;
+  check("hash pw", ra_password_hash(&h, "correct horse", CR_PW_INTERACTIVE) == RA_OK);
+  check("set_hash ada", ra_store_cred_set_hash(&st, ada_id, &h) == RA_OK);
+  var cred2: RaCredential;
+  check("cred ada again", ra_store_cred_get(&st, "ada", &cred2) == RA_OK);
+  check("cred owner kept", cred2.owner == ada_id);
+  check("hash round-trips", memcmp((rawptr)&cred2.hash, (rawptr)&h, (int64)sizeof(CrPwHash)) == 0);
+  check("stored hash verifies", ra_password_verify(&cred2.hash, "correct horse"));
+  check("stored hash rejects wrong", !ra_password_verify(&cred2.hash, "correct horsf"));
+  check("set_hash owner 99", ra_store_cred_set_hash(&st, 99, &h) == RA_E_NOT_FOUND);
+
+  // ---- prune: clear tokens first so the count is exact ----
+  check("del t1", ra_store_tok_del(&st, &t1.key[0]) == RA_OK);
+  check("del t3", ra_store_tok_del(&st, &t3.key[0]) == RA_OK);
+  var now: int64 = 1000000;
+  var pr: RaToken;
+  make_token(&pr, "rat_revoked", 1);
+  pr.revoked = 1;
+  check("prune put revoked", ra_store_tok_put(&st, &pr) == RA_OK);
+  var pe: RaToken;
+  make_token(&pe, "rat_expired", 1);
+  pe.expires = now - 1;
+  check("prune put expired", ra_store_tok_put(&st, &pe) == RA_OK);
+  var pn: RaToken;
+  make_token(&pn, "rat_expires_now", 1);
+  pn.expires = now;
+  check("prune put expires now", ra_store_tok_put(&st, &pn) == RA_OK);
+  var pl: RaToken;
+  make_token(&pl, "rat_live", 1);
+  pl.expires = 0;
+  check("prune put live", ra_store_tok_put(&st, &pl) == RA_OK);
+  var pf: RaToken;
+  make_token(&pf, "rat_future", 1);
+  pf.expires = now + 1;
+  check("prune put future", ra_store_tok_put(&st, &pf) == RA_OK);
+
+  var sk: CrSha256;
+  key_of(&sk, "stale");
+  var cs: RaCounter;
+  memcpy((rawptr)&cs.key[0], (rawptr)&sk.b[0], 32);
+  cs.failures = 2;
+  cs.window_start = now - 5000;
+  cs.locked_until = 0;
+  check("prune put stale ctr", ra_store_ctr_put(&st, &cs) == RA_OK);
+  var lk: CrSha256;
+  key_of(&lk, "locked");
+  var cl: RaCounter;
+  memcpy((rawptr)&cl.key[0], (rawptr)&lk.b[0], 32);
+  cl.failures = 9;
+  cl.window_start = now - 5000;
+  cl.locked_until = now + 100;
+  check("prune put locked ctr", ra_store_ctr_put(&st, &cl) == RA_OK);
+  var fk: CrSha256;
+  key_of(&fk, "fresh");
+  var cf: RaCounter;
+  memcpy((rawptr)&cf.key[0], (rawptr)&fk.b[0], 32);
+  cf.failures = 1;
+  cf.window_start = now;
+  check("prune put fresh ctr", ra_store_ctr_put(&st, &cf) == RA_OK);
+
+  check("prune removes exactly 4", ra_store_prune(&st, now, now) == 4);
+  var chk: RaToken;
+  check("prune keeps live token", ra_store_tok_get(&st, &pl.key[0], &chk) == RA_OK);
+  check("prune keeps future token", ra_store_tok_get(&st, &pf.key[0], &chk) == RA_OK);
+  check("prune dropped revoked", ra_store_tok_get(&st, &pr.key[0], &chk) == RA_E_NOT_FOUND);
+  check("prune dropped expired", ra_store_tok_get(&st, &pe.key[0], &chk) == RA_E_NOT_FOUND);
+  check("prune dropped expires now", ra_store_tok_get(&st, &pn.key[0], &chk) == RA_E_NOT_FOUND);
+  var cchk: RaCounter;
+  check("prune keeps locked ctr", ra_store_ctr_get(&st, &lk.b[0], &cchk) == RA_OK);
+  check("prune keeps fresh ctr", ra_store_ctr_get(&st, &fk.b[0], &cchk) == RA_OK);
+  check("prune dropped stale ctr", ra_store_ctr_get(&st, &sk.b[0], &cchk) == RA_E_NOT_FOUND);
+  check("prune again removes none", ra_store_prune(&st, now, now) == 0);
+
+  // ---- four threads, two sessions ----
+  g_st = st;
+  var th: int64[4];
+  var i: int32 = 0;
+  while (i < 4) {
+    g_ids[i] = i;
+    th[i] = CreateThread((cstring)0, 0, &worker, (cstring)&g_ids[i], 0, (uint32*)0);
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 4) {
+    thread_join_infinite(th[i]);
+    CloseHandle(th[i]);
+    i = i + 1;
+  }
+  check("threads: every put/get/list ok", g_bad == 0);
+  check("threads: pool idle", rc_pool_idle(&pool) == 2);
+
+  rc_pool_free(&pool);
+  if (g_fail != 0) { println("store_live: {g_fail} failed"); return 1; }
+  println("OK store_live");
+  return 0;
+}
