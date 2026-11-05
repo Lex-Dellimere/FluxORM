@@ -14,6 +14,6 @@ fn project() {
 
 fn deps() {
   mb_dep_path("flux_orm", "../..");
-  mb_dep_path("raize_auth", "../../../raize_auth");
+  mb_dep_path("raize_auth", "../../../raize_web/libs/auth");
   mb_dep_path("crypto", "../../../cryptex");
 }
