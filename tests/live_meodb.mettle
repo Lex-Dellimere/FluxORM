@@ -8,7 +8,8 @@
 //
 // It migrates, inserts, loads, saves with a version check (and a stale save),
 // reports a duplicate key on its field, queries, preloads, counts, deletes in
-// bulk and rolls a transaction back, printing one line per step.
+// bulk and rolls a transaction back, scans posts and follows them through a
+// subscription, printing one line per step.
 
 import "std/io";
 import "std/mem";
@@ -26,6 +27,23 @@ fn up_all(a: RcAdapter*) -> int32 {
 }
 
 const MIGRATIONS: RcMigration[1] = [ { version: 1, name: "create tables", up: &up_all } ];
+
+// Counts scanned points; a nonzero ctx group must match every point's.
+struct Seen {
+  n: int32;
+  bad: int32;
+}
+
+fn count_points(ctx: rawptr, pts: RcPoint*, n: int32) -> bool {
+  var c: Seen* = (Seen*)ctx;
+  var i: int32 = 0;
+  while (i < n) {
+    if (pts[i].x < 1.0) { c->bad = c->bad + 1; }
+    i = i + 1;
+  }
+  c->n = c->n + n;
+  return true;
+}
 
 fn step(name: string, rc: int32) -> bool {
   if (rc == RC_OK) {
@@ -185,6 +203,67 @@ export fn main() -> int32 {
   var cnt2: int64 = 0;
   rc = rc_repo_count(&s, &cq, &cnt2);
   if (rc != RC_OK || added != 2 || cnt2 != cnt + 2) { println("  FAIL insert_all: added {added}, count {cnt} -> {cnt2}"); return 17; }
+  // SCAN posts as (id, user_id) points, 2 per frame, then follow them from
+  // the scan's commit on a second connection.
+  var seen: Seen;
+  seen.n = 0;
+  seen.bad = 0;
+  var snap: uint64 = 0;
+  rc = rc_meodb_scan(a, "posts", "id", "user_id", "", 0.0, 1000000.0, 2, &count_points,
+                     (rawptr)&seen, &snap);
+  if (!step("scan posts (id, user_id)", rc)) { return 40; }
+  println("  {seen.n} points at commit {snap}");
+  if ((int64)seen.n != cnt2 || seen.bad != 0 || snap == (uint64)0) {
+    println("  FAIL scan");
+    return 41;
+  }
+  var gseen: Seen;
+  gseen.n = 0;
+  gseen.bad = 0;
+  rc = rc_meodb_scan(a, "posts", "id", "id", "user_id", 0.0, 1000000.0, 1000, &count_points,
+                     (rawptr)&gseen, (uint64*)0);
+  if (!step("scan grouped by user_id", rc)) { return 42; }
+  if (gseen.n != seen.n) { println("  FAIL grouped scan {gseen.n}"); return 50; }
+  var sub: RcSub;
+  var only: string[1] = ["posts"];
+  rc = rc_meodb_subscribe(&sub, "", "127.0.0.1:5490", &only[0], 1, 0, snap, 64);
+  if (!step("subscribe to posts from that commit", rc)) { return 43; }
+  println("  start_seq {rc_sub_start_seq(&sub)} commit_seq {rc_sub_commit_seq(&sub)}");
+  var lp: Post;
+  memset((rawptr)&lp, 0, (int64)sizeof(Post));
+  var lpe: RcEntity = rc_entity_new(post_meta(), (rawptr)&lp);
+  rc_entity_set(&lpe, "user_id", RcInt(uid[0]));
+  rc_entity_set(&lpe, "title", RcText("live"));
+  var nocs1: RcChangeset* = 0;
+  if (!step("insert a post", rc_repo_insert(&s, nocs1, &lpe))) { return 44; }
+  var lu: RcQuery = rc_query_update_all(post_meta());
+  rc_query_set(&lu, "title", RcText("live 2"));
+  rc_query_where(&lu, "id", RC_CMP_EQ, RcInt(lp.id));
+  var lun: int32 = 0;
+  if (!step("update it", rc_repo_update_all(&s, &lu, &lun))) { return 45; }
+  rc_query_free(&lu);
+  if (!step("delete it", rc_repo_delete(&s, &lpe))) { return 46; }
+  var want: int32[3] = [RC_EV_INSERT, RC_EV_UPDATE, RC_EV_DELETE];
+  var ev: RcEvent;
+  var last: uint64 = 0;
+  var w: int32 = 0;
+  while (w < 3) {
+    rc = rc_sub_next(&sub, &ev);
+    if (rc != RC_OK || ev.kind != want[w] || ev.rowid != lp.id || ev.table != "posts") {
+      println("  FAIL event {w}: {rc_status_name(rc)} kind {ev.kind}");
+      return 47;
+    }
+    var title: string = "";
+    rc_value_as_text(ev.vals[2], &title);
+    var col: string = rc_sub_column(&sub, ev.table_id, 2);
+    println("  ok   event seq {ev.seq} kind {ev.kind} {col}={title} old {ev.n_old}");
+    if (w == 1 && ev.n_old != ev.n_vals) { println("  FAIL update without its old row"); return 48; }
+    last = ev.seq;
+    w = w + 1;
+  }
+  if (!step("ack", rc_sub_ack(&sub, last))) { return 49; }
+  rc_sub_close(&sub);
+
   var bp: Post;
   var bpe: RcEntity;
   if (!step("get_by title = e", rc_repo_get_by(&s, post_meta(), "title", RcText("e"), (rawptr)&bp, &bpe))) { return 18; }
@@ -220,6 +299,13 @@ export fn main() -> int32 {
   var pc: int64 = 0;
   if (!step("count posts on it", rc_repo_count(ps, &cq, &pc))) { return 33; }
   if (pc != cnt + 2) { println("  FAIL pooled count {pc}"); return 34; }
+  var pseen: Seen;
+  pseen.n = 0;
+  pseen.bad = 0;
+  rc = rc_meodb_scan(rc_session_adapter(ps), "posts", "id", "user_id", "", 0.0, 1000000.0, 3,
+                     &count_points, (rawptr)&pseen, (uint64*)0);
+  if (!step("scan on it", rc)) { return 36; }
+  if ((int64)pseen.n != pc) { println("  FAIL pooled scan {pseen.n}"); return 37; }
   if (!step("checkin", rc_pool_checkin(&pool, ps))) { return 35; }
   rc_pool_free(&pool);
 

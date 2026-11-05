@@ -78,7 +78,7 @@ fn check_control() -> int32 {
   e_u8(&e, 2);
   if (!same(&w, &e)) { return 4; }
 
-  // HELLO: "MEOS", major 1, minor 0, max_frame, token, name.
+  // HELLO: "MEOS", major 1, minor 1, max_frame, token, name.
   rc_wire_clear(&w);
   e.n = 0;
   if (rc_wire_hello(&w, 1, (uint32)16777216, "s3cret", "flux_orm") != RC_OK) { return 5; }
@@ -88,7 +88,7 @@ fn check_control() -> int32 {
   e_u8(&e, 79);
   e_u8(&e, 83);
   e_le(&e, 1, 2);
-  e_le(&e, 0, 2);
+  e_le(&e, 1, 2);
   e_le(&e, 16777216, 4);
   e_str(&e, "s3cret");
   e_str(&e, "flux_orm");
@@ -319,13 +319,291 @@ fn check_decode() -> int32 {
   return 0;
 }
 
+// --- 5. minor 1 requests ---------------------------------------------------------
+
+// Appends p's bytes to e.
+fn e_cat(e: Exp*, p: Exp*) {
+  var i: int32 = 0;
+  while (i < p->n) {
+    e_u8(e, (int64)p->b[i]);
+    i = i + 1;
+  }
+}
+
+fn check_requests() -> int32 {
+  var w: RcWire = rc_wire_new();
+  defer rc_wire_free(&w);
+  var e: Exp;
+  e.n = 0;
+  var p: Exp;
+  p.n = 0;
+
+  // SUBSCRIBE: two tables, from_seq, from_commit, window.
+  var names: string[2] = ["posts", "users"];
+  if (rc_wire_subscribe(&w, 2, &names[0], 2, 9, 40, 256) != RC_OK) { return 1; }
+  e_le(&p, 2, 2);
+  e_str(&p, "posts");
+  e_str(&p, "users");
+  e_le(&p, 9, 8);
+  e_le(&p, 40, 8);
+  e_le(&p, 256, 4);
+  e_header(&e, (int64)p.n, 8, 2);
+  e_cat(&e, &p);
+  if (!same(&w, &e)) { return 2; }
+  // Every table: n_tables 0.
+  rc_wire_clear(&w);
+  e.n = 0;
+  if (rc_wire_subscribe(&w, 3, (string*)0, 0, 0, 0, 1) != RC_OK) { return 3; }
+  e_header(&e, 22, 8, 3);
+  e_le(&e, 0, 2);
+  e_le(&e, 0, 8);
+  e_le(&e, 0, 8);
+  e_le(&e, 1, 4);
+  if (!same(&w, &e)) { return 4; }
+  if (rc_wire_subscribe(&w, 3, (string*)0, 1, 0, 0, 1) != RC_ERR_USAGE) { return 5; }
+  if (rc_wire_subscribe(&w, 3, &names[0], -1, 0, 0, 1) != RC_ERR_USAGE) { return 6; }
+
+  // ACK carries the seq; UNSUBSCRIBE nothing.
+  rc_wire_clear(&w);
+  e.n = 0;
+  if (rc_wire_ack(&w, 4, 77) != RC_OK) { return 7; }
+  e_header(&e, 8, 9, 4);
+  e_le(&e, 77, 8);
+  if (!same(&w, &e)) { return 8; }
+  rc_wire_clear(&w);
+  e.n = 0;
+  if (rc_wire_empty(&w, RC_WIRE_UNSUBSCRIBE, 5) != RC_OK) { return 9; }
+  e_header(&e, 0, 10, 5);
+  if (!same(&w, &e)) { return 10; }
+
+  // SCAN: four names, lo and hi as f64 bits, chunk.
+  rc_wire_clear(&w);
+  e.n = 0;
+  p.n = 0;
+  if (rc_wire_scan(&w, 6, "posts", "id", "user_id", "", -0.0, 2.5, 1000) != RC_OK) { return 11; }
+  e_str(&p, "posts");
+  e_str(&p, "id");
+  e_str(&p, "user_id");
+  e_str(&p, "");
+  e_le(&p, 0, 7);                          // -0.0: only the sign bit
+  e_u8(&p, 128);
+  e_le(&p, 4612811918334230528, 8);        // 2.5
+  e_le(&p, 1000, 4);
+  e_header(&e, (int64)p.n, 11, 6);
+  e_cat(&e, &p);
+  if (!same(&w, &e)) { return 12; }
+  return 0;
+}
+
+// --- 6. minor 1 replies ----------------------------------------------------------
+
+// One event's fixed part.
+fn e_event(e: Exp*, seq: int64, kind: int64, table_id: int64, rowid: int64, old_rowid: int64) {
+  e_le(e, seq, 8);
+  e_le(e, 70, 8);                          // commit_seq
+  e_le(e, 1700000000000000, 8);            // time_us
+  e_u8(e, kind);
+  e_le(e, table_id, 4);
+  e_le(e, rowid, 8);
+  e_le(e, old_rowid, 8);
+}
+
+fn check_replies() -> int32 {
+  // SUB_OK: two tables, the second with no columns.
+  var so: Exp;
+  so.n = 0;
+  e_le(&so, 11, 8);
+  e_le(&so, 70, 8);
+  e_le(&so, 15000, 4);
+  e_le(&so, 2, 4);
+  e_le(&so, 3, 4);
+  e_str(&so, "posts");
+  e_le(&so, 2, 2);
+  e_str(&so, "id");
+  e_u8(&so, 1);
+  e_str(&so, "title");
+  e_u8(&so, 3);
+  e_le(&so, 4, 4);
+  e_str(&so, "empty");
+  e_le(&so, 0, 2);
+  var ok: RcWireSubOk;
+  if (rc_wire_sub_ok(&so.b[0], (int64)so.n, &ok) != RC_OK) { return 1; }
+  if (ok.start_seq != (uint64)11 || ok.commit_seq != (uint64)70 || ok.heartbeat_ms != 15000) { return 2; }
+  if (ok.n_tables != 2 || ok.tables[0].id != 3 || ok.tables[0].name != "posts") { return 3; }
+  if (ok.tables[0].n_cols != 2 || ok.tables[0].cols[1].name != "title" || ok.tables[0].cols[1].ty != 3) { return 4; }
+  if (ok.tables[1].id != 4 || ok.tables[1].n_cols != 0) { return 5; }
+  rc_wire_sub_ok_free(&ok);
+  // Short, long, and a column type 5 are refused.
+  if (rc_wire_sub_ok(&so.b[0], (int64)so.n - 1, &ok) != RC_ERR_ADAPTER) { return 6; }
+  e_u8(&so, 0);
+  if (rc_wire_sub_ok(&so.b[0], (int64)so.n, &ok) != RC_ERR_ADAPTER) { return 7; }
+  so.n = so.n - 1;
+  so.b[49] = (uint8)5;                     // "title"'s type
+  if (rc_wire_sub_ok(&so.b[0], (int64)so.n, &ok) != RC_ERR_ADAPTER) { return 8; }
+
+  // EVENTS: INSERT, UPDATE with old, DELETE, GAP, SCHEMA.
+  var ev: Exp;
+  ev.n = 0;
+  e_le(&ev, 5, 4);
+  e_event(&ev, 11, 1, 3, 1, 1);            // INSERT (1, "a")
+  e_le(&ev, 2, 2);
+  e_u8(&ev, 1);
+  e_le(&ev, 1, 8);
+  e_u8(&ev, 3);
+  e_le(&ev, 1, 4);
+  e_u8(&ev, 97);
+  e_le(&ev, 0, 2);
+  e_event(&ev, 12, 2, 3, 1, 1);            // UPDATE (1, "b") was (1, "a")
+  e_le(&ev, 2, 2);
+  e_u8(&ev, 1);
+  e_le(&ev, 1, 8);
+  e_u8(&ev, 3);
+  e_le(&ev, 1, 4);
+  e_u8(&ev, 98);
+  e_le(&ev, 2, 2);
+  e_u8(&ev, 1);
+  e_le(&ev, 1, 8);
+  e_u8(&ev, 3);
+  e_le(&ev, 1, 4);
+  e_u8(&ev, 97);
+  e_event(&ev, 13, 5, 3, 1, 0);            // DELETE (1, NULL)
+  e_le(&ev, 2, 2);
+  e_u8(&ev, 1);
+  e_le(&ev, 1, 8);
+  e_u8(&ev, 0);
+  e_le(&ev, 0, 2);
+  e_event(&ev, 14, 4, 0, 0, 0);            // GAP
+  e_le(&ev, 0, 2);
+  e_le(&ev, 0, 2);
+  e_event(&ev, 15, 6, 3, 0, 0);            // SCHEMA: posts (id INT, title TEXT, n REAL)
+  e_le(&ev, 0, 2);
+  e_le(&ev, 0, 2);
+  e_str(&ev, "posts");
+  e_le(&ev, 3, 2);
+  e_str(&ev, "id");
+  e_u8(&ev, 1);
+  e_str(&ev, "title");
+  e_u8(&ev, 3);
+  e_str(&ev, "n");
+  e_u8(&ev, 2);
+  var es: RcWireEvents;
+  if (rc_wire_events(&ev.b[0], (int64)ev.n, &es) != RC_OK) { return 10; }
+  defer rc_wire_events_free(&es);
+  if (es.n != 5) { return 11; }
+  var ins: RcEvent = es.ev[0].ev;
+  if (ins.seq != (uint64)11 || ins.commit_seq != (uint64)70 || ins.kind != RC_EV_INSERT) { return 12; }
+  if (ins.table_id != 3 || ins.rowid != 1 || ins.n_vals != 2 || ins.n_old != 0) { return 13; }
+  if (!rc_value_same(ins.vals[0], RcInt(1)) || !rc_value_same(ins.vals[1], RcText("a"))) { return 14; }
+  var up: RcEvent = es.ev[1].ev;
+  if (up.kind != RC_EV_UPDATE || up.n_vals != 2 || up.n_old != 2) { return 15; }
+  if (!rc_value_same(up.vals[1], RcText("b")) || !rc_value_same(up.old[1], RcText("a"))) { return 16; }
+  var del: RcEvent = es.ev[2].ev;
+  if (del.kind != RC_EV_DELETE || del.n_vals != 2 || !rc_value_is_null(del.vals[1])) { return 17; }
+  var gap: RcEvent = es.ev[3].ev;
+  if (gap.kind != RC_EV_GAP || gap.table_id != 0 || gap.n_vals != 0) { return 18; }
+  var sch: RcWireEvent = es.ev[4];
+  if (sch.ev.kind != RC_EV_SCHEMA || sch.ev.table != "posts" || sch.n_cols != 3) { return 19; }
+  if (sch.cols[2].name != "n" || sch.cols[2].ty != 2) { return 20; }
+
+  // The heartbeat: no events.
+  var hb: Exp;
+  hb.n = 0;
+  e_le(&hb, 0, 4);
+  var hs: RcWireEvents;
+  if (rc_wire_events(&hb.b[0], (int64)hb.n, &hs) != RC_OK || hs.n != 0) { return 21; }
+  rc_wire_events_free(&hs);
+
+  // Malformed events are refused.
+  var bad: Exp;
+  bad.n = 0;
+  e_le(&bad, 1, 4);
+  e_event(&bad, 1, 4, 3, 0, 0);            // a GAP with a table_id
+  e_le(&bad, 0, 2);
+  e_le(&bad, 0, 2);
+  var bs: RcWireEvents;
+  if (rc_wire_events(&bad.b[0], (int64)bad.n, &bs) != RC_ERR_ADAPTER) { return 22; }
+  bad.b[4 + 24] = (uint8)3;                // kind 3 does not exist
+  bad.b[4 + 25] = (uint8)0;
+  if (rc_wire_events(&bad.b[0], (int64)bad.n, &bs) != RC_ERR_ADAPTER) { return 23; }
+  bad.n = 0;
+  e_le(&bad, 1, 4);
+  e_event(&bad, 1, 1, 3, 1, 1);            // old values on an INSERT
+  e_le(&bad, 0, 2);
+  e_le(&bad, 1, 2);
+  e_u8(&bad, 0);
+  if (rc_wire_events(&bad.b[0], (int64)bad.n, &bs) != RC_ERR_ADAPTER) { return 24; }
+  bad.n = 0;
+  e_le(&bad, 1, 4);
+  e_event(&bad, 1, 6, 3, 0, 0);            // values on a SCHEMA
+  e_le(&bad, 1, 2);
+  e_u8(&bad, 0);
+  e_le(&bad, 0, 2);
+  e_str(&bad, "t");
+  e_le(&bad, 0, 2);
+  if (rc_wire_events(&bad.b[0], (int64)bad.n, &bs) != RC_ERR_ADAPTER) { return 25; }
+  bad.n = 0;
+  e_le(&bad, 2, 4);                        // two events promised, one sent
+  e_event(&bad, 1, 4, 0, 0, 0);
+  e_le(&bad, 0, 2);
+  e_le(&bad, 0, 2);
+  if (rc_wire_events(&bad.b[0], (int64)bad.n, &bs) != RC_ERR_ADAPTER) { return 26; }
+  if (rc_wire_events(&ev.b[0], (int64)ev.n - 1, &bs) != RC_ERR_ADAPTER) { return 27; }
+
+  // SCAN_ROWS: ungrouped, then grouped and last.
+  var sr: Exp;
+  sr.n = 0;
+  e_u8(&sr, 0);
+  e_u8(&sr, 0);
+  e_le(&sr, 70, 8);
+  e_le(&sr, 2, 4);
+  e_le(&sr, 4607182418800017408, 8);       // 1.0
+  e_le(&sr, 4612811918334230528, 8);       // 2.5
+  e_le(&sr, 4611686018427387904, 8);       // 2.0
+  e_le(&sr, 9221120237041090560, 8);       // NaN
+  var h: RcWireScanRows;
+  if (rc_wire_scan_rows(&sr.b[0], (int64)sr.n, &h) != RC_OK) { return 30; }
+  if (h.last || h.grouped || h.commit_seq != (uint64)70 || h.n != 2) { return 31; }
+  var pt: RcPoint;
+  rc_wire_scan_point(&h, 0, &pt);
+  if (pt.group != 0 || pt.x != 1.0 || pt.y != 2.5) { return 32; }
+  rc_wire_scan_point(&h, 1, &pt);
+  if (pt.x != 2.0 || pt.y == pt.y) { return 33; }   // NaN != NaN
+  if (rc_wire_scan_rows(&sr.b[0], (int64)sr.n - 8, &h) != RC_ERR_ADAPTER) { return 34; }
+  var sg: Exp;
+  sg.n = 0;
+  e_u8(&sg, 1);
+  e_u8(&sg, 1);
+  e_le(&sg, 70, 8);
+  e_le(&sg, 1, 4);
+  e_le(&sg, -4, 8);
+  e_le(&sg, 4607182418800017408, 8);
+  e_le(&sg, 4607182418800017408, 8);
+  if (rc_wire_scan_rows(&sg.b[0], (int64)sg.n, &h) != RC_OK) { return 35; }
+  if (!h.last || !h.grouped || h.n != 1) { return 36; }
+  rc_wire_scan_point(&h, 0, &pt);
+  if (pt.group != -4 || pt.x != 1.0 || pt.y != 1.0) { return 37; }
+  sg.b[1] = (uint8)2;                      // grouped is a bool byte
+  if (rc_wire_scan_rows(&sg.b[0], (int64)sg.n, &h) != RC_ERR_ADAPTER) { return 38; }
+  // The last frame may be empty.
+  var se: Exp;
+  se.n = 0;
+  e_u8(&se, 1);
+  e_u8(&se, 0);
+  e_le(&se, 70, 8);
+  e_le(&se, 0, 4);
+  if (rc_wire_scan_rows(&se.b[0], (int64)se.n, &h) != RC_OK || !h.last || h.n != 0) { return 39; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("wire: control frames", check_control())) { failures = failures + 1; }
   if (!rc_report("wire: values", check_values())) { failures = failures + 1; }
   if (!rc_report("wire: QUERY carries the RcStmt", check_query())) { failures = failures + 1; }
   if (!rc_report("wire: decoding replies", check_decode())) { failures = failures + 1; }
-  return rc_summary(failures, 4);
+  if (!rc_report("wire: minor 1 requests", check_requests())) { failures = failures + 1; }
+  if (!rc_report("wire: minor 1 replies", check_replies())) { failures = failures + 1; }
+  return rc_summary(failures, 6);
 }
 
 @test fn t_wire() -> int32 {
@@ -333,5 +611,7 @@ export fn main() -> int32 {
   if (check_values() != 0) { return 2; }
   if (check_query() != 0) { return 3; }
   if (check_decode() != 0) { return 4; }
+  if (check_requests() != 0) { return 5; }
+  if (check_replies() != 0) { return 6; }
   return 0;
 }

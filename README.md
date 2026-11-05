@@ -219,6 +219,44 @@ if (rc_pool_checkout(&pool, 1000, &s) == RC_OK) {   // RC_ERR_BUSY after 1 s
 rc_pool_free(&pool);
 ```
 
+### Live changes and scans
+
+MeoDB pushes row changes to a subscriber, like Postgres logical replication.
+A subscription has its own connection (it cannot run queries) and never sits
+in a pool. To follow a table from a known state, scan it first and subscribe
+from the scan's commit: every later commit then arrives once.
+
+```mettle
+fn on_points(ctx: rawptr, pts: RcPoint*, n: int32) -> bool {
+  // pts[i].x, pts[i].y, pts[i].group; return false to stop early
+  return true;
+}
+
+var snap: uint64 = 0;
+rc_meodb_scan(adapter, "posts", "id", "score", "", 0.0, 1000.0, 4096,
+              &on_points, (rawptr)0, &snap);    // or rc_session_adapter(s)
+
+var sub: RcSub;
+var tables: string[1] = ["posts"];
+rc_meodb_subscribe(&sub, "token", "127.0.0.1:5490", &tables[0], 1, 0, snap, 256);
+var ev: RcEvent;
+while (running) {
+  var rc: int32 = rc_sub_next(&sub, &ev);
+  if (rc == RC_OK) {
+    // ev.kind: RC_EV_INSERT, RC_EV_UPDATE (ev.old is the row before),
+    // RC_EV_DELETE, RC_EV_SCHEMA, or RC_EV_GAP (rescan, then resubscribe).
+    // ev.vals[i] is column rc_sub_column(&sub, ev.table_id, i).
+    rc_sub_ack(&sub, ev.seq);
+  } else if (rc == RC_ERR_CLOSED) {
+    Sleep(1000);
+    rc_sub_reopen(&sub);   // resumes after the last event returned
+  }
+}
+rc_sub_close(&sub);
+```
+
+A silent connection (twice the server's 15 s heartbeat) counts as closed.
+
 raize_auth apps can keep API tokens, lockout counters and password hashes in
 MeoDB through `ext/raize_auth` (package `flux_raize_auth`), a separate package
 so flux_orm itself does not depend on raize_auth. See its README.
@@ -251,7 +289,9 @@ Conventions:
 | Relations | `rc_relation_has_many`, `rc_relation_belongs_to`, `rc_relation_has_many_through`, `rc_relation_load`, `rc_relation_group`, `rc_relation_count`, `rc_relation_hydrate`, `rc_relation_free` |
 | Migrations | `rc_migration_set`, `rc_migration_run`, `rc_migration_down`, `rc_migration_create`, `rc_migration_drop`, `rc_migration_add_column`, `rc_migration_create_index`, `rc_migration_drop_index` |
 | Pool | `rc_pool_new`, `rc_meodb_pool`, `rc_pool_checkout`, `rc_pool_checkin`, `rc_pool_idle`, `rc_pool_free` |
-| Adapters | `rc_meodb_adapter`, `rc_meodb_timeout`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
+| Adapters | `rc_meodb_adapter`, `rc_meodb_timeout`, `rc_meodb_caps`, `rc_adapter_open`, `rc_adapter_close`, `rc_mem_adapter` (tests) |
+| Scans | `rc_meodb_scan` |
+| Subscriptions | `rc_meodb_subscribe`, `rc_sub_next`, `rc_sub_ack`, `rc_sub_reopen`, `rc_sub_table`, `rc_sub_column`, `rc_sub_n_columns`, `rc_sub_start_seq`, `rc_sub_commit_seq`, `rc_sub_close` |
 | Clock | `rc_clock_set`, `rc_clock_realtime_us` |
 
 ## Build and test

@@ -23,6 +23,7 @@ var SRV_KINDS: int32[32];
 var SRV_RIDS: int32[32];
 var SRV_N: int32 = 0;
 var SRV_FAIL: int32 = 0;   // nonzero: the server saw something wrong
+var SRV_BODY: uint8[512];  // the last request's payload
 
 // --- frames the fake sends ----------------------------------------------------
 
@@ -147,8 +148,7 @@ fn srv_next(c: int64, want_kind: int32) -> int32 {
   var len: int32 = (int32)head[0] | ((int32)head[1] << 8) | ((int32)head[2] << 16);
   var kind: int32 = (int32)head[4];
   var rid: int32 = (int32)head[8] | ((int32)head[9] << 8);
-  var body: uint8[512];
-  if (len > 512 || !srv_read_n(c, &body[0], len)) {
+  if (len > 512 || !srv_read_n(c, &SRV_BODY[0], len)) {
     SRV_FAIL = 200 + SRV_N;
     return 0;
   }
@@ -245,6 +245,26 @@ fn check_offline() -> int32 {
   if (rc_adapter_open(a, "127.0.0.1:") != RC_ERR_USAGE) { return 6; }
   if (rc_adapter_open(a, ":5490") != RC_ERR_USAGE) { return 7; }
   if (rc_adapter_open(a, "127.0.0.1:99999") != RC_ERR_USAGE) { return 8; }
+  // SCAN: bad arguments, then no connection.
+  var t: Tally = tally();
+  var seq: uint64 = 5;
+  if (rc_meodb_scan(a, "posts", "id", "score", "", 0.0, 1.0, 0, &take_all,
+                    (rawptr)&t, &seq) != RC_ERR_USAGE) { return 9; }
+  if (rc_meodb_scan(a, "", "id", "score", "", 0.0, 1.0, 10, &take_all, (rawptr)&t,
+                    &seq) != RC_ERR_USAGE) { return 10; }
+  if (rc_meodb_scan(a, "posts", "id", "score", "", 0.0, 1.0, 10, &take_all,
+                    (rawptr)&t, &seq) != RC_ERR_CLOSED) { return 11; }
+  if (seq != (uint64)0 || t.calls != 0) { return 12; }
+  // SUBSCRIBE: bad arguments are refused before connecting, and close is safe.
+  var sub: RcSub;
+  var only: string[1] = ["posts"];
+  if (rc_meodb_subscribe(&sub, "", "127.0.0.1:5490", &only[0], 1, 0, 0, 0) != RC_ERR_USAGE) { return 13; }
+  rc_sub_close(&sub);
+  if (rc_meodb_subscribe(&sub, "", "127.0.0.1:", &only[0], 1, 0, 0, 1) != RC_ERR_USAGE) { return 14; }
+  rc_sub_close(&sub);
+  rc_sub_close(&sub);
+  if (rc_sub_reopen(&sub) != RC_ERR_USAGE) { return 15; }
+  if (rc_sub_table(&sub, 1) != "" || rc_sub_n_columns(&sub, 1) != 0) { return 16; }
   return 0;
 }
 
@@ -300,6 +320,10 @@ fn check_server() -> int32 {
   rc_result_free(&res);
   // No COUNT capability on this connection: refused, nothing sent.
   if (rc_repo_count(&s, &cq, &n) != RC_ERR_UNSUPPORTED) { return 19; }
+  // No SCAN capability either.
+  var t: Tally = tally();
+  if (rc_meodb_scan(a, "posts", "id", "score", "", 0.0, 1.0, 10, &take_all,
+                    (rawptr)&t, (uint64*)0) != RC_ERR_UNSUPPORTED) { return 27; }
   // A fatal timeout closes it.
   if (rc_query_exec(&q, a, &res) != RC_ERR_CLOSED) { return 20; }
   // A reply that never comes: the timeout closes the connection.
@@ -317,11 +341,319 @@ fn check_server() -> int32 {
   return 0;
 }
 
+// --- minor 1: SCAN and SUBSCRIBE ------------------------------------------------
+
+const SRV1_PORT: int32 = 45491;
+
+// What a scan callback saw.
+struct Tally {
+  calls: int32;
+  points: int32;
+  group: int64;
+  last_x: float64;
+}
+
+fn tally() -> Tally {
+  var t: Tally;
+  t.calls = 0;
+  t.points = 0;
+  t.group = 0;
+  t.last_x = 0.0;
+  return t;
+}
+
+fn take(ctx: rawptr, pts: RcPoint*, n: int32) {
+  var t: Tally* = (Tally*)ctx;
+  t->calls = t->calls + 1;
+  t->points = t->points + n;
+  t->group = pts[0].group;
+  t->last_x = pts[n - 1].x;
+}
+
+fn take_all(ctx: rawptr, pts: RcPoint*, n: int32) -> bool {
+  take(ctx, pts, n);
+  return true;
+}
+
+fn take_first(ctx: rawptr, pts: RcPoint*, n: int32) -> bool {
+  take(ctx, pts, n);
+  return false;
+}
+
+const F1: int64 = 4607182418800017408;   // 1.0
+const F2: int64 = 4611686018427387904;   // 2.0
+const F3: int64 = 4613937818241073152;   // 3.0
+const F4: int64 = 4616189618054758400;   // 4.0
+
+// A SCAN_ROWS frame with commit 70 and the points x = xs[i], y = 1.0.
+fn srv_scan_rows(c: int64, rid: int32, last: int64, grouped: int64, n: int32, xs: int64*) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, last, 1);
+  o_le(&p, grouped, 1);
+  o_le(&p, 70, 8);
+  o_le(&p, (int64)n, 4);
+  var i: int32 = 0;
+  while (i < n) {
+    if (grouped == 1) { o_le(&p, 7, 8); }
+    o_le(&p, xs[i], 8);
+    o_le(&p, F1, 8);
+    i = i + 1;
+  }
+  srv_send(c, 69, rid, &p);
+}
+
+// SUB_OK: table 3 "posts" (id INT, title TEXT).
+fn srv_sub_ok(c: int64, rid: int32, start: int64) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, start, 8);
+  o_le(&p, 70, 8);
+  o_le(&p, 15000, 4);
+  o_le(&p, 1, 4);
+  o_le(&p, 3, 4);
+  o_str(&p, "posts");
+  o_le(&p, 2, 2);
+  o_str(&p, "id");
+  o_le(&p, 1, 1);
+  o_str(&p, "title");
+  o_le(&p, 3, 1);
+  srv_send(c, 68, rid, &p);
+}
+
+fn o_event(o: Out*, seq: int64, kind: int64, table_id: int64) {
+  o_le(o, seq, 8);
+  o_le(o, 71, 8);
+  o_le(o, 1700000000000000, 8);
+  o_le(o, kind, 1);
+  o_le(o, table_id, 4);
+  o_le(o, 1, 8);
+  o_le(o, 1, 8);
+}
+
+// The row (1, "<ch>").
+fn o_row(o: Out*, ch: int64) {
+  o_le(o, 2, 2);
+  o_le(o, 1, 1);
+  o_le(o, 1, 8);
+  o_le(o, 3, 1);
+  o_le(o, 1, 4);
+  o_le(o, ch, 1);
+}
+
+fn srv_events_two(c: int64) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, 2, 4);
+  o_event(&p, 11, 1, 3);       // INSERT (1, "a")
+  o_row(&p, 97);
+  o_le(&p, 0, 2);
+  o_event(&p, 12, 2, 3);       // UPDATE to (1, "b") from (1, "a")
+  o_row(&p, 98);
+  o_row(&p, 97);
+  srv_send(c, 128, 0, &p);
+}
+
+// SCHEMA: table 3 is now "articles" (id INT, title TEXT, n REAL).
+fn srv_events_schema(c: int64) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, 1, 4);
+  o_event(&p, 13, 6, 3);
+  o_le(&p, 0, 2);
+  o_le(&p, 0, 2);
+  o_str(&p, "articles");
+  o_le(&p, 3, 2);
+  o_str(&p, "id");
+  o_le(&p, 1, 1);
+  o_str(&p, "title");
+  o_le(&p, 3, 1);
+  o_str(&p, "n");
+  o_le(&p, 2, 1);
+  srv_send(c, 128, 0, &p);
+}
+
+fn srv_heartbeat(c: int64) {
+  var p: Out;
+  p.n = 0;
+  o_le(&p, 0, 4);
+  srv_send(c, 128, 0, &p);
+}
+
+// n little-endian bytes of the last request's payload at off.
+fn body_le(off: int32, n: int32) -> int64 {
+  var v: int64 = 0;
+  var i: int32 = n - 1;
+  while (i >= 0) {
+    v = (v << 8) | (int64)SRV_BODY[off + i];
+    i = i - 1;
+  }
+  return v;
+}
+
+fn srv_wait_eof(c: int64) {
+  var junk: uint8[64];
+  while (recv(c, (cstring)&junk[0], 64, 0) > 0) {}
+  closesocket(c);
+}
+
+fn srv1_main(arg: cstring) -> uint32 {
+  var ls: int64 = -1;
+  match (socket_tcp()) {
+    case Ok(s): { ls = s; }
+    case Err(_e): { SRV_FAIL = 1; InterlockedExchange(&SRV_READY, 1); return 1; }
+  }
+  set_reuseaddr(ls, 1);
+  var addr: cstring = (cstring)0;
+  match (sockaddr_in((cstring)"127.0.0.1", SRV1_PORT)) {
+    case Ok(a): { addr = a; }
+    case Err(_e): { SRV_FAIL = 2; InterlockedExchange(&SRV_READY, 1); return 1; }
+  }
+  if (bind(ls, addr, 16) != 0 || listen(ls, 4) != 0) {
+    SRV_FAIL = 3;
+    InterlockedExchange(&SRV_READY, 1);
+    return 1;
+  }
+  free((rawptr)addr);
+  InterlockedExchange(&SRV_READY, 1);
+
+  // Connection 1: scans. Three frames; an error first; an error mid-reply.
+  var xs: int64[2];
+  var c: int64 = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c, srv_next(c, 1), 9);
+  var rid: int32 = srv_next(c, 11);
+  if (body_le(43, 4) != 2 && SRV_FAIL == 0) { SRV_FAIL = 10; }   // chunk
+  xs[0] = F1;
+  xs[1] = F2;
+  srv_scan_rows(c, rid, 0, 1, 2, &xs[0]);
+  xs[0] = F3;
+  xs[1] = F4;
+  srv_scan_rows(c, rid, 0, 1, 2, &xs[0]);
+  srv_scan_rows(c, rid, 1, 1, 0, &xs[0]);
+  srv_ok(c, srv_next(c, 2));
+  srv_error(c, srv_next(c, 11), 16, 0, 0);
+  rid = srv_next(c, 11);
+  srv_scan_rows(c, rid, 0, 0, 2, &xs[0]);
+  srv_error(c, rid, 1, 0, 0);
+  srv_ok(c, srv_next(c, 2));
+  srv_ok(c, srv_next(c, 7));
+  closesocket(c);
+
+  // Connection 2: no SUBSCRIBE capability.
+  c = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c, srv_next(c, 1), 9);
+  srv_wait_eof(c);
+
+  // Connection 3: an unknown table.
+  c = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c, srv_next(c, 1), 4);
+  srv_error(c, srv_next(c, 8), 16, 0, 0);
+  srv_wait_eof(c);
+
+  // Connection 4: subscribed from commit 70; a heartbeat, two events, the
+  // ACK, then the connection drops.
+  c = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c, srv_next(c, 1), 4);
+  rid = srv_next(c, 8);
+  // n_tables 1, "posts", from_seq 0, from_commit 70, window 16
+  if ((body_le(0, 2) != 1 || body_le(9, 8) != 0 || body_le(17, 8) != 70
+       || body_le(25, 4) != 16) && SRV_FAIL == 0) { SRV_FAIL = 11; }
+  srv_sub_ok(c, rid, 11);
+  srv_heartbeat(c);
+  srv_events_two(c);
+  srv_next(c, 9);
+  if (body_le(0, 8) != 12 && SRV_FAIL == 0) { SRV_FAIL = 12; }
+  closesocket(c);
+
+  // Connection 5: the reopen resumes after seq 12; a SCHEMA event; BYE.
+  c = accept(ls, (cstring)0, (cstring)0);
+  srv_hello_ok(c, srv_next(c, 1), 4);
+  rid = srv_next(c, 8);
+  if ((body_le(9, 8) != 13 || body_le(17, 8) != 0) && SRV_FAIL == 0) { SRV_FAIL = 13; }
+  srv_sub_ok(c, rid, 13);
+  srv_events_schema(c);
+  srv_next(c, 7);
+  srv_wait_eof(c);
+  closesocket(ls);
+  return 0;
+}
+
+fn check_minor1() -> int32 {
+  SRV_READY = 0;
+  SRV_N = 0;
+  SRV_FAIL = 0;
+  var th: int64 = CreateThread((cstring)0, 0, &srv1_main, (cstring)0, 0, (uint32*)0);
+  if (th == 0) { return 1; }
+  while (InterlockedCompareExchange(&SRV_READY, 0, 0) == 0) { Sleep(1); }
+  if (SRV_FAIL != 0) { return 2; }
+
+  var a: RcAdapter* = rc_meodb_adapter("");
+  defer rc_meodb_adapter_free(a);
+  if (rc_adapter_open(a, "127.0.0.1:45491") != RC_OK) { return 3; }
+  // The callback stops after the first frame; the reply is still drained.
+  var t: Tally = tally();
+  var seq: uint64 = 0;
+  if (rc_meodb_scan(a, "posts", "id", "score", "user_id", 0.0, 10.0, 2, &take_first,
+                    (rawptr)&t, &seq) != RC_OK) { return 4; }
+  if (t.calls != 1 || t.points != 2 || t.group != 7 || t.last_x != 2.0) { return 5; }
+  if (seq != (uint64)70) { return 6; }
+  if (rc_adapter_ping(a) != RC_OK) { return 7; }
+  // SCHEMA before the first frame; an error after it.
+  if (rc_meodb_scan(a, "nope", "id", "score", "", 0.0, 1.0, 2, &take_all,
+                    (rawptr)&t, &seq) != RC_ERR_USAGE) { return 8; }
+  var t2: Tally = tally();
+  if (rc_meodb_scan(a, "posts", "id", "score", "", 0.0, 10.0, 2, &take_all,
+                    (rawptr)&t2, &seq) != RC_ERR_ADAPTER) { return 9; }
+  if (t2.calls != 1 || t2.group != 0 || t2.last_x != 4.0) { return 10; }
+  if (rc_adapter_ping(a) != RC_OK) { return 11; }
+  rc_adapter_close(a);
+
+  var sub: RcSub;
+  var only: string[1] = ["posts"];
+  if (rc_meodb_subscribe(&sub, "", "127.0.0.1:45491", &only[0], 1, 0, 70,
+                         16) != RC_ERR_UNSUPPORTED) { return 12; }
+  if (rc_meodb_subscribe(&sub, "", "127.0.0.1:45491", &only[0], 1, 0, 70,
+                         16) != RC_ERR_USAGE) { return 13; }
+  if (rc_meodb_subscribe(&sub, "", "127.0.0.1:45491", &only[0], 1, 0, 70, 16) != RC_OK) { return 14; }
+  if (rc_sub_start_seq(&sub) != (uint64)11 || rc_sub_commit_seq(&sub) != (uint64)70) { return 15; }
+  if (rc_sub_table(&sub, 3) != "posts" || rc_sub_n_columns(&sub, 3) != 2) { return 16; }
+  if (rc_sub_column(&sub, 3, 1) != "title" || rc_sub_column(&sub, 3, 2) != "") { return 17; }
+  // The heartbeat is skipped; two events come from one frame.
+  var ev: RcEvent;
+  if (rc_sub_next(&sub, &ev) != RC_OK) { return 18; }
+  if (ev.kind != RC_EV_INSERT || ev.seq != (uint64)11 || ev.table != "posts") { return 19; }
+  if (ev.n_vals != 2 || !rc_value_same(ev.vals[1], RcText("a"))) { return 20; }
+  if (rc_sub_next(&sub, &ev) != RC_OK) { return 21; }
+  if (ev.kind != RC_EV_UPDATE || ev.seq != (uint64)12 || ev.n_old != 2) { return 22; }
+  if (!rc_value_same(ev.vals[1], RcText("b")) || !rc_value_same(ev.old[1], RcText("a"))) { return 23; }
+  if (rc_sub_ack(&sub, 13) != RC_ERR_USAGE) { return 24; }   // not returned yet
+  if (rc_sub_ack(&sub, 12) != RC_OK) { return 25; }
+  // The connection drops: closed, until reopened after seq 12.
+  if (rc_sub_next(&sub, &ev) != RC_ERR_CLOSED) { return 26; }
+  if (rc_sub_next(&sub, &ev) != RC_ERR_CLOSED) { return 27; }
+  if (rc_sub_ack(&sub, 12) != RC_ERR_CLOSED) { return 28; }
+  if (rc_sub_reopen(&sub) != RC_OK) { return 29; }
+  if (rc_sub_start_seq(&sub) != (uint64)13) { return 30; }
+  // SCHEMA updates the table map before it is returned.
+  if (rc_sub_next(&sub, &ev) != RC_OK) { return 31; }
+  if (ev.kind != RC_EV_SCHEMA || ev.table_id != 3 || ev.table != "articles") { return 32; }
+  if (rc_sub_n_columns(&sub, 3) != 3 || rc_sub_column(&sub, 3, 2) != "n") { return 33; }
+  rc_sub_close(&sub);
+  rc_sub_close(&sub);
+
+  thread_join_infinite(th);
+  CloseHandle(th);
+  if (SRV_FAIL != 0) { return 100 + SRV_FAIL; }
+  if (SRV_N != 16) { return 34; }
+  return 0;
+}
+
 export fn main() -> int32 {
   var failures: int32 = 0;
   if (!rc_report("meodb: offline refusals", check_offline())) { failures = failures + 1; }
   if (!rc_report("meodb: a scripted server", check_server())) { failures = failures + 1; }
-  return rc_summary(failures, 2);
+  if (!rc_report("meodb: SCAN and SUBSCRIBE", check_minor1())) { failures = failures + 1; }
+  return rc_summary(failures, 3);
 }
 
 // The interpreter has no sockets or threads: offline checks only.

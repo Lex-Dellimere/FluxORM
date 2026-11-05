@@ -24,7 +24,9 @@ import "stmt";
 
 export const RC_WIRE_HEADER: int32 = 12;  // header bytes before every payload
 
-// Frame kinds: requests (client -> server), then replies.
+export const RC_WIRE_MINOR: int32 = 1;    // the protocol minor HELLO asks for
+
+// Frame kinds: requests (client -> server), then replies, then the push.
 export const RC_WIRE_HELLO: int32 = 1;
 export const RC_WIRE_PING: int32 = 2;
 export const RC_WIRE_BEGIN: int32 = 3;
@@ -32,14 +34,54 @@ export const RC_WIRE_COMMIT: int32 = 4;
 export const RC_WIRE_ROLLBACK: int32 = 5;
 export const RC_WIRE_QUERY: int32 = 6;
 export const RC_WIRE_BYE: int32 = 7;
+export const RC_WIRE_SUBSCRIBE: int32 = 8;     // minor 1, RC_WIRE_CAP_SUBSCRIBE
+export const RC_WIRE_ACK: int32 = 9;           // no reply
+export const RC_WIRE_UNSUBSCRIBE: int32 = 10;
+export const RC_WIRE_SCAN: int32 = 11;         // minor 1, RC_WIRE_CAP_SCAN
 export const RC_WIRE_OK: int32 = 64;        // 0x40
 export const RC_WIRE_HELLO_OK: int32 = 65;  // 0x41
 export const RC_WIRE_ERROR: int32 = 66;     // 0x42
 export const RC_WIRE_RESULT: int32 = 67;    // 0x43
+export const RC_WIRE_SUB_OK: int32 = 68;    // 0x44
+export const RC_WIRE_SCAN_ROWS: int32 = 69; // 0x45
+export const RC_WIRE_EVENTS: int32 = 128;   // 0x80, rid 0, to a subscribed session
 
 // Server capability bits, from HELLO_OK's caps.
 export const RC_WIRE_CAP_COUNT: int32 = 1;       // RC_OP_COUNT is supported
 export const RC_WIRE_CAP_ASSIGN_ADD: int32 = 2;  // `col = col + value` updates
+export const RC_WIRE_CAP_SUBSCRIBE: int32 = 4;   // SUBSCRIBE, ACK, UNSUBSCRIBE
+export const RC_WIRE_CAP_SCAN: int32 = 8;        // SCAN
+
+// Event kinds (RcEvent.kind).
+export const RC_EV_INSERT: int32 = 1;  // vals is the new row
+export const RC_EV_UPDATE: int32 = 2;  // vals the new row, old the row before
+export const RC_EV_GAP: int32 = 4;     // events were lost: rescan, then resubscribe
+export const RC_EV_DELETE: int32 = 5;  // vals is the deleted row
+export const RC_EV_SCHEMA: int32 = 6;  // table_id changed shape; no values
+
+// One point of a SCAN.
+export struct RcPoint {
+  group: int64;   // the group column's value; 0 when the scan is ungrouped
+  x: float64;
+  y: float64;     // NaN for a NULL or non-numeric value
+}
+
+// One row change from a subscription. The values and strings are views,
+// borrowed until the next rc_sub_next or rc_sub_close.
+export struct RcEvent {
+  seq: uint64;         // feed position; ACK it once processed
+  commit_seq: uint64;  // the commit it belongs to (GAP: the newest durable one)
+  time_us: int64;      // commit time
+  kind: int32;         // RC_EV_*
+  table_id: int32;     // 0 for GAP
+  table: string;       // the table's name; "" for GAP or an unknown id
+  rowid: int64;
+  old_rowid: int64;    // UPDATE: the rowid before (equal unless the row moved)
+  vals: RcValue*;      // n_vals values in table column order
+  n_vals: int32;       // 0 for GAP and SCHEMA
+  old: RcValue*;       // UPDATE: the row before
+  n_old: int32;        // 0 unless UPDATE
+}
 
 // --- writing -----------------------------------------------------------------
 
@@ -215,7 +257,7 @@ fn rc_wire_end(w: RcWire*, at: int64) -> int32 {
   return RC_OK;
 }
 
-// Appends a HELLO frame: "MEOS", major 1, minor 0, then:
+// Appends a HELLO frame: "MEOS", major 1, minor RC_WIRE_MINOR, then:
 //   w          the buffer
 //   rid        request id; 1 on a fresh connection
 //   max_frame  the largest reply payload we accept (server wants >= 65536)
@@ -233,7 +275,7 @@ export fn rc_wire_hello(w: RcWire*, rid: uint32, max_frame: uint32, token: strin
   rc_wire_u8(w, 79);   // O
   rc_wire_u8(w, 83);   // S
   rc_wire_le(w, 1, 2);
-  rc_wire_le(w, 0, 2);
+  rc_wire_le(w, (uint64)RC_WIRE_MINOR, 2);
   rc_wire_le(w, (uint64)max_frame, 4);
   var rc: int32 = rc_wire_str16(w, token);
   if (rc == RC_OK) { rc = rc_wire_str16(w, name); }
@@ -243,8 +285,8 @@ export fn rc_wire_hello(w: RcWire*, rid: uint32, max_frame: uint32, token: strin
 
 // Appends a request with no payload.
 //   w     the buffer
-//   kind  RC_WIRE_PING, RC_WIRE_COMMIT, RC_WIRE_ROLLBACK or RC_WIRE_BYE (not
-//         checked)
+//   kind  RC_WIRE_PING, RC_WIRE_COMMIT, RC_WIRE_ROLLBACK, RC_WIRE_BYE or
+//         RC_WIRE_UNSUBSCRIBE (not checked)
 //   rid   request id
 // Returns RC_OK, RC_ERR_USAGE (w is 0) or RC_ERR_NOMEM.
 export fn rc_wire_empty(w: RcWire*, kind: int32, rid: uint32) -> int32 {
@@ -356,6 +398,72 @@ export fn rc_wire_query(w: RcWire*, rid: uint32, st: RcStmt*) -> int32 {
     if (rc != RC_OK) { return rc; }
     i = i + 1;
   }
+  return rc_wire_end(w, at);
+}
+
+// Appends a SUBSCRIBE frame (PROTOCOL.md "subscribe").
+//   w            the buffer
+//   rid          request id
+//   tables       n_tables table names; borrowed. n_tables 0 = every table
+//   n_tables     0..65535
+//   from_seq     0 = start after the newest event; else resume at that seq
+//   from_commit  0 = unused; else every event of the commits after it (wins
+//                over from_seq)
+//   window       most events sent and not ACKed (the server wants 1..65536)
+// Returns RC_OK, RC_ERR_USAGE (w is 0, n_tables out of range, or tables 0
+// with n_tables > 0), RC_ERR_RANGE (a name over 65535 bytes) or RC_ERR_NOMEM.
+export fn rc_wire_subscribe(w: RcWire*, rid: uint32, tables: string*, n_tables: int32,
+                            from_seq: uint64, from_commit: uint64, window: uint32) -> int32 {
+  if (w == 0 || n_tables < 0 || n_tables > 65535) { return RC_ERR_USAGE; }
+  if (n_tables > 0 && tables == 0) { return RC_ERR_USAGE; }
+  var at: int64 = rc_wire_start(w, RC_WIRE_SUBSCRIBE, rid);
+  rc_wire_le(w, (uint64)n_tables, 2);
+  var i: int32 = 0;
+  while (i < n_tables) {
+    var rc: int32 = rc_wire_str16(w, tables[i]);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  rc_wire_le(w, from_seq, 8);
+  rc_wire_le(w, from_commit, 8);
+  rc_wire_le(w, (uint64)window, 4);
+  return rc_wire_end(w, at);
+}
+
+// Appends an ACK frame: the last event seq processed. It has no reply.
+//   w    the buffer
+//   rid  request id
+//   seq  the seq to acknowledge
+// Returns RC_OK, RC_ERR_USAGE (w is 0) or RC_ERR_NOMEM.
+export fn rc_wire_ack(w: RcWire*, rid: uint32, seq: uint64) -> int32 {
+  if (w == 0) { return RC_ERR_USAGE; }
+  var at: int64 = rc_wire_start(w, RC_WIRE_ACK, rid);
+  rc_wire_le(w, seq, 8);
+  return rc_wire_end(w, at);
+}
+
+// Appends a SCAN frame (PROTOCOL.md "scan").
+//   w           the buffer
+//   rid         request id
+//   table       the table; borrowed
+//   x, y        the point columns; borrowed
+//   group       the group column, "" for none; borrowed
+//   lo, hi      inclusive x window, sent bit-exact
+//   chunk       most points per SCAN_ROWS frame (the server wants 1..1048576)
+// Returns RC_OK, RC_ERR_USAGE (w is 0), RC_ERR_RANGE (a name over 65535
+// bytes) or RC_ERR_NOMEM.
+export fn rc_wire_scan(w: RcWire*, rid: uint32, table: string, x: string, y: string,
+                       group: string, lo: float64, hi: float64, chunk: uint32) -> int32 {
+  if (w == 0) { return RC_ERR_USAGE; }
+  var at: int64 = rc_wire_start(w, RC_WIRE_SCAN, rid);
+  var rc: int32 = rc_wire_str16(w, table);
+  if (rc == RC_OK) { rc = rc_wire_str16(w, x); }
+  if (rc == RC_OK) { rc = rc_wire_str16(w, y); }
+  if (rc == RC_OK) { rc = rc_wire_str16(w, group); }
+  if (rc != RC_OK) { return rc; }
+  rc_wire_le(w, rc_wire_f64_bits(lo), 8);
+  rc_wire_le(w, rc_wire_f64_bits(hi), 8);
+  rc_wire_le(w, (uint64)chunk, 4);
   return rc_wire_end(w, at);
 }
 
@@ -574,6 +682,348 @@ export fn rc_wire_result(p: uint8*, n: int64, out: RcResult*) -> int32 {
     return RC_ERR_ADAPTER;
   }
   return RC_OK;
+}
+
+// --- minor 1: subscriptions and scans ----------------------------------------
+
+// A column of a subscribed table: a view into the payload.
+export struct RcWireCol {
+  name: string;
+  ty: int32;     // 1 INT, 2 REAL, 3 TEXT, 4 BLOB
+}
+
+// A table of SUB_OK.
+export struct RcWireTable {
+  id: int32;
+  name: string;       // a view into the payload
+  n_cols: int32;
+  cols: RcWireCol*;   // points into RcWireSubOk.cols
+}
+
+// A decoded SUB_OK. Free it with rc_wire_sub_ok_free; the strings are views
+// into the payload.
+export struct RcWireSubOk {
+  start_seq: uint64;     // seq of the first event that will be sent
+  commit_seq: uint64;    // newest durable commit at subscribe time
+  heartbeat_ms: int64;   // the server sends an empty EVENTS this often
+  n_tables: int32;
+  tables: RcWireTable*;  // owned
+  cols: RcWireCol*;      // owned; every table's columns
+}
+
+// One event of an EVENTS frame, with the new shape a SCHEMA event carries.
+export struct RcWireEvent {
+  ev: RcEvent;         // ev.table is "" except for SCHEMA: the table's name
+  n_cols: int32;       // SCHEMA: the table's columns, else 0
+  cols: RcWireCol*;    // points into RcWireEvents.cols
+}
+
+// A decoded EVENTS frame. Free it with rc_wire_events_free; the strings,
+// text and blob values are views into the payload.
+export struct RcWireEvents {
+  n: int32;            // 0 is the heartbeat
+  ev: RcWireEvent*;    // owned
+  vals: RcValue*;      // owned; every event's vals and old
+  cols: RcWireCol*;    // owned; every SCHEMA event's columns
+}
+
+// A decoded SCAN_ROWS frame; read its points with rc_wire_scan_point.
+export struct RcWireScanRows {
+  last: bool;          // the final frame of the reply
+  grouped: bool;       // points carry a group
+  commit_seq: uint64;  // the snapshot's commit; the same in every frame
+  n: int32;            // points in this frame
+  pts: uint8*;         // the points; a view into the payload
+}
+
+// One value as a view: text and blob bodies point into the payload.
+fn rc_wire_get_view(r: RcWireRead*) -> RcValue {
+  var tag: uint64 = rc_wire_get(r, 1);
+  if (r->bad) { return RcNull; }
+  if (tag == (uint64)0) { return RcNull; }
+  if (tag == (uint64)1) { return RcInt((int64)rc_wire_get(r, 8)); }
+  if (tag == (uint64)2) { return RcFloat(rc_wire_f64_from(rc_wire_get(r, 8))); }
+  if (tag == (uint64)3 || tag == (uint64)4) {
+    var n: int64 = (int64)rc_wire_get(r, 4);
+    if (!rc_wire_take(r, n)) { return RcNull; }
+    var at: uint8* = r->p + r->off;
+    r->off = r->off + n;
+    if (tag == (uint64)3) { return RcText(str_from_bytes((cstring)at, n)); }
+    var b: RcBytes;
+    b.data = at;
+    b.len = n;
+    return RcBlob(b);
+  }
+  r->bad = true;
+  return RcNull;
+}
+
+// u16 n, then n values as views into dst. dst 0 only counts. Returns n.
+fn rc_wire_get_vals(r: RcWireRead*, dst: RcValue*) -> int32 {
+  var n: int32 = (int32)rc_wire_get(r, 2);
+  if (r->bad) { return 0; }
+  if ((int64)n > r->n - r->off) {
+    r->bad = true;
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < n && !r->bad) {
+    var v: RcValue = rc_wire_get_view(r);
+    if (dst != 0) { dst[i] = v; }
+    i = i + 1;
+  }
+  return n;
+}
+
+// u16 n, then n columns (str16 name, u8 type 1..4) into dst. dst 0 only
+// counts. Returns n.
+fn rc_wire_get_cols(r: RcWireRead*, dst: RcWireCol*) -> int32 {
+  var n: int32 = (int32)rc_wire_get(r, 2);
+  if (r->bad) { return 0; }
+  if ((int64)n * 3 > r->n - r->off) {
+    r->bad = true;
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < n && !r->bad) {
+    var name: string = rc_wire_get_str16(r);
+    var ty: int32 = (int32)rc_wire_get(r, 1);
+    if (ty < 1 || ty > 4) { r->bad = true; }
+    if (dst != 0) {
+      dst[i].name = name;
+      dst[i].ty = ty;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+// A u32 count that must fit int32 and leave at least `min` bytes per item.
+fn rc_wire_get_count(r: RcWireRead*, min: int64) -> int32 {
+  var n: uint64 = rc_wire_get(r, 4);
+  if (r->bad) { return 0; }
+  if (n > (uint64)2147483647 || (int64)n * min > r->n - r->off) {
+    r->bad = true;
+    return 0;
+  }
+  return (int32)n;
+}
+
+// Reads SUB_OK's tables. With tables 0 it only counts; *n_cols gets the
+// total number of columns.
+fn rc_wire_sub_tables(r: RcWireRead*, n: int32, tables: RcWireTable*, cols: RcWireCol*,
+                      n_cols: int64*) {
+  var used: int64 = 0;
+  var i: int32 = 0;
+  while (i < n && !r->bad) {
+    var id: int32 = (int32)rc_wire_get(r, 4);
+    var name: string = rc_wire_get_str16(r);
+    var at: RcWireCol* = 0;
+    if (cols != 0) { at = &cols[used]; }
+    var k: int32 = rc_wire_get_cols(r, at);
+    if (tables != 0) {
+      tables[i].id = id;
+      tables[i].name = name;
+      tables[i].n_cols = k;
+      tables[i].cols = at;
+    }
+    used = used + (int64)k;
+    i = i + 1;
+  }
+  *n_cols = used;
+}
+
+// Decodes a SUB_OK payload.
+//   p, n  the payload; borrowed, must outlive out's strings
+//   out   receives the fields and two owned arrays
+// Returns RC_OK, RC_ERR_USAGE (out is 0), RC_ERR_NOMEM, or RC_ERR_ADAPTER for
+// a malformed payload (short or long, a count over 2^31-1 or past the bytes
+// left, a column type outside 1..4, a NUL in a name). Free out with
+// rc_wire_sub_ok_free on RC_OK; on an error nothing is left to free.
+export fn rc_wire_sub_ok(p: uint8*, n: int64, out: RcWireSubOk*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  out->n_tables = 0;
+  out->tables = 0;
+  out->cols = 0;
+  var r: RcWireRead = rc_wire_read(p, n);
+  out->start_seq = rc_wire_get(&r, 8);
+  out->commit_seq = rc_wire_get(&r, 8);
+  out->heartbeat_ms = (int64)rc_wire_get(&r, 4);
+  var nt: int32 = rc_wire_get_count(&r, 8);   // id, empty name, n_cols
+  var body: int64 = r.off;
+  var n_cols: int64 = 0;
+  rc_wire_sub_tables(&r, nt, 0, 0, &n_cols);
+  if (r.bad || r.off != r.n) { return RC_ERR_ADAPTER; }
+  if (nt > 0) {
+    out->tables = (RcWireTable*)malloc((int64)nt * (int64)sizeof(RcWireTable));
+    if (n_cols > 0) { out->cols = (RcWireCol*)malloc(n_cols * (int64)sizeof(RcWireCol)); }
+    if (out->tables == 0 || (n_cols > 0 && out->cols == 0)) {
+      rc_wire_sub_ok_free(out);
+      return RC_ERR_NOMEM;
+    }
+  }
+  r.off = body;
+  rc_wire_sub_tables(&r, nt, out->tables, out->cols, &n_cols);
+  out->n_tables = nt;
+  return RC_OK;
+}
+
+// Frees a SUB_OK's arrays and empties it. 0 is a no-op.
+export fn rc_wire_sub_ok_free(s: RcWireSubOk*) {
+  if (s == 0) { return; }
+  if (s->tables != 0) { free((rawptr)s->tables); }
+  if (s->cols != 0) { free((rawptr)s->cols); }
+  s->tables = 0;
+  s->cols = 0;
+  s->n_tables = 0;
+}
+
+// Reads one event; vals and cols receive its values and SCHEMA columns
+// (both 0: only counts). Breaks the cursor on any rule in PROTOCOL.md
+// "events".
+fn rc_wire_get_event(r: RcWireRead*, e: RcWireEvent*, vals: RcValue*, cols: RcWireCol*) {
+  e->ev.seq = rc_wire_get(r, 8);
+  e->ev.commit_seq = rc_wire_get(r, 8);
+  e->ev.time_us = (int64)rc_wire_get(r, 8);
+  var kind: int32 = (int32)rc_wire_get(r, 1);
+  var tid: uint64 = rc_wire_get(r, 4);
+  e->ev.kind = kind;
+  e->ev.table_id = (int32)tid;
+  e->ev.table = "";
+  e->ev.rowid = (int64)rc_wire_get(r, 8);
+  e->ev.old_rowid = (int64)rc_wire_get(r, 8);
+  e->ev.vals = vals;
+  e->ev.n_vals = rc_wire_get_vals(r, vals);
+  var old: RcValue* = 0;
+  if (vals != 0) { old = &vals[e->ev.n_vals]; }
+  e->ev.old = old;
+  e->ev.n_old = rc_wire_get_vals(r, old);
+  e->n_cols = 0;
+  e->cols = cols;
+  if (kind != RC_EV_INSERT && kind != RC_EV_UPDATE && kind != RC_EV_GAP
+      && kind != RC_EV_DELETE && kind != RC_EV_SCHEMA) {
+    r->bad = true;
+  }
+  if (kind == RC_EV_GAP && tid != (uint64)0) { r->bad = true; }
+  if ((kind == RC_EV_GAP || kind == RC_EV_SCHEMA) && e->ev.n_vals != 0) { r->bad = true; }
+  if (kind != RC_EV_UPDATE && e->ev.n_old != 0) { r->bad = true; }
+  if (kind == RC_EV_SCHEMA && !r->bad) {
+    e->ev.table = rc_wire_get_str16(r);
+    e->n_cols = rc_wire_get_cols(r, cols);
+  }
+}
+
+// Reads n events. With ev 0 it only counts: *n_vals and *n_cols get the
+// totals the arrays need.
+fn rc_wire_events_walk(r: RcWireRead*, n: int32, ev: RcWireEvent*, vals: RcValue*,
+                       cols: RcWireCol*, n_vals: int64*, n_cols: int64*) {
+  var nv: int64 = 0;
+  var nc: int64 = 0;
+  var tmp: RcWireEvent;
+  var i: int32 = 0;
+  while (i < n && !r->bad) {
+    var e: RcWireEvent* = &tmp;
+    var v: RcValue* = 0;
+    var c: RcWireCol* = 0;
+    if (ev != 0) {
+      e = &ev[i];
+      if (vals != 0) { v = &vals[nv]; }
+      if (cols != 0) { c = &cols[nc]; }
+    }
+    rc_wire_get_event(r, e, v, c);
+    nv = nv + (int64)e->ev.n_vals + (int64)e->ev.n_old;
+    nc = nc + (int64)e->n_cols;
+    i = i + 1;
+  }
+  *n_vals = nv;
+  *n_cols = nc;
+}
+
+// Decodes an EVENTS payload.
+//   p, n  the payload; borrowed, must outlive out's strings and values
+//   out   receives the events and three owned arrays
+// Returns RC_OK, RC_ERR_USAGE (out is 0), RC_ERR_NOMEM, or RC_ERR_ADAPTER for
+// a malformed payload: short or long, a count past the bytes left, a bad
+// value tag, an unknown kind, a GAP with a table_id, values on a GAP or
+// SCHEMA, old values on anything but UPDATE, a column type outside 1..4.
+// Free out with rc_wire_events_free on RC_OK; on an error nothing is left to
+// free.
+export fn rc_wire_events(p: uint8*, n: int64, out: RcWireEvents*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  out->n = 0;
+  out->ev = 0;
+  out->vals = 0;
+  out->cols = 0;
+  var r: RcWireRead = rc_wire_read(p, n);
+  var count: int32 = rc_wire_get_count(&r, 49);   // the smallest event
+  var body: int64 = r.off;
+  var n_vals: int64 = 0;
+  var n_cols: int64 = 0;
+  rc_wire_events_walk(&r, count, 0, 0, 0, &n_vals, &n_cols);
+  if (r.bad || r.off != r.n) { return RC_ERR_ADAPTER; }
+  if (count == 0) { return RC_OK; }
+  out->ev = (RcWireEvent*)malloc((int64)count * (int64)sizeof(RcWireEvent));
+  if (n_vals > 0) { out->vals = (RcValue*)malloc(n_vals * (int64)sizeof(RcValue)); }
+  if (n_cols > 0) { out->cols = (RcWireCol*)malloc(n_cols * (int64)sizeof(RcWireCol)); }
+  if (out->ev == 0 || (n_vals > 0 && out->vals == 0) || (n_cols > 0 && out->cols == 0)) {
+    rc_wire_events_free(out);
+    return RC_ERR_NOMEM;
+  }
+  r.off = body;
+  rc_wire_events_walk(&r, count, out->ev, out->vals, out->cols, &n_vals, &n_cols);
+  out->n = count;
+  return RC_OK;
+}
+
+// Frees an EVENTS frame's arrays and empties it. 0 is a no-op.
+export fn rc_wire_events_free(e: RcWireEvents*) {
+  if (e == 0) { return; }
+  if (e->ev != 0) { free((rawptr)e->ev); }
+  if (e->vals != 0) { free((rawptr)e->vals); }
+  if (e->cols != 0) { free((rawptr)e->cols); }
+  e->ev = 0;
+  e->vals = 0;
+  e->cols = 0;
+  e->n = 0;
+}
+
+// Decodes a SCAN_ROWS payload; nothing is allocated.
+//   p, n  the payload; borrowed, must outlive out->pts
+//   out   receives the header and a view of the points
+// Returns RC_OK, RC_ERR_USAGE (out is 0), or RC_ERR_ADAPTER for a short or
+// long payload, a last or grouped byte over 1, or n over 2^31-1.
+export fn rc_wire_scan_rows(p: uint8*, n: int64, out: RcWireScanRows*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  var r: RcWireRead = rc_wire_read(p, n);
+  var last: uint64 = rc_wire_get(&r, 1);
+  var grouped: uint64 = rc_wire_get(&r, 1);
+  out->commit_seq = rc_wire_get(&r, 8);
+  out->last = last == (uint64)1;
+  out->grouped = grouped == (uint64)1;
+  out->n = 0;
+  out->pts = 0;
+  var size: int64 = 16;
+  if (out->grouped) { size = 24; }
+  var count: int32 = rc_wire_get_count(&r, size);
+  if (r.bad || last > (uint64)1 || grouped > (uint64)1) { return RC_ERR_ADAPTER; }
+  if (r.off + (int64)count * size != r.n) { return RC_ERR_ADAPTER; }
+  out->n = count;
+  out->pts = r.p + r.off;
+  return RC_OK;
+}
+
+// Reads point i of a decoded SCAN_ROWS frame.
+//   h    from rc_wire_scan_rows
+//   i    0 <= i < h->n (not checked)
+//   out  receives the point; group 0 when the frame is not grouped
+export fn rc_wire_scan_point(h: RcWireScanRows*, i: int32, out: RcPoint*) {
+  var size: int64 = 16;
+  if (h->grouped) { size = 24; }
+  var r: RcWireRead = rc_wire_read(h->pts + (int64)i * size, size);
+  out->group = 0;
+  if (h->grouped) { out->group = (int64)rc_wire_get(&r, 8); }
+  out->x = rc_wire_f64_from(rc_wire_get(&r, 8));
+  out->y = rc_wire_f64_from(rc_wire_get(&r, 8));
 }
 
 // Maps a MeoDB status code (positive, from an ERROR frame) to an RC_* code:
