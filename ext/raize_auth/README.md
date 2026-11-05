@@ -12,7 +12,7 @@ Add it with its dependencies in the app's `mbuild.mettle`:
 mb_dep_path("flux_raize_auth", "../flux_orm/ext/raize_auth");
 mb_dep_path("flux_orm", "../flux_orm");
 mb_dep_path("raize_auth", "../raize_auth");
-mb_dep_path("crypto", "../cryptex");
+mb_dep_path("cryptex", "../cryptex");
 ```
 
 Then:
